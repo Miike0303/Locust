@@ -28,6 +28,21 @@ pub fn get_server_port(port: State<ServerPort>) -> u16 {
     port.0
 }
 
+#[tauri::command]
+pub async fn text_fit(
+    request: locust_core::text_fit::TextFitRequest,
+    state: State<'_, AppStateWrapper>,
+) -> Result<locust_core::text_fit::TextFitResponse, String> {
+    apply_text_fit(&state.0, request).await
+}
+
+async fn apply_text_fit(
+    state: &AppState,
+    request: locust_core::text_fit::TextFitRequest,
+) -> Result<locust_core::text_fit::TextFitResponse, String> {
+    locust_server::estimate_text_fit(state, request).await
+}
+
 // ─── Project commands ───────────────────────────────────────────────────────
 
 // Plain derive is fine here — unlike `TokenStore`, every field is already
@@ -2975,5 +2990,111 @@ mod tests {
             .await
             .expect_err("consumed handle");
         assert!(err.to_lowercase().contains("not found"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod text_fit_tests {
+    use super::*;
+    use locust_core::text_fit::TextFitRequest;
+    use serde_json::{json, Value};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn http_estimate(base: &str, request: &TextFitRequest) -> (u16, Vec<u8>) {
+        let address = base.strip_prefix("http://").unwrap();
+        let body = serde_json::to_vec(request).unwrap();
+        let mut connection = tokio::net::TcpStream::connect(address).await.unwrap();
+        let headers = format!("POST /api/text-fit HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+        connection.write_all(headers.as_bytes()).await.unwrap();
+        connection.write_all(&body).await.unwrap();
+        let mut response = Vec::new();
+        connection.read_to_end(&mut response).await.unwrap();
+        let split = response
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .unwrap();
+        let status = std::str::from_utf8(&response[..split])
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        (status, response[split + 4..].to_vec())
+    }
+
+    #[tokio::test]
+    async fn text_fit_native_http_parity_and_read_only() {
+        let state = locust_server::create_test_state();
+        *state.current_project.write().await = Some(ProjectInfo {
+            path: "owned-game".into(),
+            format_id: "rpgmaker-mv".into(),
+            name: "Owned".into(),
+            ..Default::default()
+        });
+        let mut row = StringEntry::new(
+            "owned#event_1#page_0#cmd_1#msg",
+            "あ\nHola\n",
+            "any.asset".into(),
+        )
+        .with_format_id("rpgmaker-mv")
+        .with_tags(vec!["dialogue".into()]);
+        row.translation = Some("Saved".into());
+        row.status = StringStatus::Approved;
+        state.db.save_entries(std::slice::from_ref(&row)).unwrap();
+        let snapshot = || json!({"row":state.db.get_entry(&row.id).unwrap(),"history":state.db.get_string_history(&row.id, 50).unwrap()});
+        let before = snapshot();
+        let (base, server) = locust_server::start_test_server(state.clone()).await;
+        let mut request = TextFitRequest {
+            entry_id: row.id.clone(),
+            font_path: Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../crates/cli/tests/fixtures/synthetic-ascii.ttf"),
+            font_size_px: 28.0,
+            usable_width_px: 56.0,
+            draft_text: Some("Hola\n WWW \n".into()),
+        };
+        // Same serialized request crosses both actual HTTP and the native
+        // command's implementation (Tauri State constructors are private).
+        for scenario in 0..5 {
+            match scenario {
+                1 => request.draft_text = None,
+                2 => request.font_path = "".into(),
+                3 => request.font_size_px = 0.0,
+                4 => request.draft_text = Some("A".repeat(16_385)),
+                _ => {}
+            }
+            let native = apply_text_fit(&state, request.clone()).await;
+            let (status, body) = http_estimate(&base, &request).await;
+            match native {
+                Ok(result) => {
+                    assert_eq!(status, 200);
+                    assert_eq!(
+                        serde_json::from_slice::<Value>(&body).unwrap(),
+                        serde_json::to_value(result).unwrap()
+                    );
+                }
+                Err(error) => {
+                    assert_eq!(status, 400);
+                    assert_eq!(body, error.as_bytes());
+                }
+            }
+            assert_eq!(snapshot(), before);
+        }
+        request.draft_text = Some("Hello".into());
+        row.metadata.clear();
+        state.db.save_entries(std::slice::from_ref(&row)).unwrap();
+        let native_error = apply_text_fit(&state, request.clone()).await.unwrap_err();
+        let (status, body) = http_estimate(&base, &request).await;
+        assert_eq!(status, 400);
+        assert_eq!(body, native_error.as_bytes());
+        *state.current_project.write().await = None;
+        assert_eq!(
+            apply_text_fit(&state, request.clone()).await.unwrap_err(),
+            "no project open"
+        );
+        let (status, body) = http_estimate(&base, &request).await;
+        assert_eq!(status, 400);
+        assert_eq!(body, b"no project open");
+        server.abort();
     }
 }

@@ -156,6 +156,32 @@ export interface StringEntry {
   translated_at: string | null; reviewed_at: string | null;
 }
 
+export interface TextFitRequest {
+  entry_id: string;
+  font_path: string;
+  font_size_px: number;
+  usable_width_px: number;
+  draft_text?: string;
+}
+
+export interface TextFitLine {
+  status: "within_width" | "exceeds_width" | "unavailable";
+  advance_px: number | null;
+  usable_width_px: number;
+  reason: string | null;
+}
+
+export interface TextFitResponse {
+  source: TextFitLine[];
+  draft: TextFitLine[];
+}
+
+/** Read-only advance estimate. Tauri ownership is guarded by the caller. */
+export const estimateTextFit = (body: TextFitRequest, signal?: AbortSignal): Promise<TextFitResponse> =>
+  IS_TAURI
+    ? tauriInvoke("text_fit", { request: body })
+    : request("/text-fit", { method: "POST", body: JSON.stringify(body), signal });
+
 export interface StringFilter {
   status?: string; file_path?: string; tag?: string;
   search?: string; limit?: number; offset?: number;

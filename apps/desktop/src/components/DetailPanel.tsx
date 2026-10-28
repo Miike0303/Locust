@@ -9,6 +9,7 @@ import { acknowledgeDraft, draftAlternatives, selectDraftAlternative, draftEntry
 import { useProjectStore } from "../stores/projectStore";
 import StringHistory from "./StringHistory";
 import MemorySuggestions from "./MemorySuggestions";
+import TextFitPreview, { isTextFitEligible } from "./TextFitPreview";
 import { isCompactLayout, subscribeCompactLayout } from "../lib/layoutPrefs";
 import { isTopmostOverlayDialog, useModalA11y } from "../lib/modalA11y";
 
@@ -231,7 +232,12 @@ export default function DetailPanel({
 							if (!useDraftStore.getState().drafts[draftKey]) editDraft(draftKey, translation, entry.translation);
 						}}
 						onChange={(e) => editDraft(draftKey, e.target.value, entry.translation)}
-						onBlur={() => handleSave()}
+						onBlur={(event) => {
+							// Inspecting an unsaved draft must remain read-only.
+							if (event?.relatedTarget && "closest" in event.relatedTarget
+								&& (event.relatedTarget as Element).closest("[data-text-fit-preview]")) return;
+							return handleSave();
+						}}
 						onKeyDown={(e) => {
 							if (e.key === "Enter" && e.ctrlKey) handleSave();
 						}}
@@ -263,6 +269,8 @@ export default function DetailPanel({
 						{budgetHint.expandable && !budgetHint.grouped && <p className="mt-1">{t("detail.expandableBudget")}</p>}
 					</div>
 				</div>
+
+				{isTextFitEligible(entry) && <TextFitPreview key={projectKey} projectKey={projectKey} entry={entry} draft={translation} />}
 
 				<MemorySuggestions projectKey={projectKey} entry={entry} sampleSources={sampleSources}
 					busy={saving || changingStatus} onUse={text => {

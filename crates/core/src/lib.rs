@@ -19,6 +19,7 @@ pub mod patch;
 pub mod placeholder;
 pub mod project;
 pub mod speakers;
+pub mod text_fit;
 pub mod textasset_group;
 pub mod translation;
 pub mod validation;

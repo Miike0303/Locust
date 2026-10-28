@@ -10,6 +10,7 @@ pub(crate) mod patch;
 pub(crate) mod project;
 pub(crate) mod speakers;
 pub(crate) mod strings;
+pub(crate) mod text_fit;
 pub(crate) mod translate;
 
 #[cfg(test)]

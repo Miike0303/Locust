@@ -59,6 +59,8 @@ use routes::strings::{
     batch_patch_strings, get_file_stats, get_stats, get_string, get_string_facets,
     get_string_history, get_strings, list_translation_runs, patch_string,
 };
+pub use routes::text_fit::estimate_text_fit;
+use routes::text_fit::text_fit;
 pub use routes::translate::{cancel_translation_job, spawn_translation_job};
 use routes::translate::{translate_cancel, translate_estimate, translate_start, translate_ws};
 
@@ -332,6 +334,8 @@ pub struct ProjectInfo {
 }
 
 pub struct AppState {
+    /// Bounded metric cache shared by HTTP and direct desktop estimates.
+    pub text_fit_cache: Arc<std::sync::Mutex<locust_core::text_fit::TextFitCache>>,
     pub format_registry: Arc<FormatRegistry>,
     pub provider_registry: Arc<RwLock<ProviderRegistry>>,
     pub db: Arc<Database>,
@@ -386,6 +390,7 @@ pub fn create_app_state() -> Arc<AppState> {
         .unwrap_or_else(|_| GlobalMemoryDb::open_in_memory().unwrap());
 
     Arc::new(AppState {
+        text_fit_cache: Arc::new(std::sync::Mutex::new(Default::default())),
         format_registry: Arc::new(format_registry),
         provider_registry: Arc::new(RwLock::new(provider_registry)),
         db,
@@ -429,6 +434,7 @@ fn create_test_state_inner(db: Arc<Database>) -> Arc<AppState> {
     let provider_registry = locust_providers::default_registry(&config);
 
     Arc::new(AppState {
+        text_fit_cache: Arc::new(std::sync::Mutex::new(Default::default())),
         format_registry: Arc::new(format_registry),
         provider_registry: Arc::new(RwLock::new(provider_registry)),
         db,
@@ -589,6 +595,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/speakers/note", axum::routing::put(save_speaker_note))
         .route("/api/pivot", post(pivot_project))
         .route("/api/strings", get(get_strings))
+        .route("/api/text-fit", post(text_fit))
         // Static paths before `:id` so "batch" / "facets" are never captured as ids.
         .route("/api/strings/batch", post(batch_patch_strings))
         .route("/api/strings/facets", get(get_string_facets))
