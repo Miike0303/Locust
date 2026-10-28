@@ -1,8 +1,18 @@
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
 import { after, beforeEach, test } from "node:test";
+import { QueryClient, QueryObserver } from "@tanstack/react-query";
 import type { StringEntry } from "../lib/api.ts";
+import { draftProjectKey, projectScopedQueryFn } from "../lib/projectScope.ts";
+import { useProjectStore } from "../stores/projectStore.ts";
+import { draftEntryKey, editDraft, saveDraft, useDraftStore } from "../stores/draftStore.ts";
 import { setLocale, t } from "../lib/i18n/index.ts";
+
+const project = { path: "/game", database_path: "/game.db", format_id: "renpy", name: "Game" };
+const projectKey = draftProjectKey(project);
+const client = new QueryClient({ defaultOptions: { queries: {
+  retry: false, staleTime: 30_000, gcTime: Infinity,
+} } });
 
 type Patch = Partial<Pick<StringEntry, "translation" | "status">>;
 type Effect = { deps?: unknown[]; cleanup?: () => void };
@@ -18,9 +28,10 @@ const h = {
   values: [] as any[], cursor: 0, dirty: false,
   effects: [] as (() => void)[], pending: [] as Promise<void>[], errors: [] as unknown[],
   rows: {} as Record<string, StringEntry>, writes: [] as { id: string; patch: Patch }[],
+  saved: [] as StringEntry[],
   failure: null as unknown, waitForSave: null as Promise<void> | null, invalidations: 0,
   keydown: null as ((event: any) => void) | null, navigations: [] as string[],
-  t,
+  t, client, projectStore: useProjectStore,
   state(initial: any) {
     const index = this.cursor++;
     if (!(index in this.values)) this.values[index] = typeof initial === "function" ? initial() : initial;
@@ -55,7 +66,9 @@ const h = {
     return wrapped;
   },
   speakers: [] as { id: string; name: string; count: number; entry_ids: string[]; note: string }[],
-  format: "renpy", contextFailure: false, contextWaits: {} as Record<string, Promise<void> | undefined>,
+  get format() { return useProjectStore.getState().project?.format_id ?? ""; },
+  set format(format_id: string) { useProjectStore.getState().setProject({ ...project, format_id }); },
+  contextFailure: false, contextWaits: {} as Record<string, Promise<void> | undefined>,
   focused: 0,
   reads: [] as { status?: string; file_path?: string; limit?: number; offset?: number }[],
   async getStrings(filter: { status?: string; file_path?: string; limit?: number; offset?: number }) {
@@ -72,10 +85,12 @@ const h = {
   },
   async patchString(id: string, patch: Patch) {
     this.writes.push({ id, patch });
+    const rows = this.rows;
     if (this.waitForSave) await this.waitForSave;
     if (this.failure !== null) throw this.failure;
-    this.rows[id] = { ...this.rows[id], ...patch };
-    return this.rows[id];
+    rows[id] = { ...rows[id], ...patch };
+    this.saved.push(rows[id]);
+    return rows[id];
   },
 };
 (globalThis as any).__reviewTest = h;
@@ -85,8 +100,8 @@ const hooks = registerHooks({
       const stubs: Record<string, string> = {
         react: `const h=globalThis.__reviewTest;export const useState=x=>h.state(x);export const useRef=x=>h.ref(x);export const useEffect=(fn,deps)=>h.effect(fn,deps);export const useCallback=(fn,deps)=>h.callback(fn,deps);`,
         "react-router-dom": `export const useNavigate=()=>path=>globalThis.__reviewTest.navigations.push(path);`,
-        "@tanstack/react-query": `export const useQueryClient=()=>({invalidateQueries:async()=>{globalThis.__reviewTest.invalidations++;}});`,
-        "../stores/projectStore": `export const useProjectStore=select=>select({project:{path:'/game',database_path:'/game.db',format_id:globalThis.__reviewTest.format}});`,
+        "@tanstack/react-query": `export const useQueryClient=()=>globalThis.__reviewTest.client;`,
+        "../stores/projectStore": `const store=globalThis.__reviewTest.projectStore;export const useProjectStore=Object.assign(select=>select(store.getState()),{getState:store.getState});`,
         "../lib/i18n": `export const useT=()=>globalThis.__reviewTest.t;`,
         "../lib/api": `const h=globalThis.__reviewTest;export const getStrings=filter=>h.getStrings(filter);export const patchString=(id,patch)=>h.patchString(id,patch);export const getSpeakers=async()=>({groups:h.speakers,unassigned_entry_ids:[]});`,
       };
@@ -109,7 +124,15 @@ Object.defineProperty(globalThis, "document", {
   } },
 });
 const { default: Review, reviewApprovalPatch } = await import("./Review.tsx");
+// Count calls without replacing QueryClient's real invalidation/cache behavior.
+const invalidateQueries = client.invalidateQueries.bind(client);
+client.invalidateQueries = (...args: Parameters<typeof client.invalidateQueries>) => {
+  h.invalidations++;
+  return invalidateQueries(...args);
+};
 after(() => {
+  client.clear();
+  useProjectStore.getState().clearProject();
   hooks.deregister();
   if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow);
   else Reflect.deleteProperty(globalThis, "window");
@@ -160,9 +183,12 @@ async function approve() {
   await settle();
 }
 beforeEach(async () => {
+  client.clear();
+  useDraftStore.setState({ drafts: {}, records: [], persistenceIssue: null, persistenceIssues: {} });
+  useProjectStore.getState().setProject(project);
   setLocale("en");
   h.values = []; h.effects = []; h.pending = []; h.errors = [];
-  h.rows = { A: row("A"), B: row("B") }; h.writes = [];
+  h.rows = { A: row("A"), B: row("B") }; h.writes = []; h.saved = [];
   h.failure = null; h.waitForSave = null; h.invalidations = 0;
   h.keydown = null; h.navigations = []; h.speakers = []; h.reads = [];
   h.format = "renpy"; h.contextFailure = false; h.contextWaits = {}; h.focused = 0;
@@ -170,6 +196,145 @@ beforeEach(async () => {
   await settle();
   assert.equal(textarea().props.value, "Translation A");
 });
+
+// Match Editor's public query keys, fetch gate and 30-second freshness window.
+function editorQueries(status?: StringEntry["status"]) {
+  const filter = { ...(status ? { status } : {}), limit: 50, offset: 0 };
+  return {
+    list: { queryKey: ["strings", filter, projectKey],
+      queryFn: projectScopedQueryFn(projectKey, () => h.getStrings(filter)) },
+    detail: { queryKey: ["string", "A", projectKey],
+      queryFn: projectScopedQueryFn(projectKey, async () => h.rows.A) },
+  };
+}
+
+for (const status of [undefined, "translated", "approved", "reviewed"] as const) {
+  test(`approval then Editor navigation refreshes the ${status ?? "all"} table and selected detail`, async () => {
+    if (status === "reviewed") {
+      await startWith([{ ...row("A"), status: "reviewed" }, { ...row("B"), status: "pending" }]);
+    }
+    const queries = editorQueries(status);
+    await client.fetchQuery(queries.list);
+    await client.fetchQuery(queries.detail);
+    const statsKey = ["stats", projectKey];
+    client.setQueryData(statsKey, { approved: 0 });
+    if (!status) edit("Approved revision");
+    await approve();
+    assert.equal(h.saved[h.saved.length - 1]?.status, "approved", "the public save API returned approved");
+    button(t(status === "reviewed" ? "review.returnToEditor" : "common.exit")).props.onClick();
+    assert.deepEqual(h.navigations, ["/editor"]);
+    const table = new QueryObserver(client, queries.list);
+    const detail = new QueryObserver(client, queries.detail);
+    const unsubscribe = [table.subscribe(() => {}), detail.subscribe(() => {})];
+    try {
+      await settle();
+      const rows = table.getCurrentResult().data!.entries;
+      assert.deepEqual(rows.map(entry => [entry.id, entry.status]),
+        status === "translated" ? [["B", "translated"]] :
+        status === "reviewed" ? [] :
+        status === "approved" ? [["A", "approved"]] : [["A", "approved"], ["B", "translated"]]);
+      assert.equal(detail.getCurrentResult().data!.status, "approved");
+      assert.equal(detail.getCurrentResult().data!.translation, status ? "Translation A" : "Approved revision");
+      if (!status) assert.equal(rows[0].translation, "Approved revision");
+      assert.equal(client.getQueryState(statsKey)?.isInvalidated, true);
+    } finally { unsubscribe.forEach(stop => stop()); }
+  });
+}
+
+test("approval invalidates only this database's caches and leaves newer Editor drafts intact", async () => {
+  const own = [["strings", {}, projectKey], ["string", "A", projectKey], ["stats", projectKey]];
+  const others = [
+    { ...project, database_path: "/pivot.db" }, { ...project, path: "/other" },
+    { ...project, format_id: "rpgmaker-mv" },
+  ].flatMap(other => {
+    const key = draftProjectKey(other);
+    return [["strings", {}, key], ["string", "A", key], ["stats", key]];
+  });
+  const unrelated = [["config"], ["memory-suggestions", projectKey, "A"]];
+  for (const key of [...own, ...others, ...unrelated]) client.setQueryData(key, "cached");
+  const draftKey = draftEntryKey(projectKey, "A");
+  editDraft(draftKey, "Submitted Editor draft", "Translation A");
+  let finish!: () => void;
+  const saving = saveDraft(draftKey, "Translation A", () => new Promise<void>(resolve => { finish = resolve; }));
+  await Promise.resolve();
+  editDraft(draftKey, "Newer Editor draft");
+  const drafts = useDraftStore.getState().drafts;
+  assert.equal(drafts[draftKey].saving, true);
+  const reads = h.reads.length;
+  try {
+    await approve();
+    for (const key of own) assert.equal(client.getQueryState(key)?.isInvalidated, true, JSON.stringify(key));
+    for (const key of [...others, ...unrelated]) {
+      assert.equal(client.getQueryState(key)?.isInvalidated, false, JSON.stringify(key));
+      assert.equal(client.getQueryData(key), "cached");
+    }
+    assert.equal(h.reads.length, reads, "invalidation defers API reads until Editor navigation");
+    assert.equal(useDraftStore.getState().drafts, drafts, "approval cannot acknowledge a newer pending Editor draft");
+  } finally { finish(); await saving; }
+  assert.equal(useDraftStore.getState().drafts[draftKey].text, "Newer Editor draft");
+});
+
+for (const action of ["skip", "refused", "pending"] as const) {
+  test(`${action} approval does not invalidate or replace Editor cache data`, async () => {
+    const queries = editorQueries("translated");
+    const cached = await client.fetchQuery(queries.list);
+    client.setQueryData(["stats", projectKey], { approved: 0 });
+    let finish = () => {};
+    if (action === "skip") button(t("review.skip")).props.onClick();
+    else {
+      if (action === "refused") h.failure = new Error("Approval refused");
+      else h.waitForSave = new Promise<void>(resolve => { finish = resolve; });
+      button(t("review.approve")).props.onClick();
+      if (action === "refused") await settle();
+    }
+    try {
+      assert.equal(client.getQueryData(queries.list.queryKey), cached);
+      assert.equal(client.getQueryState(queries.list.queryKey)?.isInvalidated, false);
+      assert.equal(client.getQueryState(["stats", projectKey])?.isInvalidated, false);
+      assert.equal(h.invalidations, 0);
+      assert.deepEqual(h.saved, []);
+    } finally { finish(); await settle(); }
+  });
+}
+
+test("no project shows the empty state and refuses a previously captured approval handler", async () => {
+  const click = button(t("review.approve")).props.onClick;
+  useProjectStore.getState().clearProject();
+  click(); // The store can change before React has rendered the new project.
+  await settle();
+  assert.equal(textarea(), undefined);
+  assert.deepEqual(h.writes, []);
+  assert.equal(h.invalidations, 0);
+});
+
+for (const replacement of [
+  { ...project, database_path: "/pivot.db" }, { ...project, path: "/other" },
+  { ...project, format_id: "rpgmaker-mv" },
+]) {
+  test(`a pending approval cannot advance or invalidate the replacement project: ${draftProjectKey(replacement)}`, async () => {
+    const oldRows = h.rows;
+    const nextKey = draftProjectKey(replacement);
+    const oldCache = ["strings", {}, projectKey];
+    const nextCache = ["strings", {}, nextKey];
+    client.setQueryData(oldCache, "old cached");
+    client.setQueryData(nextCache, "next cached");
+    let finish!: () => void;
+    h.waitForSave = new Promise<void>(resolve => { finish = resolve; });
+    button(t("review.approve")).props.onClick();
+    useProjectStore.getState().setProject(replacement);
+    h.rows = { A: { ...row("A"), translation: "Replacement A" }, B: row("B") };
+    render();
+    finish();
+    await settle();
+    assert.equal(oldRows.A.status, "approved");
+    assert.equal(h.saved[h.saved.length - 1]?.status, "approved");
+    assert.equal(textarea().props.value, "Replacement A");
+    progress(1, 0);
+    assert.equal(client.getQueryState(oldCache)?.isInvalidated, true);
+    assert.equal(client.getQueryState(nextCache)?.isInvalidated, false);
+    assert.equal(client.getQueryData(nextCache), "next cached");
+  });
+}
 
 test("the approval decision preserves approved status and distinguishes cleared text from no change", () => {
   assert.deepEqual(reviewApprovalPatch(row("A"), "Translation A"), { status: "approved" });

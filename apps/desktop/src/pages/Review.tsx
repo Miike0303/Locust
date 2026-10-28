@@ -12,6 +12,8 @@ import DiffView from "../components/DiffView";
 import EmptyState from "../components/EmptyState";
 import { shouldHandleEscape, shouldRunActionHotkey } from "../lib/hotkeyPolicy";
 import { useProjectStore } from "../stores/projectStore";
+import { draftProjectKey, isProjectScopedQueryEnabled } from "../lib/projectScope";
+import { invalidateProjectData } from "../lib/queryClient";
 import { useT } from "../lib/i18n";
 import {
   applyBootstrap,
@@ -61,6 +63,7 @@ export default function Review() {
   const loadGenRef = useRef(0);
 
   const projectPath = project?.path ?? null;
+  const projectKey = project ? draftProjectKey(project) : "";
   const databasePath = project?.database_path ?? null;
   const format = project?.format_id ?? "";
 
@@ -89,7 +92,7 @@ export default function Review() {
     setLoadError(null);
     setInitialLoading(true);
     fetchingRef.current = false;
-  }, [projectPath]);
+  }, [projectKey]);
 
   const loadMore = useCallback(async () => {
     if (!projectPath || fetchingRef.current) return;
@@ -158,7 +161,7 @@ export default function Review() {
     ) {
       void loadMore();
     }
-  }, [projectPath]);
+  }, [projectPath, projectKey]);
 
   useEffect(() => {
     void loadMore();
@@ -214,7 +217,7 @@ export default function Review() {
   }, [entry?.id]);
 
   const handleApprove = useCallback(async () => {
-    if (approvingRef.current) return;
+    if (approvingRef.current || !projectKey || !isProjectScopedQueryEnabled(projectKey)) return;
     const state = queueRef.current;
     const id = state.items[state.index]?.id;
     const current = id ? byId[id] : undefined;
@@ -226,14 +229,17 @@ export default function Review() {
       const patch = reviewApprovalPatch(current, translation);
       if (patch) {
         const saved = await patchString(current.id, patch);
-        if (gen !== loadGenRef.current) return;
+        // Defer reads until Editor remounts; never refetch a different open database.
+        void invalidateProjectData(qc, projectKey, "none");
+        if (gen !== loadGenRef.current || !isProjectScopedQueryEnabled(projectKey)) return;
         setById((prev) => ({ ...prev, [current.id]: saved }));
+      } else {
+        void invalidateProjectData(qc, projectKey, "none");
       }
       setLoadError(null);
       const next = approveCurrent(queueRef.current, current.id);
       queueRef.current = next;
       setQueue(next);
-      void qc.invalidateQueries({ queryKey: ["stats"], refetchType: "none" });
     } catch (err: unknown) {
       if (gen === loadGenRef.current) {
         setLoadError(err instanceof Error ? err.message : String(err));
@@ -242,7 +248,7 @@ export default function Review() {
       approvingRef.current = false;
       setApproving(false);
     }
-  }, [byId, translation, qc]);
+  }, [byId, translation, qc, projectKey]);
 
   const handleSkip = useCallback(() => {
     if (approvingRef.current) return;
