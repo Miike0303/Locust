@@ -1,4 +1,4 @@
-//! Experimental adapter for explicitly selected standalone PCK v2.
+//! Experimental adapter for explicitly selected standalone PCK v2/v3.
 //!
 //! Positive profile: stock Dialogic syntax understood by `dialogic`, with unique
 //! `.dch` file stems in this archive as character identifiers. Display names are
@@ -377,7 +377,7 @@ impl FormatPlugin for GodotDialogicPlugin {
         "Godot / Dialogic (standalone PCK)"
     }
     fn description(&self) -> &str {
-        "Experimental stock Dialogic timelines in a selected standalone Godot 4.0–4.4 PCK v2; archive-only Replace."
+        "Experimental stock Dialogic timelines in a selected standalone Godot 4.0–4.4 PCK v2 or Godot 4.5+ PCK v3; archive-only Replace."
     }
     fn supported_extensions(&self) -> &[&str] {
         &["pck"]

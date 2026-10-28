@@ -89,7 +89,11 @@ fn godot_dialogic_detection_and_source_matrix() {
         .is_err());
     for (offset, value, message) in [
         (4, 1u32, "PCK format version unsupported (requires v2)"),
-        (4, 3, "PCK format version unsupported (requires v2)"),
+        (
+            4,
+            3,
+            "PCK v3 engine version unsupported (requires Godot 4.5+)",
+        ),
         (
             8,
             3,

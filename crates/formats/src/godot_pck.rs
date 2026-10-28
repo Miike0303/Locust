@@ -1,4 +1,4 @@
-//! Experimental standalone Godot PCK v2 metadata and streaming rebuild helpers.
+//! Experimental standalone Godot PCK v2/v3 metadata and streaming rebuild helpers.
 //!
 //! This is not a registered format or native Godot translation support.
 //! `read_index` reads metadata only: `stored_md5` remains an unauthenticated index
@@ -12,36 +12,42 @@
 //! `PackedSourcePCK::try_open_pack` in `file_access_pack.cpp`, and
 //! `PCKPacker::{pck_start,flush}` in `pck_packer.cpp` at that same commit.
 //!
-//! Only an offset-zero `GDPC`, little-endian v2 header is accepted. Engine versions
-//! 4.0 through 4.4 inclusive are the deliberately bounded profile, with any patch
-//! number (the primary reader ignores patch). Older majors and later minors are
-//! unsupported, not assertions that their archives are necessarily malformed.
-//! Header bytes: magic/version/major/minor/patch/flags (six u32s), file base (u64),
-//! sixteen reserved u32s, count (u32): 100 bytes. Reserved words are ignored by
-//! Godot, so we retain them without inventing a zero-only validity requirement.
+//! Only offset-zero `GDPC`, little-endian headers are accepted. Explicit profiles
+//! admit v2 / Godot 4.0–4.4 and v3 / Godot 4.5+ (major 4), with any patch number.
+//! V2 has six u32s, file base (u64), sixteen reserved u32s and count: 100 bytes.
+//! V3 inserts directory_offset (u64) at byte 32, moves reserved words to byte 40,
+//! and puts count at that directory: 104 fixed header bytes. V3 follows upstream
+//! [4.5 file_access_pack.cpp](https://github.com/godotengine/godot/blob/4.5/core/io/file_access_pack.cpp)
+//! and [pck_packer.cpp](https://github.com/godotengine/godot/blob/4.5/core/io/pck_packer.cpp).
+//! Reserved words are opaque and retained even when nonzero.
 //! Directory flag bit 0 and member flag bit 0 mean encryption: both are refused.
 //! Header bit 1 means file base relative to PCK start; at start zero it is an
-//! identity operation and is supported. All unknown flag bits are refused.
+//! identity operation and is supported. V3 file base and directory offset are
+//! always relative to PCK start. Sparse bundles (header bit 2), removal entries
+//! (member bit 1), and all unknown flag bits are refused.
 //!
 //! Entries contain a u32 padded path length, UTF-8 bytes, u64 relative offset,
 //! u64 size, 16 stored MD5 bytes, and u32 flags. The primary packer pads paths
 //! with 0–3 zero bytes to a four-byte boundary (no mandatory NUL terminator).
-//! We require that encoding. Paths must be `res://` virtual names, never host
-//! paths. Redundant `/` and `.` components are canonicalized; `..`, backslashes,
+//! We require that encoding. Paths can be bare or `res://` virtual names, never
+//! host paths; canonical identity always has `res://`. Redundant `/` and `.`
+//! components are canonicalized; `..`, backslashes,
 //! colons in the tail, control characters, empty names and directory-only names
 //! are refused. Names are case-sensitive, with no Unicode normalization.
 //!
 //! File base is not an index boundary: Godot adds it to each stored offset, so
-//! base zero with absolute stored offsets is valid. Resolved ranges must lie
-//! after the entire index and inside the file. This conservative profile refuses
+//! base zero with absolute stored offsets is valid. Checked ranges must be in
+//! bounds and disjoint from both header and directory. Payloads may precede or
+//! follow the directory. This conservative profile refuses
 //! **all nonempty overlaps**, including exact shared ranges, rather than claiming
 //! that a future writer can safely mutate aliases. Empty members have no occupied
-//! bytes; their offsets must still be at/after index end and at/before EOF, and
-//! may coincide with each other or with nonempty members. Empty archives work.
+//! bytes; their offsets must still be outside metadata and at/before EOF, and
+//! may coincide with each other or with nonempty members. Metadata ends are
+//! permitted; metadata starts are excluded. Empty archives work.
 //!
 //! # Bounds and separation
 //!
-//! At most 16 MiB of serialized index (excluding the 100-byte header), 100,000
+//! At most 16 MiB of directory (v2 records; v3 count plus records), 100,000
 //! entries, and 16 KiB per padded path. Count feasibility is checked before entry
 //! allocation; complete record and remaining-count bounds precede path allocation.
 //! Heap usage is O(bounded index bytes + bounded entry count), not a 16 MiB total
@@ -60,7 +66,10 @@
 //! words survive. Replacements keep the original path encoding and member flags;
 //! additions use canonical paths and zero flags, and follow caller order.
 //! Inter-member gaps, header padding and trailing bytes are regenerated, not
-//! preserved. `file_base` becomes the aligned index end and offsets are rebased.
+//! preserved. V2 `file_base` becomes aligned index end. V3 is preplanned as
+//! header, aligned payloads, then count/directory, with file base 128 and the new
+//! directory offset in the header. Empty final payloads receive a gap before the
+//! directory so their offsets remain outside metadata. All offsets are rebased.
 //! This agrees with the reader's
 //! [file-base addition and record layout](https://github.com/godotengine/godot/blob/77dcf97d82cbfe4e4615475fa52ca03da645dbd8/core/io/file_access_pack.cpp#L192-L247),
 //! including relative-to-start bit 1 at standalone offset zero; flag definitions
@@ -81,16 +90,65 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
 pub const HEADER_SIZE: u64 = 100;
+pub const V3_HEADER_SIZE: u64 = 104;
 pub const MAX_INDEX_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_ENTRIES: u32 = 100_000;
 pub const MAX_PATH_BYTES: u32 = 16 * 1024;
-// Smallest accepted path is "res://a", padded to eight bytes.
-const MIN_RECORD_BYTES: u64 = 4 + 8 + 36;
+// Smallest accepted serialized path is bare "a", padded to four bytes.
+const MIN_RECORD_BYTES: u64 = 4 + 4 + 36;
 const PACK_DIR_ENCRYPTED: u32 = 1;
 const PACK_REL_FILEBASE: u32 = 2;
+const PACK_SPARSE_BUNDLE: u32 = 4;
 const PACK_FILE_ENCRYPTED: u32 = 1;
+const PACK_FILE_REMOVAL: u32 = 2;
 const PAYLOAD_BUFFER_BYTES: usize = 64 * 1024;
 const ALIGNMENT: u64 = 32;
+
+#[derive(Clone, Copy)]
+enum VersionProfile {
+    V2,
+    V3,
+}
+
+impl VersionProfile {
+    fn from_version(version: u32) -> io::Result<Self> {
+        match version {
+            2 => Ok(Self::V2),
+            3 => Ok(Self::V3),
+            // Retain the legacy refusal diagnostic for existing callers.
+            _ => Err(invalid(
+                "PCK format version unsupported (requires v2) for Godot 4.0–4.4, or v3 for Godot 4.5+",
+            )),
+        }
+    }
+
+    fn header_size(self) -> u64 {
+        match self {
+            Self::V2 => HEADER_SIZE,
+            Self::V3 => V3_HEADER_SIZE,
+        }
+    }
+
+    fn reserved_position(self) -> usize {
+        match self {
+            Self::V2 => 32,
+            Self::V3 => 40,
+        }
+    }
+
+    fn check_engine(self, version: [u32; 3]) -> io::Result<()> {
+        match self {
+            Self::V2 if version[0] == 4 && version[1] <= 4 => Ok(()),
+            Self::V3 if version[0] == 4 && version[1] >= 5 => Ok(()),
+            Self::V2 => Err(invalid(
+                "PCK engine version unsupported (requires Godot 4.0–4.4)",
+            )),
+            Self::V3 => Err(invalid(
+                "PCK v3 engine version unsupported (requires Godot 4.5+)",
+            )),
+        }
+    }
+}
 
 /// One index record, in original directory order. All positions are absolute.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,9 +184,11 @@ pub struct PckIndex {
     pub flags: u32,
     /// Raw header field at byte 24; relative-to-start is identical at start zero.
     pub file_base: u64,
-    /// Opaque reserved words at bytes 32..96, preserved even when nonzero.
+    /// Opaque reserved words at bytes 32..96 (v2) or 40..104 (v3).
     pub reserved: [u32; 16],
-    /// First byte after the index, excluding any padding before payloads.
+    /// V2 first record (100); v3 count position from the header's byte-32 field.
+    pub directory_offset: u64,
+    /// First byte after the directory, excluding any following padding.
     pub index_end: u64,
     pub entries: Vec<PckEntry>,
 }
@@ -153,9 +213,7 @@ fn canonical_path(bytes: &[u8]) -> io::Result<String> {
     }
     let text = std::str::from_utf8(&bytes[..text_end])
         .map_err(|_| invalid("PCK path is not strict UTF-8"))?;
-    let tail = text
-        .strip_prefix("res://")
-        .ok_or_else(|| invalid("PCK path must be a res:// virtual name"))?;
+    let tail = text.strip_prefix("res://").unwrap_or(text);
     if tail.is_empty()
         || tail.starts_with('/')
         || tail.ends_with('/')
@@ -196,26 +254,31 @@ pub fn read_index<R: Read + Seek>(reader: &mut R) -> io::Result<PckIndex> {
         return Err(invalid("PCK header is truncated (requires 100 bytes)"));
     }
     reader.seek(SeekFrom::Start(0))?;
-    let mut header = [0; HEADER_SIZE as usize];
-    reader.read_exact(&mut header)?;
+    let mut header = [0; V3_HEADER_SIZE as usize];
+    reader.read_exact(&mut header[..HEADER_SIZE as usize])?;
     if &header[..4] != b"GDPC" {
         return Err(invalid(
             "PCK magic missing at offset zero; embedded/executable packs are unsupported",
         ));
     }
     let format_version = u32_at(&header, 4);
-    if format_version != 2 {
-        return Err(invalid("PCK format version unsupported (requires v2)"));
+    let profile = VersionProfile::from_version(format_version)?;
+    if file_size < profile.header_size() {
+        return Err(invalid("PCK v3 header is truncated (requires 104 bytes)"));
+    }
+    if matches!(profile, VersionProfile::V3) {
+        reader.read_exact(&mut header[HEADER_SIZE as usize..])?;
     }
     let engine_version = [u32_at(&header, 8), u32_at(&header, 12), u32_at(&header, 16)];
-    if engine_version[0] != 4 || engine_version[1] > 4 {
-        return Err(invalid(
-            "PCK engine version unsupported (requires Godot 4.0–4.4)",
-        ));
-    }
+    profile.check_engine(engine_version)?;
     let flags = u32_at(&header, 20);
     if flags & PACK_DIR_ENCRYPTED != 0 {
         return Err(invalid("PCK encrypted directory is unsupported"));
+    }
+    if flags & PACK_SPARSE_BUNDLE != 0 {
+        return Err(invalid(
+            "PCK unknown header flags are unsupported: sparse bundles",
+        ));
     }
     if flags & !(PACK_DIR_ENCRYPTED | PACK_REL_FILEBASE) != 0 {
         return Err(invalid("PCK unknown header flags are unsupported"));
@@ -226,19 +289,36 @@ pub fn read_index<R: Read + Seek>(reader: &mut R) -> io::Result<PckIndex> {
     }
     let mut reserved = [0; 16];
     for (i, word) in reserved.iter_mut().enumerate() {
-        *word = u32_at(&header, 32 + i * 4);
+        *word = u32_at(&header, profile.reserved_position() + i * 4);
     }
-    let count = u32_at(&header, 96);
+    let (directory_offset, mut position, count) = match profile {
+        VersionProfile::V2 => (HEADER_SIZE, HEADER_SIZE, u32_at(&header, 96)),
+        VersionProfile::V3 => {
+            let directory_offset = u64_at(&header, 32);
+            let records = directory_offset
+                .checked_add(4)
+                .ok_or_else(|| invalid("PCK directory offset overflow"))?;
+            if directory_offset < profile.header_size() {
+                return Err(invalid("PCK directory overlaps header"));
+            }
+            if records > file_size {
+                return Err(invalid("PCK directory count is truncated or exceeds EOF"));
+            }
+            reader.seek(SeekFrom::Start(directory_offset))?;
+            let mut count = [0; 4];
+            reader.read_exact(&mut count)?;
+            (directory_offset, records, u32::from_le_bytes(count))
+        }
+    };
     if count > MAX_ENTRIES {
         return Err(invalid("PCK entry count exceeds 100000 limit"));
     }
-    let index_limit = file_size.min(HEADER_SIZE + MAX_INDEX_BYTES);
+    let index_limit = file_size.min(directory_offset.saturating_add(MAX_INDEX_BYTES));
     let minimum_bytes = u64::from(count) * MIN_RECORD_BYTES;
-    if minimum_bytes > index_limit - HEADER_SIZE {
+    if minimum_bytes > index_limit - position {
         return Err(invalid("PCK entry count cannot fit bounded index"));
     }
     let mut entries = Vec::with_capacity(count as usize);
-    let mut position = HEADER_SIZE;
     for number in 0..count {
         let path_length_position = position;
         // The previous feasibility check covers at least the length word.
@@ -274,6 +354,11 @@ pub fn read_index<R: Read + Seek>(reader: &mut R) -> io::Result<PckIndex> {
         let flags = u32_at(&fields, 32);
         if flags & PACK_FILE_ENCRYPTED != 0 {
             return Err(invalid("PCK encrypted member is unsupported"));
+        }
+        if flags & PACK_FILE_REMOVAL != 0 {
+            return Err(invalid(
+                "PCK unknown member flags are unsupported: removal entries",
+            ));
         }
         if flags != 0 {
             return Err(invalid("PCK unknown member flags are unsupported"));
@@ -311,7 +396,11 @@ pub fn read_index<R: Read + Seek>(reader: &mut R) -> io::Result<PckIndex> {
         if !names.insert(entry.path.as_str()) {
             return Err(invalid("PCK duplicate canonical virtual identity"));
         }
-        if entry.offset < position {
+        let end = entry.offset + entry.size; // Both additions checked above.
+        let in_header = entry.offset < profile.header_size();
+        let in_directory =
+            entry.offset < position && (end > directory_offset || entry.offset >= directory_offset);
+        if in_header || in_directory {
             return Err(invalid("PCK member overlaps header or index"));
         }
         if entry.size != 0 {
@@ -332,6 +421,7 @@ pub fn read_index<R: Read + Seek>(reader: &mut R) -> io::Result<PckIndex> {
         flags,
         file_base,
         reserved,
+        directory_offset,
         index_end: position,
         entries,
     })
@@ -411,7 +501,10 @@ fn aligned(position: u64) -> io::Result<u64> {
 }
 
 fn check_key(path: &str) -> io::Result<()> {
-    if path.len() > MAX_PATH_BYTES as usize || canonical_path(path.as_bytes())? != path {
+    // A maximal bare serialized name gains six bytes in canonical identity.
+    if path.len() > MAX_PATH_BYTES as usize + "res://".len()
+        || canonical_path(path.as_bytes())? != path
+    {
         return Err(invalid(
             "PCK change key must be a bounded canonical virtual path",
         ));
@@ -455,21 +548,17 @@ pub fn rebuild<R: Read + Seek, W: Write>(
             return Err(invalid("PCK duplicate replacement key"));
         }
     }
-    let mut index_end = index.index_end;
     for &(path, _) in additions {
         check_key(path)?;
+        if path.len().div_ceil(4) * 4 > MAX_PATH_BYTES as usize {
+            return Err(invalid("PCK added padded path exceeds 16 KiB"));
+        }
         if !names.insert(path) {
             return Err(invalid(
                 "PCK addition collides with an existing name or key",
             ));
         }
-        let path_size = path.len().div_ceil(4) * 4;
-        index_end = checked_add(index_end, 40 + path_size as u64)?;
-        if index_end - HEADER_SIZE > MAX_INDEX_BYTES {
-            return Err(invalid("PCK rebuilt index exceeds bounded index"));
-        }
     }
-    let file_base = aligned(index_end)?;
     let mut entries = Vec::with_capacity(count);
     let mut payloads = Vec::with_capacity(count);
     for old in &index.entries {
@@ -503,28 +592,68 @@ pub fn rebuild<R: Read + Seek, W: Write>(
         });
         payloads.push(Some(bytes));
     }
-    let mut position = HEADER_SIZE;
+    let profile = VersionProfile::from_version(index.format_version)?;
+    let mut directory_bytes = if matches!(profile, VersionProfile::V3) {
+        4
+    } else {
+        0
+    };
+    for entry in &entries {
+        directory_bytes = checked_add(directory_bytes, 40 + u64::from(entry.path_length))?;
+    }
+    if directory_bytes > MAX_INDEX_BYTES {
+        return Err(invalid("PCK rebuilt index exceeds bounded index"));
+    }
+    let file_base = match profile {
+        VersionProfile::V2 => aligned(checked_add(HEADER_SIZE, directory_bytes)?)?,
+        VersionProfile::V3 => aligned(V3_HEADER_SIZE)?,
+    };
     let mut payload_position = file_base;
     for entry in &mut entries {
-        entry.path_length_position = position;
-        entry.path_position = position + 4;
-        entry.offset_position = entry.path_position + u64::from(entry.path_length);
-        entry.size_position = entry.offset_position + 8;
-        entry.md5_position = entry.offset_position + 16;
-        entry.flags_position = entry.offset_position + 32;
-        position = entry.offset_position + 36;
         entry.offset = payload_position;
         entry.stored_offset = payload_position - file_base;
         payload_position = aligned(checked_add(payload_position, entry.size)?)?;
     }
+    let directory_offset = match profile {
+        VersionProfile::V2 => HEADER_SIZE,
+        VersionProfile::V3 => {
+            // Keep zero-length members' offsets outside directory metadata too.
+            if entries
+                .iter()
+                .any(|e| e.size == 0 && e.offset == payload_position)
+            {
+                checked_add(payload_position, ALIGNMENT)?
+            } else {
+                payload_position
+            }
+        }
+    };
+    let index_end = checked_add(directory_offset, directory_bytes)?;
+    let mut position = match profile {
+        VersionProfile::V2 => directory_offset,
+        VersionProfile::V3 => checked_add(directory_offset, 4)?,
+    };
+    for entry in &mut entries {
+        entry.path_length_position = position;
+        entry.path_position = checked_add(position, 4)?;
+        entry.offset_position = checked_add(entry.path_position, u64::from(entry.path_length))?;
+        entry.size_position = checked_add(entry.offset_position, 8)?;
+        entry.md5_position = checked_add(entry.offset_position, 16)?;
+        entry.flags_position = checked_add(entry.offset_position, 32)?;
+        position = checked_add(entry.offset_position, 36)?;
+    }
     let plan = RebuildPlan {
         index: PckIndex {
-            file_size: payload_position,
+            file_size: match profile {
+                VersionProfile::V2 => payload_position,
+                VersionProfile::V3 => index_end,
+            },
             format_version: index.format_version,
             engine_version: index.engine_version,
             flags: index.flags,
             file_base,
             reserved: index.reserved,
+            directory_offset,
             index_end,
             entries,
         },
@@ -540,20 +669,22 @@ pub fn rebuild<R: Read + Seek, W: Write>(
         output.write_all(&word.to_le_bytes())?;
     }
     output.write_all(&file_base.to_le_bytes())?;
+    if matches!(profile, VersionProfile::V3) {
+        output.write_all(&directory_offset.to_le_bytes())?;
+    }
     for word in index.reserved {
         output.write_all(&word.to_le_bytes())?;
     }
-    output.write_all(&(count as u32).to_le_bytes())?;
-    for entry in &plan.index.entries {
-        output.write_all(&entry.path_length.to_le_bytes())?;
-        output.write_all(&entry.padded_path)?;
-        output.write_all(&entry.stored_offset.to_le_bytes())?;
-        output.write_all(&entry.size.to_le_bytes())?;
-        output.write_all(&entry.stored_md5)?;
-        output.write_all(&entry.flags.to_le_bytes())?;
-    }
     let padding = [0; ALIGNMENT as usize];
-    output.write_all(&padding[..(file_base - index_end) as usize])?;
+    match profile {
+        VersionProfile::V2 => {
+            write_directory(output, &plan.index)?;
+            output.write_all(&padding[..(file_base - index_end) as usize])?;
+        }
+        VersionProfile::V3 => {
+            output.write_all(&padding[..(file_base - V3_HEADER_SIZE) as usize])?;
+        }
+    }
     for (number, entry) in plan.index.entries.iter().enumerate() {
         if let Some(bytes) = payloads[number] {
             for chunk in bytes.chunks(PAYLOAD_BUFFER_BYTES) {
@@ -565,7 +696,24 @@ pub fn rebuild<R: Read + Seek, W: Write>(
         let end = entry.offset + entry.size; // Checked during planning, including padding.
         output.write_all(&padding[..(aligned(end)? - end) as usize])?;
     }
+    if matches!(profile, VersionProfile::V3) {
+        output.write_all(&padding[..(directory_offset - payload_position) as usize])?;
+        write_directory(output, &plan.index)?;
+    }
     Ok(plan)
+}
+
+fn write_directory<W: Write>(output: &mut W, index: &PckIndex) -> io::Result<()> {
+    output.write_all(&(index.entries.len() as u32).to_le_bytes())?;
+    for entry in &index.entries {
+        output.write_all(&entry.path_length.to_le_bytes())?;
+        output.write_all(&entry.padded_path)?;
+        output.write_all(&entry.stored_offset.to_le_bytes())?;
+        output.write_all(&entry.size.to_le_bytes())?;
+        output.write_all(&entry.stored_md5)?;
+        output.write_all(&entry.flags.to_le_bytes())?;
+    }
+    Ok(())
 }
 
 /// Independently parse the completed output, compare every planned header/entry

@@ -579,12 +579,12 @@ fn reads_multiple_members_with_independent_field_positions() {
 fn godot_refuses_unsupported_pack_version() {
     for minor in [3, 4, 5] {
         let mut bytes = two_members_for_engine(minor);
-        put32(&mut bytes, 4, 3);
+        put32(&mut bytes, 4, 4);
         let error = read_index(&mut Cursor::new(bytes)).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert_eq!(
             error.to_string(),
-            "PCK format version unsupported (requires v2)"
+            "PCK format version unsupported (requires v2) for Godot 4.0–4.4, or v3 for Godot 4.5+"
         );
     }
 }
@@ -722,7 +722,7 @@ fn checks_path_allocation_bounds_before_reading_path_bytes() {
         assert_eq!(reader.position(), 104);
     }
     // Length is within the per-path cap, but cannot fit the file/remaining entry.
-    for length in [40, 16_384] {
+    for length in [44, 16_384] {
         let mut bytes = two_members();
         put32(&mut bytes, 100, length);
         let mut reader = Cursor::new(bytes);
@@ -770,7 +770,6 @@ fn refuses_interior_nul_excess_padding_and_invalid_utf8() {
 fn refuses_host_paths_traversal_controls_and_directory_names() {
     for name in [
         "",
-        "a.dtl",
         "/a",
         "C:/a",
         "C:\\a",

@@ -6,15 +6,27 @@ archive; review warnings and translations before installing it.
 
 ## Supported input
 
-- A **standalone `.pck` file**, **Godot 4.0–4.4 PCK v2**.
+- A **standalone `.pck` file** at offset zero, little-endian and plain:
+  **Godot 4.0–4.4 PCK v2** or **Godot 4.5+ PCK v3** (engine major 4).
+- Both bare and `res://` member paths; canonical identities use `res://` while
+  rebuilds preserve each original serialized spelling, member order, version,
+  flags and reserved words.
 - Dialogic `.dtl` timelines using the supported stock syntax.
 - `.dch` file stems identify speakers; character display names are not translated.
 
 Select the **`.pck` file**, not its folder or the game executable. Folder selection
 is refused before backup or copying; this format never adopts the parent folder.
-Embedded packs in executables and encrypted packs are unsupported.
+Embedded packs in executables, directory/member encryption, sparse bundles,
+removal entries and unknown flags are unsupported. Unsafe or colliding paths,
+overlapping payloads/metadata, out-of-bounds ranges, overflow and truncated
+headers/directories are refused. Reader limits remain 100,000 entries, 16 KiB
+per padded path and 16 MiB of directory records (including the v3 count).
 
-Godot 4.4 support is proven on synthetic fixtures only; no real 4.4 game has been verified.
+Godot 4.4 v2 and 4.5+ v3 support is proven on synthetic fixtures only; no real
+4.4/v3 game or engine launch has been verified. Independent hand-built fixtures
+cover `.dtl`, `.dch`, opaque `.uid`/`.remap` sidecars and binary members. Sidecars
+are preserved byte for byte; their presence does not establish that remapped
+or custom-addon resources can be translated.
 
 The compatible Dialogic reference is **2.0-alpha-16**. This does not identify the
 installed addon version.
@@ -88,6 +100,10 @@ locust inject "<game>.pck" -P "<db>" -l es --direct
 
 Each member read is MD5-checked. Rewriting streams the archive, verifies the
 result before atomic installation, and retains the previous archive.
+V2 keeps its directory-before-payload layout; v3 writes aligned payloads before
+the trailing directory. Unchanged member payloads remain byte-identical;
+container padding and offsets are regenerated. Recovery restores the exact
+original archive from backup.
 
 ## Package, apply and roll back a patch
 
@@ -106,6 +122,12 @@ Applying an already-applied patch is refused. Rollback restores the exact origin
 archive, after which the same patch can be applied again.
 
 ## Limitations and recorded verification
+
+**Synthetic v3 verification:** independently assembled fixtures exercise
+metadata-only reading, refusal cases, grow/shrink/empty rebuilds, an independent
+byte/MD5 oracle, Replace, Direct revisions and no-ops, strict whole-PCK packing,
+apply/already-applied refusal, exact rollback and reapply. The v2 lifecycle suite
+also runs its revision, drift, provenance, scope and recovery checks for v3.
 
 **Verified on 2026-10-15:** owned copies of one installed game; the original was
 never modified. These results establish resource preservation and recovery:
