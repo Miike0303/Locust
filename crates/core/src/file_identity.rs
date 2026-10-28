@@ -1,7 +1,9 @@
+//! Physical file identities shared by filesystem readers and writers.
 use std::{fs::File, io};
 
+/// An open file's filesystem and file identifier, independent of its path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct FileIdentity {
+pub struct FileIdentity {
     volume: u64,
     index: u64,
 }
@@ -15,7 +17,9 @@ pub(crate) fn same_file(left: &File, right: &File) -> bool {
         .is_some_and(|(a, b)| a == b)
 }
 
-pub(crate) fn identity(file: &File) -> io::Result<FileIdentity> {
+/// Identify an open file. Keep its handle open while comparing identities so a
+/// deleted file's identifier cannot be reused for an unrelated file.
+pub fn identity(file: &File) -> io::Result<FileIdentity> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;

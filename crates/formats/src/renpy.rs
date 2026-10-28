@@ -49,6 +49,12 @@ impl Drop for TempDirGuard {
     }
 }
 
+struct PreparedLooseFile {
+    source: String,
+    output: Option<String>,
+    written: usize,
+}
+
 impl RenPyPlugin {
     pub fn new() -> Self {
         Self
@@ -125,6 +131,20 @@ impl RenPyPlugin {
         id_prefix: &str,
         warnings: &mut Vec<String>,
     ) -> Vec<StringEntry> {
+        let before = warnings.len();
+        let entries = Self::extract_rpyc_quiet(file, original, id_prefix, warnings);
+        for warning in &warnings[before..] {
+            tracing::warn!("{warning}");
+        }
+        entries
+    }
+
+    fn extract_rpyc_quiet(
+        file: &Path,
+        original: &Path,
+        id_prefix: &str,
+        warnings: &mut Vec<String>,
+    ) -> Vec<StringEntry> {
         let (strings, warning) = match Self::read_rpyc_bytes(file) {
             Ok(bytes) => harvest_rpyc_strings_with_diagnostics(&bytes),
             Err(error) => (
@@ -134,7 +154,6 @@ impl RenPyPlugin {
         };
         if let Some(reason) = warning {
             let warning = format!("{} ({id_prefix}): {reason}", original.display());
-            tracing::warn!("{warning}");
             warnings.push(warning);
         }
         strings
@@ -750,6 +769,73 @@ impl RenPyPlugin {
             &names,
             &file.file_name().unwrap_or_default().to_string_lossy(),
         )
+    }
+
+    fn prepare_loose_file(
+        file_path: &Path,
+        file_entries: &[&StringEntry],
+        content: String,
+    ) -> PreparedLooseFile {
+        let mut written = 0;
+        let filename = file_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        // The current extraction pass is the write allow-list. It carries
+        // the extractor's stateful exclusions, so a stale row cannot turn
+        // an arbitrary code literal at the old line number into a target.
+        let current_sources: std::collections::HashSet<(usize, String)> =
+            Self::extract_content(file_path, &content)
+                .into_iter()
+                .filter_map(|entry| {
+                    entry_line_number(&entry.id, &filename).map(|line| (line, entry.source))
+                })
+                .collect();
+
+        // Entries are only counted as written after an exact current-source
+        // match and a replacement of the extractor-selected literal.
+        let mut line_translations: HashMap<usize, &StringEntry> = HashMap::new();
+        for entry in file_entries {
+            if let (Some(line_num), Some(translation)) = (
+                entry_line_number(&entry.id, &filename),
+                entry.translation.as_deref(),
+            ) {
+                if translation != entry.source.as_str() {
+                    line_translations.insert(line_num, entry);
+                }
+            }
+        }
+
+        let mut new_lines = Vec::new();
+        let mut modified = false;
+        // Retain per-line terminators rather than normalizing the script
+        // or dropping its final newline when a selected literal changes.
+        for (line_idx, line) in content.split_inclusive('\n').enumerate() {
+            let line_num = line_idx + 1;
+            let mut replaced_line = None;
+            if let Some(entry) = line_translations.get(&line_num) {
+                if current_sources.contains(&(line_num, entry.source.clone())) {
+                    if let Some(translation) = entry.translation.as_deref() {
+                        replaced_line = replace_extracted_literal(line, &entry.source, translation);
+                    }
+                }
+            }
+            if let Some(new_line) = replaced_line {
+                new_lines.push(new_line);
+                written += 1;
+                modified = true;
+            } else {
+                new_lines.push(line.to_string());
+            }
+        }
+
+        PreparedLooseFile {
+            source: content,
+            output: modified.then(|| new_lines.concat()),
+            written,
+        }
     }
 
     fn extract_file(file_path: &Path) -> Result<Vec<StringEntry>> {
@@ -2712,21 +2798,72 @@ impl FormatPlugin for RenPyPlugin {
             .collect();
         let names: HashSet<_> = relative_names.iter().map(String::as_str).collect();
         let mut all = Vec::new();
-        for (file, relative) in files.iter().zip(&relative_names) {
-            if file.extension().is_some_and(|ext| ext == "rpyc") {
-                if Self::has_rpy_twin(&names, relative) {
-                    continue;
-                }
-                // Loose IDs: <relative path>#sN. Archived IDs retain the
-                // existing <archive filename>#<relative path>#sN prefix.
-                all.extend(Self::extract_rpyc(file, file, relative, &mut warnings));
-            } else {
-                match Self::extract_file(file) {
-                    Ok(entries) => all.extend(entries),
-                    Err(e) => {
-                        let warning = format!("Failed to extract {}: {e}", file.display());
+        if crate::file_workers::parallel(
+            crate::file_workers::Phase::RenpyExtract,
+            files.len(),
+            || {
+                let (min_files, min_bytes, _) =
+                    crate::file_workers::thresholds(crate::file_workers::Phase::RenpyExtract);
+                files
+                    .iter()
+                    .filter(|file| {
+                        file.metadata()
+                            .is_ok_and(|metadata| metadata.len() >= min_bytes)
+                    })
+                    .take(min_files)
+                    .count()
+                    == min_files
+            },
+        ) {
+            let loose: Vec<_> = files.iter().zip(&relative_names).collect();
+            crate::file_workers::ordered(
+                &loose,
+                |(file, relative)| {
+                    let mut warnings = Vec::new();
+                    let entries = if file.extension().is_some_and(|ext| ext == "rpyc") {
+                        if Self::has_rpy_twin(&names, relative) {
+                            Vec::new()
+                        } else {
+                            Self::extract_rpyc_quiet(file, file, relative, &mut warnings)
+                        }
+                    } else {
+                        match Self::extract_file(file) {
+                            Ok(entries) => entries,
+                            Err(error) => {
+                                warnings
+                                    .push(format!("Failed to extract {}: {error}", file.display()));
+                                Vec::new()
+                            }
+                        }
+                    };
+                    (entries, warnings)
+                },
+                |_, (entries, file_warnings)| -> Result<()> {
+                    all.extend(entries);
+                    for warning in file_warnings {
                         tracing::warn!("{warning}");
                         warnings.push(warning);
+                    }
+                    Ok(())
+                },
+            )?;
+        } else {
+            for (file, relative) in files.iter().zip(&relative_names) {
+                if file.extension().is_some_and(|ext| ext == "rpyc") {
+                    if Self::has_rpy_twin(&names, relative) {
+                        continue;
+                    }
+                    // Loose IDs: <relative path>#sN. Archived IDs retain the
+                    // existing <archive filename>#<relative path>#sN prefix.
+                    all.extend(Self::extract_rpyc(file, file, relative, &mut warnings));
+                } else {
+                    match Self::extract_file(file) {
+                        Ok(entries) => all.extend(entries),
+                        Err(e) => {
+                            let warning = format!("Failed to extract {}: {e}", file.display());
+                            tracing::warn!("{warning}");
+                            warnings.push(warning);
+                        }
                     }
                 }
             }
@@ -2938,85 +3075,160 @@ impl FormatPlugin for RenPyPlugin {
         let mut strings_written = 0;
         let mut files_written: Vec<PathBuf> = Vec::new();
 
-        // Group loose (non-archive) entries by file
+        // Group loose entries in first-seen order so reports, errors and writes
+        // do not depend on the HashMap's randomized iteration order.
         let mut by_file: HashMap<PathBuf, Vec<&StringEntry>> = HashMap::new();
+        let mut file_order = Vec::new();
         for entry in &loose_entries {
             by_file
                 .entry(entry.file_path.clone())
-                .or_default()
+                .or_insert_with(|| {
+                    file_order.push(entry.file_path.clone());
+                    Vec::new()
+                })
                 .push(entry);
         }
 
-        for (file_path, file_entries) in &by_file {
-            if !file_path.exists() {
-                continue;
-            }
-            let content = std::fs::read_to_string(file_path)?;
-            let filename = file_path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-
-            // The current extraction pass is the write allow-list. It carries
-            // the extractor's stateful exclusions, so a stale row cannot turn
-            // an arbitrary code literal at the old line number into a target.
-            let current_sources: std::collections::HashSet<(usize, String)> =
-                Self::extract_file(file_path)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(|entry| {
-                        entry_line_number(&entry.id, &filename).map(|line| (line, entry.source))
-                    })
-                    .collect();
-
-            // Entries are only counted as written after an exact current-source
-            // match and a replacement of the extractor-selected literal.
-            let mut line_translations: HashMap<usize, &StringEntry> = HashMap::new();
-            for entry in file_entries {
-                if let (Some(line_num), Some(translation)) = (
-                    entry_line_number(&entry.id, &filename),
-                    entry.translation.as_deref(),
-                ) {
-                    if translation != entry.source.as_str() {
-                        line_translations.insert(line_num, entry);
+        if crate::file_workers::parallel(
+            crate::file_workers::Phase::RenpyInject,
+            file_order.len(),
+            || {
+                let (min_files, _, min_entries) =
+                    crate::file_workers::thresholds(crate::file_workers::Phase::RenpyInject);
+                by_file
+                    .values()
+                    .filter(|entries| entries.len() >= min_entries)
+                    .take(min_files)
+                    .count()
+                    == min_files
+            },
+        ) && crate::file_workers::independent_files(&file_order)
+        {
+            crate::file_workers::ordered(
+                &file_order,
+                |file_path| -> Result<_> {
+                    if !file_path.exists() {
+                        return Ok(None);
                     }
+                    let content = std::fs::read_to_string(file_path)?;
+                    Ok(Some(Self::prepare_loose_file(
+                        file_path,
+                        &by_file[file_path],
+                        content,
+                    )))
+                },
+                |file_path, prepared| -> Result<()> {
+                    if !file_path.exists() {
+                        return Ok(());
+                    }
+                    // An alias may have been read during a preceding write. Retry
+                    // speculative read errors only once the coordinator reaches it.
+                    let prepared = prepared.or_else(|_| -> Result<_> {
+                        if !file_path.exists() {
+                            return Ok(None);
+                        }
+                        Ok(Some(Self::prepare_loose_file(
+                            file_path,
+                            &by_file[file_path],
+                            std::fs::read_to_string(file_path)?,
+                        )))
+                    })?;
+                    let Some(mut prepared) = prepared else {
+                        return Ok(());
+                    };
+                    // Earlier groups may alias this file (including hard links).
+                    // Reprepare against their committed bytes, as a serial run would.
+                    let current = std::fs::read_to_string(file_path)?;
+                    if current != prepared.source {
+                        prepared =
+                            Self::prepare_loose_file(file_path, &by_file[file_path], current);
+                    }
+                    if let Some(output) = prepared.output {
+                        std::fs::write(file_path, output)?;
+                        strings_written += prepared.written;
+                        files_modified += 1;
+                        files_written.push(file_path.clone());
+                        let rpyc_path = file_path.with_extension("rpyc");
+                        if rpyc_path.exists() {
+                            let _ = std::fs::remove_file(&rpyc_path);
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
+        } else {
+            for file_path in &file_order {
+                let file_entries = &by_file[file_path];
+                if !file_path.exists() {
+                    continue;
                 }
-            }
+                let content = std::fs::read_to_string(file_path)?;
+                let filename = file_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
 
-            let mut new_lines = Vec::new();
-            let mut modified = false;
-            // Retain per-line terminators rather than normalizing the script
-            // or dropping its final newline when a selected literal changes.
-            for (line_idx, line) in content.split_inclusive('\n').enumerate() {
-                let line_num = line_idx + 1;
-                let mut replaced_line = None;
-                if let Some(entry) = line_translations.get(&line_num) {
-                    if current_sources.contains(&(line_num, entry.source.clone())) {
-                        if let Some(translation) = entry.translation.as_deref() {
-                            replaced_line =
-                                replace_extracted_literal(line, &entry.source, translation);
+                // The current extraction pass is the write allow-list. It carries
+                // the extractor's stateful exclusions, so a stale row cannot turn
+                // an arbitrary code literal at the old line number into a target.
+                let current_sources: std::collections::HashSet<(usize, String)> =
+                    Self::extract_file(file_path)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|entry| {
+                            entry_line_number(&entry.id, &filename).map(|line| (line, entry.source))
+                        })
+                        .collect();
+
+                // Entries are only counted as written after an exact current-source
+                // match and a replacement of the extractor-selected literal.
+                let mut line_translations: HashMap<usize, &StringEntry> = HashMap::new();
+                for entry in file_entries {
+                    if let (Some(line_num), Some(translation)) = (
+                        entry_line_number(&entry.id, &filename),
+                        entry.translation.as_deref(),
+                    ) {
+                        if translation != entry.source.as_str() {
+                            line_translations.insert(line_num, entry);
                         }
                     }
                 }
-                if let Some(new_line) = replaced_line {
-                    new_lines.push(new_line);
-                    strings_written += 1;
-                    modified = true;
-                } else {
-                    new_lines.push(line.to_string());
+
+                let mut new_lines = Vec::new();
+                let mut modified = false;
+                // Retain per-line terminators rather than normalizing the script
+                // or dropping its final newline when a selected literal changes.
+                for (line_idx, line) in content.split_inclusive('\n').enumerate() {
+                    let line_num = line_idx + 1;
+                    let mut replaced_line = None;
+                    if let Some(entry) = line_translations.get(&line_num) {
+                        if current_sources.contains(&(line_num, entry.source.clone())) {
+                            if let Some(translation) = entry.translation.as_deref() {
+                                replaced_line =
+                                    replace_extracted_literal(line, &entry.source, translation);
+                            }
+                        }
+                    }
+                    if let Some(new_line) = replaced_line {
+                        new_lines.push(new_line);
+                        strings_written += 1;
+                        modified = true;
+                    } else {
+                        new_lines.push(line.to_string());
+                    }
                 }
-            }
 
-            if modified {
-                std::fs::write(file_path, new_lines.concat())?;
-                files_modified += 1;
-                files_written.push(file_path.clone());
+                if modified {
+                    std::fs::write(file_path, new_lines.concat())?;
+                    files_modified += 1;
+                    files_written.push(file_path.clone());
 
-                // Delete corresponding .rpyc so Ren'Py recompiles from the modified .rpy
-                let rpyc_path = file_path.with_extension("rpyc");
-                if rpyc_path.exists() {
-                    let _ = std::fs::remove_file(&rpyc_path);
+                    // Delete corresponding .rpyc so Ren'Py recompiles from the modified .rpy
+                    let rpyc_path = file_path.with_extension("rpyc");
+                    if rpyc_path.exists() {
+                        let _ = std::fs::remove_file(&rpyc_path);
+                    }
                 }
             }
         }

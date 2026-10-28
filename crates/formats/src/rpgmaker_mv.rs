@@ -214,6 +214,17 @@ pub enum MvMzVersion {
 
 pub struct RpgMakerMvPlugin;
 
+enum DataOutput {
+    Pristine(Vec<u8>),
+    Encoded(String),
+}
+
+struct PreparedDataFile {
+    source: Option<Vec<u8>>,
+    output: Option<DataOutput>,
+    report: InjectionReport,
+}
+
 impl RpgMakerMvPlugin {
     pub fn new() -> Self {
         Self
@@ -239,6 +250,22 @@ impl RpgMakerMvPlugin {
             }
         }
         None
+    }
+
+    /// Keep the streaming serial traversal for counts outside the parallel gate.
+    /// Probe errors are handled by that traversal at their original position.
+    fn has_parallel_file_count(data_dir: &Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(data_dir) else {
+            return false;
+        };
+        let mut count = 0;
+        for entry in entries.take(65) {
+            if entry.is_err() {
+                return false;
+            }
+            count += 1;
+        }
+        (2..=64).contains(&count)
     }
 
     fn has_rpgmaker_json(dir: &Path) -> bool {
@@ -1538,21 +1565,71 @@ impl RpgMakerMvPlugin {
         };
 
         let mut all = Vec::new();
-        for (pack, lang, path) in packs {
-            if lang != source_lang {
-                continue;
-            }
-            match Self::extract_iavra_pack_file(&path) {
-                Ok(entries) => {
-                    tracing::info!("Iavra pack {} ({}): {} strings", pack, lang, entries.len());
-                    all.extend(entries);
+        if crate::file_workers::parallel(
+            crate::file_workers::Phase::RpgExtract,
+            packs.len(),
+            || {
+                let (min_files, min_bytes, _) =
+                    crate::file_workers::thresholds(crate::file_workers::Phase::RpgExtract);
+                packs
+                    .iter()
+                    .filter(|(_, lang, path)| {
+                        *lang == source_lang
+                            && path
+                                .metadata()
+                                .is_ok_and(|metadata| metadata.len() >= min_bytes)
+                    })
+                    .take(min_files)
+                    .count()
+                    == min_files
+            },
+        ) {
+            let selected: Vec<_> = packs
+                .into_iter()
+                .filter(|(_, lang, _)| *lang == source_lang)
+                .collect();
+            crate::file_workers::ordered(
+                &selected,
+                |(_, _, path)| Self::extract_iavra_pack_file(path),
+                |(pack, lang, path), result| -> Result<()> {
+                    match result {
+                        Ok(entries) => {
+                            tracing::info!(
+                                "Iavra pack {} ({}): {} strings",
+                                pack,
+                                lang,
+                                entries.len()
+                            );
+                            all.extend(entries);
+                        }
+                        Err(error) => {
+                            tracing::warn!("Failed Iavra pack {}: {}", path.display(), error);
+                            warnings.push(format!(
+                                "skipped Iavra pack {}: {error}",
+                                path.strip_prefix(data_dir).unwrap_or(path).display()
+                            ));
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
+        } else {
+            for (pack, lang, path) in packs {
+                if lang != source_lang {
+                    continue;
                 }
-                Err(e) => {
-                    tracing::warn!("Failed Iavra pack {}: {}", path.display(), e);
-                    warnings.push(format!(
-                        "skipped Iavra pack {}: {e}",
-                        path.strip_prefix(data_dir).unwrap_or(&path).display()
-                    ));
+                match Self::extract_iavra_pack_file(&path) {
+                    Ok(entries) => {
+                        tracing::info!("Iavra pack {} ({}): {} strings", pack, lang, entries.len());
+                        all.extend(entries);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed Iavra pack {}: {}", path.display(), e);
+                        warnings.push(format!(
+                            "skipped Iavra pack {}: {e}",
+                            path.strip_prefix(data_dir).unwrap_or(&path).display()
+                        ));
+                    }
                 }
             }
         }
@@ -1938,22 +2015,112 @@ impl FormatPlugin for RpgMakerMvPlugin {
             }
         }
 
-        for dir_entry in std::fs::read_dir(&data_dir)? {
-            let dir_entry = dir_entry?;
-            let file_path = dir_entry.path();
-            if let Some(name) = file_path.file_name().and_then(|n| n.to_str()) {
-                if Self::is_known_data_file(name) {
-                    match Self::extract_file(&file_path) {
-                        Ok(entries) => all_entries.extend(entries),
-                        Err(e) => {
-                            tracing::warn!("Failed to extract {}: {}", file_path.display(), e);
-                            warnings.push(format!(
-                                "skipped database file {}: {e}",
-                                file_path.strip_prefix(path).unwrap_or(&file_path).display()
-                            ));
+        if crate::file_workers::worker_count() == 1 || !Self::has_parallel_file_count(&data_dir) {
+            for dir_entry in std::fs::read_dir(&data_dir)? {
+                let dir_entry = dir_entry?;
+                let file_path = dir_entry.path();
+                if let Some(name) = file_path.file_name().and_then(|n| n.to_str()) {
+                    if Self::is_known_data_file(name) {
+                        match Self::extract_file(&file_path) {
+                            Ok(entries) => all_entries.extend(entries),
+                            Err(e) => {
+                                tracing::warn!("Failed to extract {}: {}", file_path.display(), e);
+                                warnings.push(format!(
+                                    "skipped database file {}: {e}",
+                                    file_path.strip_prefix(path).unwrap_or(&file_path).display()
+                                ));
+                            }
                         }
                     }
                 }
+            }
+        } else {
+            // Preserve directory encounter order when merging entries and warnings.
+            let mut files = Vec::new();
+            let mut discovery_error = None;
+            for entry in std::fs::read_dir(&data_dir)? {
+                match entry {
+                    Ok(entry) => files.push(entry.path()),
+                    Err(error) => {
+                        discovery_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            if crate::file_workers::parallel(
+                crate::file_workers::Phase::RpgExtract,
+                files.len(),
+                || {
+                    let (min_files, min_bytes, _) =
+                        crate::file_workers::thresholds(crate::file_workers::Phase::RpgExtract);
+                    files
+                        .iter()
+                        .filter(|file| {
+                            file.file_name()
+                                .and_then(|name| name.to_str())
+                                .is_some_and(Self::is_known_data_file)
+                                && file
+                                    .metadata()
+                                    .is_ok_and(|metadata| metadata.len() >= min_bytes)
+                        })
+                        .take(min_files)
+                        .count()
+                        == min_files
+                },
+            ) {
+                crate::file_workers::ordered(
+                    &files,
+                    |file_path| {
+                        file_path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .filter(|name| Self::is_known_data_file(name))
+                            .map(|_| Self::extract_file(file_path))
+                    },
+                    |file_path, result| -> Result<()> {
+                        match result {
+                            Some(Ok(entries)) => all_entries.extend(entries),
+                            Some(Err(error)) => {
+                                tracing::warn!(
+                                    "Failed to extract {}: {}",
+                                    file_path.display(),
+                                    error
+                                );
+                                warnings.push(format!(
+                                    "skipped database file {}: {error}",
+                                    file_path.strip_prefix(path).unwrap_or(file_path).display()
+                                ));
+                            }
+                            None => {}
+                        }
+                        Ok(())
+                    },
+                )?;
+            } else {
+                for file_path in &files {
+                    if let Some(name) = file_path.file_name().and_then(|name| name.to_str()) {
+                        if Self::is_known_data_file(name) {
+                            match Self::extract_file(file_path) {
+                                Ok(entries) => all_entries.extend(entries),
+                                Err(error) => {
+                                    tracing::warn!(
+                                        "Failed to extract {}: {}",
+                                        file_path.display(),
+                                        error
+                                    );
+                                    warnings.push(format!(
+                                        "skipped database file {}: {error}",
+                                        file_path.strip_prefix(path).unwrap_or(file_path).display()
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Emit preceding diagnostics before surfacing a directory iterator error.
+            if let Some(error) = discovery_error {
+                return Err(error.into());
             }
         }
 
@@ -2085,8 +2252,10 @@ impl RpgMakerMvPlugin {
         let warnings = Vec::new();
         let mut files_written: Vec<PathBuf> = Vec::new();
 
-        // Group entries by file
+        // First-seen file order governs reports, errors and coordinator writes;
+        // the HashMap is only a lookup, never an iteration order.
         let mut by_file: HashMap<String, Vec<&StringEntry>> = HashMap::new();
+        let mut file_order = Vec::new();
         for entry in entries {
             let filename = entry
                 .file_path
@@ -2094,7 +2263,15 @@ impl RpgMakerMvPlugin {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            by_file.entry(filename).or_default().push(entry);
+            match by_file.entry(filename) {
+                std::collections::hash_map::Entry::Vacant(group) => {
+                    file_order.push(group.key().clone());
+                    group.insert(Vec::new()).push(entry);
+                }
+                std::collections::hash_map::Entry::Occupied(mut group) => {
+                    group.get_mut().push(entry);
+                }
+            }
         }
 
         let data_dir = if path.is_dir() {
@@ -2103,95 +2280,167 @@ impl RpgMakerMvPlugin {
             path.parent().unwrap_or(path).to_path_buf()
         };
 
-        for (filename, file_entries) in &by_file {
-            let file_path = data_dir.join(filename);
-            if !file_path.exists() {
-                strings_skipped += file_entries.len();
-                *skip_reasons.entry("missing_target".into()).or_default() += file_entries.len();
-                continue;
-            }
-
-            // Core supplies originals only for verified prior Direct outputs.
-            // Rebuild in memory from the exact checked bytes so event indices,
-            // source widths and untranslated fields never depend on prior runs.
-            let original = originals
-                .get(&file_path)
-                .map(RevisionOriginal::read_bytes)
-                .transpose()?;
-            let mut json = if let Some(bytes) = &original {
-                Self::parse_data_json(&file_path, bytes)?
-            } else {
-                Self::read_data_json(&file_path)?
-            };
-            // Validate sources/tags against the same baseline before any splice.
-            // Files without revision proof retain the normal live-source checks.
-            let current_entries = if Self::is_iavra_lang_pack_name(filename) {
-                Self::extract_iavra_pack_json(&file_path, &json)?
-            } else {
-                Self::extract_file_json(&file_path, &json)?
-            };
-            let current_by_id: HashMap<String, (String, Vec<String>)> = current_entries
-                .into_iter()
-                .map(|entry| (entry.id, (entry.source, entry.tags)))
-                .collect();
-            let mut file_changed = false;
-            let mut json_changed = false;
-
-            // Message-block splices change command counts, so apply from the
-            // bottom of each event list up: earlier indices stay valid.
-            let mut ordered = file_entries.clone();
-            ordered.sort_by_key(|e| std::cmp::Reverse(last_cmd_index(&e.id)));
-
-            for entry in ordered {
-                if let Some(ref translation) = entry.translation {
-                    let Some((current, current_tags)) = current_by_id.get(&entry.id) else {
-                        strings_skipped += 1;
-                        *skip_reasons.entry("missing_target".into()).or_default() += 1;
-                        continue;
-                    };
-                    if current != &entry.source
-                        || (entry.tags.iter().any(|t| t == "d_text")
-                            && !current_tags.iter().any(|t| t == "d_text"))
-                    {
-                        strings_skipped += 1;
-                        *skip_reasons.entry("source_changed".into()).or_default() += 1;
-                        continue;
-                    }
-                    // On revision, restoring the original text is also an edit.
-                    if translation == &entry.source {
-                        if original.is_some() {
-                            strings_written += 1;
-                            file_changed = true;
-                        } else {
-                            strings_skipped += 1;
-                            *skip_reasons.entry("unchanged".into()).or_default() += 1;
+        if crate::file_workers::parallel(
+            crate::file_workers::Phase::RpgInject,
+            file_order.len(),
+            || {
+                let (min_files, _, min_entries) =
+                    crate::file_workers::thresholds(crate::file_workers::Phase::RpgInject);
+                by_file
+                    .values()
+                    .filter(|entries| entries.len() >= min_entries)
+                    .take(min_files)
+                    .count()
+                    == min_files
+            },
+        ) && crate::file_workers::independent_files(
+            file_order.iter().map(|filename| data_dir.join(filename)),
+        ) {
+            crate::file_workers::ordered(
+                &file_order,
+                |filename| {
+                    Self::prepare_data_file(
+                        &data_dir.join(filename),
+                        filename,
+                        &by_file[filename],
+                        originals,
+                    )
+                },
+                |filename, prepared| -> Result<()> {
+                    let file_path = data_dir.join(filename);
+                    // A speculative read can overlap a preceding aliased write.
+                    // Retry errors at the serial position, after that write ends.
+                    let mut prepared = prepared.or_else(|_| {
+                        Self::prepare_data_file(&file_path, filename, &by_file[filename], originals)
+                    })?;
+                    // A revision proof can itself alias a preceding live target.
+                    // Verify it at the serial position, after preceding writes.
+                    if let Some(original) = originals.get(&file_path) {
+                        if file_path.exists() {
+                            original.read_bytes()?;
                         }
-                        // Keep original line breaks, just like a fresh injection.
-                        continue;
                     }
-                    // Replace mode reaches Iavra packs and multi-line database
-                    // `description` fields too, so restore line width here.
-                    // Message blocks then wrap each paragraph at their width floor.
-                    let translation = rewrap_to_source_width(&entry.source, translation);
-                    Self::apply_translation(&mut json, filename, &entry.id, &translation);
-                    strings_written += 1;
-                    file_changed = true;
-                    json_changed = true;
-                } else {
-                    strings_skipped += 1;
-                    *skip_reasons.entry("untranslated".into()).or_default() += 1;
+                    // Distinct names can alias the same physical file. Serial reads
+                    // would observe the preceding write, so discard stale preparation.
+                    if let Some(source) = &prepared.source {
+                        if std::fs::read(&file_path)? != *source {
+                            prepared = Self::prepare_data_file(
+                                &file_path,
+                                filename,
+                                &by_file[filename],
+                                originals,
+                            )?;
+                        }
+                    }
+                    match prepared.output {
+                        Some(DataOutput::Pristine(bytes)) => std::fs::write(&file_path, bytes)?,
+                        Some(DataOutput::Encoded(text)) => {
+                            EncodingDetector::write_file_encoded(&file_path, &text, "UTF-8")?
+                        }
+                        None => {}
+                    }
+                    files_modified += prepared.report.files_modified;
+                    strings_written += prepared.report.strings_written;
+                    strings_skipped += prepared.report.strings_skipped;
+                    files_written.extend(prepared.report.files_written);
+                    for (reason, count) in prepared.report.skip_reasons {
+                        *skip_reasons.entry(reason).or_default() += count;
+                    }
+                    Ok(())
+                },
+            )?;
+        } else {
+            for filename in &file_order {
+                let file_entries = &by_file[filename];
+                let file_path = data_dir.join(filename);
+                if !file_path.exists() {
+                    strings_skipped += file_entries.len();
+                    *skip_reasons.entry("missing_target".into()).or_default() += file_entries.len();
+                    continue;
                 }
-            }
 
-            if file_changed {
-                match &original {
-                    // Restoring only source-valued translations is a pristine
-                    // no-op oracle: preserve its exact serialization and BOM.
-                    Some(bytes) if !json_changed => std::fs::write(&file_path, bytes)?,
-                    _ => Self::write_data_file(&file_path, &json)?,
+                // Core supplies originals only for verified prior Direct outputs.
+                // Rebuild in memory from the exact checked bytes so event indices,
+                // source widths and untranslated fields never depend on prior runs.
+                let original = originals
+                    .get(&file_path)
+                    .map(RevisionOriginal::read_bytes)
+                    .transpose()?;
+                let mut json = if let Some(bytes) = &original {
+                    Self::parse_data_json(&file_path, bytes)?
+                } else {
+                    Self::read_data_json(&file_path)?
+                };
+                // Validate sources/tags against the same baseline before any splice.
+                // Files without revision proof retain the normal live-source checks.
+                let current_entries = if Self::is_iavra_lang_pack_name(filename) {
+                    Self::extract_iavra_pack_json(&file_path, &json)?
+                } else {
+                    Self::extract_file_json(&file_path, &json)?
+                };
+                let current_by_id: HashMap<String, (String, Vec<String>)> = current_entries
+                    .into_iter()
+                    .map(|entry| (entry.id, (entry.source, entry.tags)))
+                    .collect();
+                let mut file_changed = false;
+                let mut json_changed = false;
+
+                // Message-block splices change command counts, so apply from the
+                // bottom of each event list up: earlier indices stay valid.
+                let mut ordered = file_entries.clone();
+                ordered.sort_by_key(|e| std::cmp::Reverse(last_cmd_index(&e.id)));
+
+                for entry in ordered {
+                    if let Some(ref translation) = entry.translation {
+                        let Some((current, current_tags)) = current_by_id.get(&entry.id) else {
+                            strings_skipped += 1;
+                            *skip_reasons.entry("missing_target".into()).or_default() += 1;
+                            continue;
+                        };
+                        if current != &entry.source
+                            || (entry.tags.iter().any(|t| t == "d_text")
+                                && !current_tags.iter().any(|t| t == "d_text"))
+                        {
+                            strings_skipped += 1;
+                            *skip_reasons.entry("source_changed".into()).or_default() += 1;
+                            continue;
+                        }
+                        // On revision, restoring the original text is also an edit.
+                        if translation == &entry.source {
+                            if original.is_some() {
+                                strings_written += 1;
+                                file_changed = true;
+                            } else {
+                                strings_skipped += 1;
+                                *skip_reasons.entry("unchanged".into()).or_default() += 1;
+                            }
+                            // Keep original line breaks, just like a fresh injection.
+                            continue;
+                        }
+                        // Replace mode reaches Iavra packs and multi-line database
+                        // `description` fields too, so restore line width here.
+                        // Message blocks then wrap each paragraph at their width floor.
+                        let translation = rewrap_to_source_width(&entry.source, translation);
+                        Self::apply_translation(&mut json, filename, &entry.id, &translation);
+                        strings_written += 1;
+                        file_changed = true;
+                        json_changed = true;
+                    } else {
+                        strings_skipped += 1;
+                        *skip_reasons.entry("untranslated".into()).or_default() += 1;
+                    }
                 }
-                files_modified += 1;
-                files_written.push(file_path.clone());
+
+                if file_changed {
+                    match &original {
+                        // Restoring only source-valued translations is a pristine
+                        // no-op oracle: preserve its exact serialization and BOM.
+                        Some(bytes) if !json_changed => std::fs::write(&file_path, bytes)?,
+                        _ => Self::write_data_file(&file_path, &json)?,
+                    }
+                    files_modified += 1;
+                    files_written.push(file_path.clone());
+                }
             }
         }
 
@@ -2205,24 +2454,147 @@ impl RpgMakerMvPlugin {
         })
     }
 
+    fn prepare_data_file(
+        file_path: &Path,
+        filename: &str,
+        file_entries: &[&StringEntry],
+        originals: &HashMap<PathBuf, RevisionOriginal>,
+    ) -> Result<PreparedDataFile> {
+        let mut report = InjectionReport {
+            skip_reasons: Default::default(),
+            files_modified: 0,
+            strings_written: 0,
+            strings_skipped: 0,
+            warnings: Vec::new(),
+            files_written: Vec::new(),
+        };
+        if !file_path.exists() {
+            report.strings_skipped = file_entries.len();
+            report
+                .skip_reasons
+                .insert("missing_target".into(), file_entries.len());
+            return Ok(PreparedDataFile {
+                source: None,
+                output: None,
+                report,
+            });
+        }
+        let mut strings_written = 0;
+        let mut strings_skipped = 0;
+        let mut skip_reasons = std::collections::BTreeMap::new();
+        let source = if originals.contains_key(file_path) {
+            None
+        } else {
+            Some(std::fs::read(file_path)?)
+        };
+        // Core supplies originals only for verified prior Direct outputs.
+        // Rebuild in memory from the exact checked bytes so event indices,
+        // source widths and untranslated fields never depend on prior runs.
+        let original = originals
+            .get(file_path)
+            .map(RevisionOriginal::read_bytes)
+            .transpose()?;
+        let mut json = if let Some(bytes) = &original {
+            Self::parse_data_json(file_path, bytes)?
+        } else {
+            Self::parse_data_json(file_path, source.as_ref().unwrap())?
+        };
+        // Validate sources/tags against the same baseline before any splice.
+        // Files without revision proof retain the normal live-source checks.
+        let current_entries = if Self::is_iavra_lang_pack_name(filename) {
+            Self::extract_iavra_pack_json(file_path, &json)?
+        } else {
+            Self::extract_file_json(file_path, &json)?
+        };
+        let current_by_id: HashMap<String, (String, Vec<String>)> = current_entries
+            .into_iter()
+            .map(|entry| (entry.id, (entry.source, entry.tags)))
+            .collect();
+        let mut file_changed = false;
+        let mut json_changed = false;
+
+        // Message-block splices change command counts, so apply from the
+        // bottom of each event list up: earlier indices stay valid.
+        let mut ordered = file_entries.to_vec();
+        ordered.sort_by_key(|e| std::cmp::Reverse(last_cmd_index(&e.id)));
+
+        for entry in ordered {
+            if let Some(ref translation) = entry.translation {
+                let Some((current, current_tags)) = current_by_id.get(&entry.id) else {
+                    strings_skipped += 1;
+                    *skip_reasons.entry("missing_target".into()).or_default() += 1;
+                    continue;
+                };
+                if current != &entry.source
+                    || (entry.tags.iter().any(|t| t == "d_text")
+                        && !current_tags.iter().any(|t| t == "d_text"))
+                {
+                    strings_skipped += 1;
+                    *skip_reasons.entry("source_changed".into()).or_default() += 1;
+                    continue;
+                }
+                // On revision, restoring the original text is also an edit.
+                if translation == &entry.source {
+                    if original.is_some() {
+                        strings_written += 1;
+                        file_changed = true;
+                    } else {
+                        strings_skipped += 1;
+                        *skip_reasons.entry("unchanged".into()).or_default() += 1;
+                    }
+                    // Keep original line breaks, just like a fresh injection.
+                    continue;
+                }
+                // Replace mode reaches Iavra packs and multi-line database
+                // `description` fields too, so restore line width here.
+                // Message blocks then wrap each paragraph at their width floor.
+                let translation = rewrap_to_source_width(&entry.source, translation);
+                Self::apply_translation(&mut json, filename, &entry.id, &translation);
+                strings_written += 1;
+                file_changed = true;
+                json_changed = true;
+            } else {
+                strings_skipped += 1;
+                *skip_reasons.entry("untranslated".into()).or_default() += 1;
+            }
+        }
+
+        let output = if file_changed {
+            report.files_modified = 1;
+            report.files_written.push(file_path.to_path_buf());
+            Some(match original {
+                Some(bytes) if !json_changed => DataOutput::Pristine(bytes),
+                _ => DataOutput::Encoded(Self::serialize_data_file(file_path, &json)?),
+            })
+        } else {
+            None
+        };
+        report.strings_written = strings_written;
+        report.strings_skipped = strings_skipped;
+        report.skip_reasons = skip_reasons;
+        Ok(PreparedDataFile {
+            source,
+            output,
+            report,
+        })
+    }
+
     /// Write JSON (pretty for .json, LZString base64 for .jsono).
     fn write_data_file(file_path: &Path, json: &serde_json::Value) -> Result<()> {
+        let text = Self::serialize_data_file(file_path, json)?;
+        EncodingDetector::write_file_encoded(file_path, &text, "UTF-8")
+    }
+
+    fn serialize_data_file(file_path: &Path, json: &serde_json::Value) -> Result<String> {
         let is_jsono = file_path
             .extension()
             .and_then(|e| e.to_str())
             .is_some_and(|e| e.eq_ignore_ascii_case("jsono"));
-        let text = if is_jsono {
-            serde_json::to_string(json)?
-        } else {
-            serde_json::to_string_pretty(json)?
-        };
         if is_jsono {
-            let encoded = lz_str::compress_to_base64(&text);
-            EncodingDetector::write_file_encoded(file_path, &encoded, "UTF-8")?;
+            Ok(lz_str::compress_to_base64(&serde_json::to_string(json)?))
         } else {
-            EncodingDetector::write_file_encoded(file_path, &text, "UTF-8")?;
+            Ok(serde_json::to_string_pretty(json)?)
         }
-        Ok(())
     }
 
     fn read_data_json(file_path: &Path) -> Result<serde_json::Value> {

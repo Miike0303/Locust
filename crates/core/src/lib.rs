@@ -6,7 +6,7 @@ pub mod encoding;
 pub mod error;
 pub mod export;
 pub mod extraction;
-mod file_identity;
+pub mod file_identity;
 pub mod font_patch;
 pub mod font_validation;
 pub mod fuzzy;
