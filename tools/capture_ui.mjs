@@ -259,6 +259,12 @@ async function scenarios(viewport, locale) {
   try {
     await navigate('/editor');
     await waitFor(`Array.from(document.querySelectorAll('tbody tr')).some(row => row.textContent.includes('First small line'))`, 'seeded editor');
+    await button(es ? 'Flujo rápido' : 'Fast workflow');
+    await waitFor(`!!document.querySelector('[role=dialog] [data-fast-workflow]')`, 'fast workflow stages');
+    await click('[role=dialog] details > summary');
+    await focus('[role=dialog] details > summary');
+    await snap('fast-workflow', { stages: ['translate', 'pivot', 'translateTarget', 'validate', 'inject', 'pack'], providerPreset: 'google', compression: 'fast' });
+    await button(es ? 'Cerrar' : 'Close', dialog);
     await evaluate(`Array.from(document.querySelectorAll('tbody tr')).find(row => row.textContent.includes('First small line')).click()`);
     await waitFor(`!!document.querySelector('[data-text-fit-preview]')`, 'Width estimate');
     await click('[data-text-fit-preview] button[aria-expanded]');
@@ -497,7 +503,7 @@ async function main() {
     await command('Emulation.setDeviceMetricsOverride', { ...viewport, deviceScaleFactor: 1, mobile: false });
     await scenarios(viewport, locale);
   }
-  assert.equal(manifest.captures.length, 40, 'Complete scenario × viewport × locale matrix');
+  assert.equal(manifest.captures.length, 44, 'Complete scenario × viewport × locale matrix');
   assert.equal(manifest.errors.length, 0, 'Unexpected browser/DevTools errors');
   assert(manifest.requests.every(request => request.status < 400 || (request.status === 409 && request.url.includes('/api/import/po/apply'))), 'Unexpected backend HTTP error');
   manifest.success = true;

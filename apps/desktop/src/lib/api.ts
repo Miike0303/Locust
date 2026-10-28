@@ -318,6 +318,8 @@ export interface MultiLangReport {
   pristine_backup_id?: string | null;
   /** Absolute backup path when direct inject created one. */
   backup_path?: string | null;
+  /** Exact per-language output roots recorded by Add/Replace injection. */
+  injected_roots?: Record<string, string>;
   files_modified?: number;
   strings_written?: number;
   strings_skipped?: number;
@@ -420,6 +422,8 @@ export interface ValidationResponse {
 
 export interface InjectionStatus {
   game_root: string;
+  /** Committed transaction evidence; absent on older compatible servers. */
+  applied?: AppliedInjection[];
   pending: null | {
     transaction_id: string;
     phase: "preparing" | "applying" | "committed_unrecorded" | "rolling_back";

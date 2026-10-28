@@ -14,6 +14,7 @@ import {
 	Replace,
 	ChevronRight,
 	GitBranch,
+	Zap,
 } from "lucide-react";
 import {
 	getStrings,
@@ -47,6 +48,7 @@ import StringTable from "../components/StringTable";
 import DetailPanel from "../components/DetailPanel";
 import { draftEntryKey, draftProjectKey } from "../stores/draftStore";
 import TranslationModal from "../components/TranslationModal";
+import FastWorkflowModal from "../components/FastWorkflowModal";
 import InjectModal from "../components/InjectModal";
 import PatchModal from "../components/PatchModal";
 import PatchStatusIndicator from "../components/PatchStatusIndicator";
@@ -115,6 +117,7 @@ export default function Editor() {
 	const navigate = useNavigate();
 	const queryClient = useQueryClient();
 	const [showTranslateModal, setShowTranslateModal] = useState(false);
+	const [showFastWorkflowModal, setShowFastWorkflowModal] = useState(false);
 	const [showInjectModal, setShowInjectModal] = useState(false);
 	const [showPatchModal, setShowPatchModal] = useState(false);
 	const [patchInitialTab, setPatchInitialTab] = useState<"apply" | "pack">(
@@ -268,6 +271,7 @@ export default function Editor() {
 	}, [t]);
 
 	const editorModalOpen =
+		showFastWorkflowModal ||
 		showTranslateModal ||
 		showInjectModal ||
 		showPatchModal ||
@@ -348,7 +352,7 @@ export default function Editor() {
 			else if (showTranslateModal) setShowTranslateModal(false);
 			else if (selectedEntryId) closeDetail();
 		},
-		!showFontPatch && (editorModalOpen || !!selectedEntryId),
+		!showFastWorkflowModal && !showFontPatch && (editorModalOpen || !!selectedEntryId),
 		true,
 	);
 
@@ -466,6 +470,14 @@ export default function Editor() {
 				>
 					{/* Primary workflow actions */}
 					<div role="group" aria-label={t("editor.workflowActions")} className="flex flex-wrap items-center gap-1.5">
+						<button
+							type="button"
+							onClick={() => setShowFastWorkflowModal(true)}
+							disabled={!hasProject}
+							className={BTN_SECONDARY}
+						>
+							<Zap size={15} aria-hidden="true" /> {t("fastWorkflow.title")}
+						</button>
 						<button
 							onClick={() => setShowTranslateModal(true)}
 							disabled={!hasProject}
@@ -651,6 +663,7 @@ export default function Editor() {
 			</div>
 
 			{/* Translation Modal */}
+			<FastWorkflowModal open={showFastWorkflowModal} onClose={() => setShowFastWorkflowModal(false)} project={project} sampleSources={sampleSources} onComplete={handleRefetch} />
 			<TranslationModal
 				open={showTranslateModal}
 				onClose={() => setShowTranslateModal(false)}
