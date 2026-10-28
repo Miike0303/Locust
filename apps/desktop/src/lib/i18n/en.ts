@@ -1310,6 +1310,7 @@ export const en = {
   "validate.kind.unencodableLabel": "Encoding incompatible",
   "validate.message.empty": "Translation is empty.",
   "validate.message.identical": "Translation is identical to the source.",
+  "validate.message.inconsistent": "The same source has {n} translation variants; most common translation: “{text}”",
   "validate.kind.emptyLabel": "Empty translation",
   "validate.kind.identicalLabel": "Identical to source",
   "validate.kind.inconsistentLabel": "Inconsistent translation",

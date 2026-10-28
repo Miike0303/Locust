@@ -336,7 +336,7 @@ export type ValidationKind =
   | { ExceedsCharLimit: { limit: number; actual: number } }
   | { ExceedsBinarySlot: { encoding: string; limit: number; actual: number } }
   | { UnencodableTranslation: { encoding: string } }
-  | { InconsistentTranslation: { variants: number } }
+  | { InconsistentTranslation: { variants: number; common?: string | null } }
   | "EmptyTranslation"
   | "InvalidInjectionProvenance"
   | "StaleTranslation"
@@ -364,6 +364,8 @@ export interface StoredValidationIssue {
   id: number;
   entry_id: string;
   kind: string;
+  /** Externally tagged payload; absent when using an older server. */
+  kind_data?: ValidationKind | null;
   message: string;
   ignored: boolean;
   source: string | null;

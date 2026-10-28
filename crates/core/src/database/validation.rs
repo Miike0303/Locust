@@ -13,10 +13,21 @@ use super::{lock_connection, Database};
 
 // Existing kinds use serde's externally tagged enum representation: a JSON
 // string for unit variants and a one-key object for variants carrying details.
-const ISSUE_ROWS: &str = "SELECT id, entry_id, message, resolved,
+const ISSUE_ROWS: &str = "SELECT id, entry_id, message, resolved, kind AS kind_data,
     CASE WHEN json_type(kind) = 'text' THEN json_extract(kind, '$')
          ELSE (SELECT key FROM json_each(kind) LIMIT 1) END AS kind
     FROM validation_issues";
+
+// The most common translation is display data, not part of the ignored issue's
+// identity. Keep ignored rows matching after an upgrade or a new common value.
+fn ignored_kind_key(kind_json: String) -> String {
+    match serde_json::from_str::<ValidationKind>(&kind_json) {
+        Ok(ValidationKind::InconsistentTranslation { variants, .. }) => {
+            format!("InconsistentTranslation:{variants}")
+        }
+        _ => kind_json,
+    }
+}
 
 impl Database {
     pub async fn save_validation_issues(&self, issues: &[ValidationIssue]) -> Result<()> {
@@ -28,7 +39,8 @@ impl Database {
             let ignored = {
                 let mut stmt =
                     tx.prepare("SELECT entry_id, kind FROM validation_issues WHERE resolved = 1")?;
-                let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                let rows =
+                    stmt.query_map([], |row| Ok((row.get(0)?, ignored_kind_key(row.get(1)?))))?;
                 rows.collect::<rusqlite::Result<HashSet<(String, String)>>>()?
             };
             tx.execute("DELETE FROM validation_issues", [])?;
@@ -39,7 +51,8 @@ impl Database {
                 )?;
                 for issue in &issues {
                     let kind_json = serde_json::to_string(&issue.kind)?;
-                    let resolved = ignored.contains(&(issue.entry_id.clone(), kind_json.clone()));
+                    let resolved = ignored
+                        .contains(&(issue.entry_id.clone(), ignored_kind_key(kind_json.clone())));
                     insert.execute(params![issue.entry_id, kind_json, issue.message, resolved])?;
                 }
             }
@@ -67,7 +80,7 @@ impl Database {
         let mut stmt = conn.prepare(&format!(
             "WITH issues AS ({ISSUE_ROWS})
              SELECT v.id, v.entry_id, v.kind, v.message, v.resolved,
-                    s.source, s.translation, s.file_path
+                    s.source, s.translation, s.file_path, v.kind_data
              FROM issues v LEFT JOIN strings s ON s.id = v.entry_id
              WHERE {condition} ORDER BY v.id LIMIT ?3 OFFSET ?4"
         ))?;
@@ -83,6 +96,7 @@ impl Database {
                     id: row.get(0)?,
                     entry_id: row.get(1)?,
                     kind: row.get(2)?,
+                    kind_data: serde_json::from_str(&row.get::<_, String>(8)?).unwrap_or_default(),
                     message: row.get(3)?,
                     ignored: row.get(4)?,
                     source: row.get(5)?,
@@ -184,7 +198,10 @@ mod tests {
     #[tokio::test]
     async fn validation_inconsistent_translation_wire_form_round_trips_through_storage() {
         let db = Database::open_in_memory().unwrap();
-        let kind = ValidationKind::InconsistentTranslation { variants: 2 };
+        let kind = ValidationKind::InconsistentTranslation {
+            variants: 2,
+            common: None,
+        };
         let expected_json = r#"{"InconsistentTranslation":{"variants":2}}"#;
         assert_eq!(serde_json::to_string(&kind).unwrap(), expected_json);
         db.save_validation_issues(&[issue("a", kind)])
@@ -216,6 +233,10 @@ mod tests {
         assert_eq!(page.issues.len(), 1);
         assert_eq!(page.issues[0].entry_id, "a");
         assert_eq!(page.issues[0].kind, "InconsistentTranslation");
+        assert_eq!(
+            page.issues[0].kind_data,
+            serde_json::from_str::<serde_json::Value>(expected_json).unwrap()
+        );
         let summary = db.validation_summary().unwrap();
         assert_eq!(summary.len(), 1);
         assert_eq!(
@@ -225,6 +246,74 @@ mod tests {
                 ignored: 0
             }
         );
+    }
+
+    #[tokio::test]
+    async fn validation_legacy_consistency_details_and_ignored_state_survive_upgrade() {
+        let db = Database::open_in_memory().unwrap();
+        let legacy_kind = r#"{"InconsistentTranslation":{"variants":2}}"#;
+        let legacy_message = "legacy English consistency diagnostic";
+        lock_connection(&db.conn)
+            .execute(
+                "INSERT INTO validation_issues (entry_id, kind, message, resolved)
+                 VALUES (?1, ?2, ?3, 1)",
+                params!["a", legacy_kind, legacy_message],
+            )
+            .unwrap();
+        let issues = db.get_validation_issues(Some("a")).unwrap();
+        assert!(matches!(
+            &issues[0].kind,
+            ValidationKind::InconsistentTranslation {
+                variants: 2,
+                common: None
+            }
+        ));
+        assert_eq!(issues[0].message, legacy_message);
+        let filter = ValidationIssueFilter {
+            include_ignored: true,
+            ..Default::default()
+        };
+        let page = db.list_validation_issues(&filter).unwrap();
+        assert_eq!(page.issues[0].message, legacy_message);
+        assert_eq!(
+            page.issues[0].kind_data,
+            serde_json::json!({"InconsistentTranslation": {"variants": 2}})
+        );
+        for common in ["Guardar", "Conservar"] {
+            db.save_validation_issues(&[issue(
+                "a",
+                ValidationKind::InconsistentTranslation {
+                    variants: 2,
+                    common: Some(common.into()),
+                },
+            )])
+            .await
+            .unwrap();
+            let page = db.list_validation_issues(&filter).unwrap();
+            assert!(page.issues[0].ignored);
+            assert_eq!(
+                page.issues[0].kind_data,
+                serde_json::json!({"InconsistentTranslation": {"variants": 2, "common": common}})
+            );
+        }
+    }
+
+    #[test]
+    fn validation_list_preserves_unknown_kind_payload_and_message() {
+        let db = Database::open_in_memory().unwrap();
+        let kind = serde_json::json!({"FutureKind": {"detail": "example"}});
+        lock_connection(&db.conn)
+            .execute(
+                "INSERT INTO validation_issues (entry_id, kind, message, resolved)
+                 VALUES (?1, ?2, ?3, 0)",
+                params!["a", kind.to_string(), "future English diagnostic"],
+            )
+            .unwrap();
+        let page = db.list_validation_issues(&Default::default()).unwrap();
+        let value = serde_json::to_value(&page.issues[0]).unwrap();
+        assert_eq!(value["kind"], "FutureKind");
+        assert_eq!(value["kind_data"], kind);
+        assert_eq!(value["message"], "future English diagnostic");
     }
 
     #[tokio::test]
@@ -355,6 +444,10 @@ mod tests {
         assert_eq!(first.issues[0].source.as_deref(), Some("Hello {0}"));
         assert_eq!(first.issues[0].translation.as_deref(), Some("Hola"));
         assert_eq!(first.issues[0].file_path.as_deref(), Some("data/a.json"));
+        assert_eq!(
+            first.issues[0].kind_data,
+            serde_json::json!({"MissingPlaceholder": {"placeholder": "{0}"}})
+        );
         let next = db
             .list_validation_issues(&ValidationIssueFilter {
                 offset: 1,

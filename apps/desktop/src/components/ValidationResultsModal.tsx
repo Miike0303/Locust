@@ -4,13 +4,12 @@ import clsx from "clsx";
 import type {
 	ValidationResponse,
 	ValidationIssue,
-	ValidationKind,
 	FontCoverageReport,
 	FontSuggestion,
 } from "../lib/api";
 import { validationKindLabel } from "../lib/api";
-import { localizeValidationMessage, validationBadgeLabel } from "../lib/validationLabels";
-import { useT, type TranslateFn } from "../lib/i18n";
+import { validationMessage, validationBadgeLabel } from "../lib/validationLabels";
+import { useT } from "../lib/i18n";
 import {
 	useModalA11y,
 	MODAL_BACKDROP_CLASS,
@@ -53,35 +52,6 @@ const KIND_BADGE: Record<string, string> = {
 	StaleTranslation:
 		"bg-danger-muted text-danger",
 };
-
-function kindDetail(
-	kind: ValidationKind,
-	t: TranslateFn,
-): string | null {
-	if (kind === "StaleTranslation") return t("validate.kind.staleDetail");
-	if (typeof kind === "string") return null;
-	if ("MissingPlaceholder" in kind)
-		return t("validate.kind.missing", {
-			placeholder: kind.MissingPlaceholder.placeholder,
-		});
-	if ("ExtraPlaceholder" in kind)
-		return t("validate.kind.extra", {
-			placeholder: kind.ExtraPlaceholder.placeholder,
-		});
-	if ("ExceedsCharLimit" in kind) {
-		const { limit, actual } = kind.ExceedsCharLimit;
-		return t("validate.kind.charLimit", { actual, limit });
-	}
-	if ("UnencodableTranslation" in kind)
-		return t("validate.kind.unencodable", {
-			encoding: kind.UnencodableTranslation.encoding,
-		});
-	if ("ExceedsBinarySlot" in kind) {
-		const { encoding, limit, actual } = kind.ExceedsBinarySlot;
-		return t("validate.kind.binarySlot", { actual, limit, encoding });
-	}
-	return null;
-}
 
 function FontSection({
 	fonts,
@@ -309,7 +279,6 @@ export default function ValidationResultsModal({
 							<ul className="divide-y divide-border border border-border rounded-lg overflow-hidden">
 								{issues.map((issue, i) => {
 									const label = validationKindLabel(issue.kind);
-									const detail = kindDetail(issue.kind, t);
 									return (
 										<li key={`${issue.entry_id}-${label}-${i}`}>
 											<button
@@ -339,7 +308,7 @@ export default function ValidationResultsModal({
 															</div>
 														)}
 														<div className="text-caption text-text-muted mt-0.5">
-															{detail || localizeValidationMessage(issue.message, t)}
+															{validationMessage(issue, t)}
 														</div>
 													</div>
 												</div>

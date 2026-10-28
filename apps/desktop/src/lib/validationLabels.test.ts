@@ -14,7 +14,7 @@ const cases = [
   [{ UnencodableTranslation: { encoding: "Shift-JIS" } } as ValidationKind, "UnencodableTranslation", "validate.kind.unencodableLabel"],
   ["EmptyTranslation", "EmptyTranslation", "validate.kind.emptyLabel"],
   ["IdenticalToSource", "IdenticalToSource", "validate.kind.identicalLabel"],
-  [{ InconsistentTranslation: { variants: 2 } }, "InconsistentTranslation", "validate.kind.inconsistentLabel"],
+  [{ InconsistentTranslation: { variants: 2, common: "Guardar" } }, "InconsistentTranslation", "validate.kind.inconsistentLabel"],
   ["StaleTranslation", "StaleTranslation", "validate.kind.staleLabel"],
   ["InvalidInjectionProvenance", "InvalidInjectionProvenance", "validate.kind.provenanceLabel"],
 ] satisfies [ValidationKind, string, string][];
@@ -116,14 +116,81 @@ for (const [locale, catalog] of [["en", en], ["es", es]] as const) {
   });
 }
 
-for (const [locale, catalog] of [["en", en], ["es", es]] as const) {
-  test(`known validation messages use exact localized matches and preserve diagnostics (${locale})`, async () => {
-    const { localizeValidationMessage } = await import("./validationLabels.ts");
-    const t = (key: any) => translate(catalog, locale, key);
-    assert.equal(localizeValidationMessage("translation is empty", t), locale === "en" ? "Translation is empty." : "La traducción está vacía.");
-    assert.equal(localizeValidationMessage("translation is identical to source", t), locale === "en" ? "Translation is identical to the source." : "La traducción es idéntica al original.");
-    for (const message of ["future detail", "translation is empty\nentry: foo", "translation is empty ", "injection error: invalid provenance at C:/game/foo", "toString", "__proto__"]) {
-      assert.equal(localizeValidationMessage(message, t), message);
+const messageCases: [ValidationKind, string, string][] = [
+  [{ MissingPlaceholder: { placeholder: "{name}" } }, "missing {name}", "falta {name}"],
+  [{ ExtraPlaceholder: { placeholder: "%s" } }, "extra %s", "extra %s"],
+  [{ ExceedsCharLimit: { actual: 12, limit: 0 } }, "12 chars > limit 0", "12 caracteres > límite 0"],
+  [{ ExceedsBinarySlot: { actual: 16, limit: 8, encoding: "utf16le" } }, "16 > 8 bytes (utf16le)", "16 > 8 bytes (utf16le)"],
+  [{ UnencodableTranslation: { encoding: "Shift-JIS" } },
+    "The translation contains characters that cannot be encoded as Shift-JIS. Injection is refused; the original game and saved translation remain unchanged.",
+    "La traducción contiene caracteres que no se pueden codificar en Shift-JIS. Se rechaza la inserción; el juego original y la traducción guardada permanecen intactos."],
+  ["EmptyTranslation", "Translation is empty.", "La traducción está vacía."],
+  ["IdenticalToSource", "Translation is identical to the source.", "La traducción es idéntica al original."],
+  [{ InconsistentTranslation: { variants: 2, common: "Guardar" } },
+    "The same source has 2 translation variants; most common translation: “Guardar”",
+    "El mismo texto original tiene 2 traducciones distintas; la más común: «Guardar»"],
+  ["StaleTranslation",
+    "Translate this entry again or mark it reviewed/approved before injecting or pivoting it.",
+    "Traduce esta entrada de nuevo o márcala como revisada/aprobada antes de insertarla o pivotarla."],
+];
+
+for (const [locale, catalog, expectedIndex] of [["en", en, 1], ["es", es, 2]] as const) {
+  test(`live and stored validation messages use structured data without mutating issues (${locale})`, async () => {
+    const { validationMessage } = await import("./validationLabels.ts");
+    const t = (key: any, vars?: any) => translate(catalog, locale, key, vars);
+    for (const messageCase of messageCases) {
+      const [kind] = messageCase;
+      const live = { kind, message: "backend diagnostic kept unchanged" };
+      const stored = { ...live, kind: validationKindLabel(kind), kind_data: kind };
+      for (const issue of [live, stored]) {
+        const before = JSON.stringify(issue);
+        assert.equal(validationMessage(issue, t), messageCase[expectedIndex]);
+        assert.equal(JSON.stringify(issue), before);
+      }
     }
+    // Unit kinds need no payload, even with an older list API.
+    assert.equal(validationMessage({ kind: "EmptyTranslation", message: "legacy empty" }, t), messageCases[5][expectedIndex]);
+  });
+
+  test(`validation result rows share all structured message translations (${locale})`, () => {
+    (globalThis as any).__badgeTranslate = (key: string, vars?: any) => translate(catalog, locale, key, vars);
+    const tree = ValidationResultsModal({
+      open: true, onClose() {}, onSelectEntry() {},
+      result: { fonts: [], validation: {
+        total_checked: messageCases.length, issues_found: messageCases.length, entries_with_issues: messageCases.length,
+        by_kind: {}, issues: messageCases.map(([kind], i) => ({ entry_id: `row-${i}`, kind, message: "raw English diagnostic" })),
+      } },
+    });
+    const text = textOf(tree);
+    for (const messageCase of messageCases) assert.ok(text.includes(messageCase[expectedIndex]), text);
+    assert.ok(!text.includes("raw English diagnostic"));
+  });
+
+  test(`legacy, incomplete and unknown validation payloads retain raw messages (${locale})`, async () => {
+    const { validationMessage } = await import("./validationLabels.ts");
+    const t = (key: any, vars?: any) => translate(catalog, locale, key, vars);
+    const message = "translation is empty";
+    const kinds: unknown[] = [
+      "InconsistentTranslation", { InconsistentTranslation: { variants: 2 } },
+      { InconsistentTranslation: { variants: 2, common: null } },
+      { InconsistentTranslation: { common: "Guardar" } },
+      "MissingPlaceholder", { MissingPlaceholder: {} }, { ExtraPlaceholder: { placeholder: null } },
+      { ExceedsCharLimit: { actual: 12 } }, { ExceedsCharLimit: { actual: -1, limit: 2 } },
+      { ExceedsBinarySlot: { actual: 12, limit: 8 } }, { UnencodableTranslation: {} },
+      "InvalidInjectionProvenance", "FutureKind", { FutureKind: { n: 2 } }, "toString", "__proto__",
+      null, {}, [], { MissingPlaceholder: null },
+      { MissingPlaceholder: { placeholder: "%s" }, ExtraPlaceholder: { placeholder: "%s" } },
+    ];
+    for (const kind of kinds) {
+      assert.equal(validationMessage({ kind: kind as ValidationKind, message }, t), message);
+      if (kind && typeof kind === "object" && !Array.isArray(kind) && Object.keys(kind).length === 1) {
+        assert.equal(validationMessage({ kind: Object.keys(kind)[0], kind_data: kind as ValidationKind, message }, t), message);
+      }
+    }
+    assert.equal(validationMessage({ kind: "FutureKind", kind_data: { MissingPlaceholder: { placeholder: "%s" } }, message }, t), message);
+    const common = '«Hola» "viajero"\n<player> {n} \\ ruta';
+    assert.equal(validationMessage({ kind: { InconsistentTranslation: { variants: 3, common } }, message }, t),
+      locale === "en" ? `The same source has 3 translation variants; most common translation: “${common}”`
+        : `El mismo texto original tiene 3 traducciones distintas; la más común: «${common}»`);
   });
 }

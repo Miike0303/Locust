@@ -471,6 +471,9 @@ pub enum ValidationKind {
     /// Advisory only: repeated source/context has multiple current translations.
     InconsistentTranslation {
         variants: usize,
+        /// Display detail; older persisted issues contain only the count.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        common: Option<String>,
     },
     InvalidInjectionProvenance,
     StaleTranslation,

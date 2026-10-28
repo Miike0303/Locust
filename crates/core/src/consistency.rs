@@ -91,7 +91,10 @@ pub fn translation_consistency_issues(entries: &[StringEntry]) -> Vec<Validation
         if variants >= 2 {
             issues.push(ValidationIssue {
                 entry_id: entry.id.clone(),
-                kind: ValidationKind::InconsistentTranslation { variants },
+                kind: ValidationKind::InconsistentTranslation {
+                    variants,
+                    common: Some(group.common.to_string()),
+                },
                 message: format!(
                     "same source has {variants} translation variants; most common translation: {:?}",
                     group.common

@@ -7,7 +7,7 @@ import { getValidationIssues, getValidationSummary, setValidationIssueIgnored, v
 import { ApiError } from "../lib/apiError";
 import { useLocale, useT } from "../lib/i18n";
 import { buildQaSummary, qaHasBeenChecked, qaIsAdvisoryKind, qaKindBadgeClass, qaLastRunKey, qaPagination, qaRelativePath, QA_PAGE_SIZE } from "../lib/qaDashboard";
-import { validationBadgeLabel, validationKindHint } from "../lib/validationLabels";
+import { validationBadgeLabel, validationKindHint, validationMessage } from "../lib/validationLabels";
 import { draftProjectKey } from "../stores/draftStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useEditorStore } from "../stores/editorStore";
@@ -123,10 +123,10 @@ function ProjectQa({ project, projectKey }: { project: ProjectInfo | null; proje
               <th scope="col" className="px-4 py-2">{t("qa.col.kind")}</th><th scope="col" className="px-4 py-2">{t("qa.col.file")}</th><th scope="col" className="px-4 py-2">{t("qa.col.source")}</th><th scope="col" className="px-4 py-2">{t("qa.col.message")}</th><th scope="col" className="px-4 py-2">{t("qa.col.actions")}</th>
             </tr></thead>
             <tbody>{data.issues.map(issue => <tr key={issue.id} className="border-b border-border hover:bg-surface-muted">
-              <td className="px-4 py-2"><span className={`rounded px-2 py-1 text-caption ${qaKindBadgeClass(issue.kind)}`} title={validationKindHint(issue.kind, t)}>{validationBadgeLabel(issue.kind, t)}</span>{issue.ignored && <span className="ml-2 text-caption text-text-muted">{t("qa.ignored")}</span>}</td>
+              <td className="px-4 py-2"><span className={`whitespace-nowrap rounded px-2 py-1 text-caption ${qaKindBadgeClass(issue.kind)}`} title={validationKindHint(issue.kind, t)}>{validationBadgeLabel(issue.kind, t)}</span>{issue.ignored && <span className="ml-2 text-caption text-text-muted">{t("qa.ignored")}</span>}</td>
               <td className="max-w-48 truncate px-4 py-2" title={issue.file_path ?? undefined}>{issue.file_path ? qaRelativePath(issue.file_path, project!.path) : t("qa.unavailable")}</td>
               <td className="max-w-xs truncate px-4 py-2" title={issue.source ?? undefined}>{issue.source ?? t("qa.unavailable")}</td>
-              <td className="px-4 py-2">{issue.message}</td>
+              <td className="px-4 py-2">{validationMessage(issue, t)}</td>
               <td className="px-4 py-2"><div className="flex flex-wrap gap-2">
                 <button type="button" className={ACTION} disabled={issue.source === null} onClick={() => { startValidationWorklist([issue.entry_id]); navigate("/editor"); }}>{t("qa.openEditor")}</button>
                 <button type="button" className={ACTION} disabled={busy || issuesQuery.isFetching} onClick={() => { run.reset(); ignore.mutate({ id: issue.id, ignored: !issue.ignored }); }}>{t(issue.ignored ? "qa.restore" : "qa.ignore")}</button>

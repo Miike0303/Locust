@@ -35,6 +35,9 @@ pub struct StoredValidationIssue {
     pub entry_id: String,
     /// The enum discriminant, shared by summary chips and kind filters.
     pub kind: String,
+    /// Original externally tagged kind, including details for UI localization.
+    #[serde(default)]
+    pub kind_data: serde_json::Value,
     pub message: String,
     pub ignored: bool,
     pub source: Option<String>,

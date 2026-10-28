@@ -30,7 +30,7 @@ fn assert_variants(issues: &[ValidationIssue], variants: usize, common: &str) {
     for issue in issues {
         assert_eq!(
             serde_json::to_value(&issue.kind).unwrap(),
-            json!({"InconsistentTranslation": {"variants": variants}})
+            json!({"InconsistentTranslation": {"variants": variants, "common": common}})
         );
         assert!(issue.message.contains(&variants.to_string()));
         assert!(issue.message.contains(common), "{}", issue.message);
@@ -266,6 +266,14 @@ async fn advisory_issues_flow_through_summary_filter_ignore_and_rerun() {
     let page = db.list_validation_issues(&filter).unwrap();
     assert_eq!(page.total, 2);
     assert_eq!(page.issues[0].translation.as_deref(), Some("Guardar"));
+    assert_eq!(
+        page.issues[0].kind_data,
+        json!({"InconsistentTranslation": {"variants": 2, "common": "Guardar"}})
+    );
+    assert_eq!(
+        page.issues[0].message,
+        "same source has 2 translation variants; most common translation: \"Guardar\""
+    );
     db.set_validation_issue_ignored(page.issues[0].id, true)
         .unwrap();
     entries[0].translation = Some("Conservar".into());

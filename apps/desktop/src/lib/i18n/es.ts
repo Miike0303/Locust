@@ -1286,6 +1286,7 @@ export const es: Record<keyof typeof en, string> = {
   "validate.kind.unencodableLabel": "Codificación incompatible",
   "validate.message.empty": "La traducción está vacía.",
   "validate.message.identical": "La traducción es idéntica al original.",
+  "validate.message.inconsistent": "El mismo texto original tiene {n} traducciones distintas; la más común: «{text}»",
   "validate.kind.emptyLabel": "Traducción vacía",
   "validate.kind.identicalLabel": "Igual al original",
   "validate.kind.inconsistentLabel": "Traducción incoherente",
