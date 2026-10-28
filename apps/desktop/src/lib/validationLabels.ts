@@ -13,6 +13,7 @@ const BADGE_LABEL_KEYS = {
   UnencodableTranslation: "validate.kind.unencodableLabel",
   EmptyTranslation: "validate.kind.emptyLabel",
   IdenticalToSource: "validate.kind.identicalLabel",
+  InconsistentTranslation: "validate.kind.inconsistentLabel",
   StaleTranslation: "validate.kind.staleLabel",
   InvalidInjectionProvenance: "validate.kind.provenanceLabel",
 } as const satisfies Record<ValidationKindName, MessageKey>;
@@ -34,4 +35,9 @@ export function validationBadgeLabel(kind: string, t: TranslateFn): string {
   return Object.prototype.hasOwnProperty.call(BADGE_LABEL_KEYS, kind)
     ? t(BADGE_LABEL_KEYS[kind as ValidationKindName])
     : kind;
+}
+
+/** Optional guidance for advisory kinds, shown on QA badges and filter chips. */
+export function validationKindHint(kind: string, t: TranslateFn): string | undefined {
+  return kind === "InconsistentTranslation" ? t("validate.kind.inconsistentHint") : undefined;
 }

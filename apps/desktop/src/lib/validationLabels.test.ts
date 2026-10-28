@@ -14,6 +14,7 @@ const cases = [
   [{ UnencodableTranslation: { encoding: "Shift-JIS" } } as ValidationKind, "UnencodableTranslation", "validate.kind.unencodableLabel"],
   ["EmptyTranslation", "EmptyTranslation", "validate.kind.emptyLabel"],
   ["IdenticalToSource", "IdenticalToSource", "validate.kind.identicalLabel"],
+  [{ InconsistentTranslation: { variants: 2 } }, "InconsistentTranslation", "validate.kind.inconsistentLabel"],
   ["StaleTranslation", "StaleTranslation", "validate.kind.staleLabel"],
   ["InvalidInjectionProvenance", "InvalidInjectionProvenance", "validate.kind.provenanceLabel"],
 ] satisfies [ValidationKind, string, string][];
@@ -53,6 +54,17 @@ function spanTexts(node: any): string[] {
 }
 
 for (const [locale, catalog] of [["en", en], ["es", es]] as const) {
+  test(`translation consistency has a localized advisory label and hint (${locale})`, async () => {
+    const { validationBadgeLabel, validationKindHint } = await import("./validationLabels.ts");
+    const t = (key: any) => translate(catalog, locale, key);
+    assert.equal(validationBadgeLabel("InconsistentTranslation", t), locale === "en"
+      ? "Inconsistent translation" : "Traducción incoherente");
+    assert.equal(validationKindHint("InconsistentTranslation", t), locale === "en"
+      ? "Same source translated differently — review for consistency"
+      : "Mismo texto original con traducciones distintas: revisa la coherencia");
+    assert.equal(validationKindHint("FutureValidationKind", t), undefined);
+  });
+
   test(`binary capacity warning reports validation without predicting skipped translations (${locale})`, () => {
     for (const count of [1, 3]) {
       const warning = translate(catalog, locale, "inject.toast.binarySlots", { count });

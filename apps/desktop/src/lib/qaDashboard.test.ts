@@ -1,6 +1,28 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { buildQaSummary, qaHasBeenChecked, qaLastRunKey, qaPagination, qaRelativePath } from "./qaDashboard.ts";
+import { buildQaSummary, qaHasBeenChecked, qaIsAdvisoryKind, qaKindBadgeClass, qaLastRunKey, qaPagination, qaRelativePath } from "./qaDashboard.ts";
+
+test("consistency warnings appear in summaries and filters alongside identical-source advisories", () => {
+  const summary = { InconsistentTranslation: { open: 42, ignored: 2 }, IdenticalToSource: { open: 1, ignored: 0 } };
+  assert.deepEqual(buildQaSummary(summary), {
+    open: 43,
+    kinds: [
+      { kind: "IdenticalToSource", open: 1, ignored: 0 },
+      { kind: "InconsistentTranslation", open: 42, ignored: 2 },
+    ],
+  });
+  assert.deepEqual(buildQaSummary({}, "InconsistentTranslation"), {
+    open: 0, kinds: [{ kind: "InconsistentTranslation", open: 0, ignored: 0 }],
+  });
+  for (const kind of ["InconsistentTranslation", "IdenticalToSource"]) {
+    assert.equal(qaIsAdvisoryKind(kind), true);
+    assert.equal(qaKindBadgeClass(kind), "bg-warning-muted text-warning");
+  }
+  for (const kind of ["MissingPlaceholder", "StaleTranslation", "FutureKind"]) {
+    assert.equal(qaIsAdvisoryKind(kind), false);
+    assert.equal(qaKindBadgeClass(kind), "bg-accent-muted text-accent-fg");
+  }
+});
 
 test("QA chips count only open issues and preserve an empty selected kind", () => {
   const summary = { StaleTranslation: { open: 2, ignored: 3 }, EmptyTranslation: { open: 0, ignored: 4 } };

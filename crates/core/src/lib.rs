@@ -1,5 +1,6 @@
 pub mod backup;
 pub mod config;
+pub mod consistency;
 pub mod database;
 pub mod encoding;
 pub mod error;

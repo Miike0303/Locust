@@ -182,6 +182,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validation_inconsistent_translation_wire_form_round_trips_through_storage() {
+        let db = Database::open_in_memory().unwrap();
+        let kind = ValidationKind::InconsistentTranslation { variants: 2 };
+        let expected_json = r#"{"InconsistentTranslation":{"variants":2}}"#;
+        assert_eq!(serde_json::to_string(&kind).unwrap(), expected_json);
+        db.save_validation_issues(&[issue("a", kind)])
+            .await
+            .unwrap();
+
+        let stored_json: String = lock_connection(&db.conn)
+            .query_row(
+                "SELECT kind FROM validation_issues WHERE entry_id = ?1",
+                ["a"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_json, expected_json);
+        let issues = db.get_validation_issues(Some("a")).unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(
+            serde_json::to_string(&issues[0].kind).unwrap(),
+            expected_json
+        );
+
+        let page = db
+            .list_validation_issues(&ValidationIssueFilter {
+                kind: Some("InconsistentTranslation".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.issues.len(), 1);
+        assert_eq!(page.issues[0].entry_id, "a");
+        assert_eq!(page.issues[0].kind, "InconsistentTranslation");
+        let summary = db.validation_summary().unwrap();
+        assert_eq!(summary.len(), 1);
+        assert_eq!(
+            summary["InconsistentTranslation"],
+            ValidationKindCounts {
+                open: 1,
+                ignored: 0
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn validation_consecutive_saves_replace_instead_of_accumulating() {
         let db = Database::open_in_memory().unwrap();
         let issues = [issue("a", ValidationKind::EmptyTranslation)];

@@ -1228,6 +1228,8 @@ export const es: Record<keyof typeof en, string> = {
   "validate.message.identical": "La traducción es idéntica al original.",
   "validate.kind.emptyLabel": "Traducción vacía",
   "validate.kind.identicalLabel": "Igual al original",
+  "validate.kind.inconsistentLabel": "Traducción incoherente",
+  "validate.kind.inconsistentHint": "Mismo texto original con traducciones distintas: revisa la coherencia",
   "validate.kind.provenanceLabel": "Procedencia de inserción inválida",
   "validate.kind.staleLabel": "Texto original cambiado",
   "validate.kind.staleDetail": "Traduce esta entrada de nuevo o márcala como revisada/aprobada antes de insertarla o pivotarla.",

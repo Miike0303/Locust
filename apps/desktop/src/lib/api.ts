@@ -310,6 +310,7 @@ export type ValidationKind =
   | { ExceedsCharLimit: { limit: number; actual: number } }
   | { ExceedsBinarySlot: { encoding: string; limit: number; actual: number } }
   | { UnencodableTranslation: { encoding: string } }
+  | { InconsistentTranslation: { variants: number } }
   | "EmptyTranslation"
   | "InvalidInjectionProvenance"
   | "StaleTranslation"
@@ -430,6 +431,7 @@ export function validationKindLabel(kind: ValidationKind): string {
   if ("ExceedsCharLimit" in kind) return "ExceedsCharLimit";
   if ("ExceedsBinarySlot" in kind) return "ExceedsBinarySlot";
   if ("UnencodableTranslation" in kind) return "UnencodableTranslation";
+  if ("InconsistentTranslation" in kind) return "InconsistentTranslation";
   return "Unknown";
 }
 

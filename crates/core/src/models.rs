@@ -468,6 +468,10 @@ pub enum ValidationKind {
     },
     EmptyTranslation,
     IdenticalToSource,
+    /// Advisory only: repeated source/context has multiple current translations.
+    InconsistentTranslation {
+        variants: usize,
+    },
     InvalidInjectionProvenance,
     StaleTranslation,
 }

@@ -6,8 +6,8 @@ import { ChevronLeft, ChevronRight, ShieldCheck, ShieldQuestion } from "lucide-r
 import { getValidationIssues, getValidationSummary, setValidationIssueIgnored, validate, type ProjectInfo } from "../lib/api";
 import { ApiError } from "../lib/apiError";
 import { useLocale, useT } from "../lib/i18n";
-import { buildQaSummary, qaHasBeenChecked, qaLastRunKey, qaPagination, qaRelativePath, QA_PAGE_SIZE } from "../lib/qaDashboard";
-import { validationBadgeLabel } from "../lib/validationLabels";
+import { buildQaSummary, qaHasBeenChecked, qaIsAdvisoryKind, qaKindBadgeClass, qaLastRunKey, qaPagination, qaRelativePath, QA_PAGE_SIZE } from "../lib/qaDashboard";
+import { validationBadgeLabel, validationKindHint } from "../lib/validationLabels";
 import { draftProjectKey } from "../stores/draftStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useEditorStore } from "../stores/editorStore";
@@ -92,7 +92,7 @@ function ProjectQa({ project, projectKey }: { project: ProjectInfo | null; proje
   const neverChecked = !qaHasBeenChecked(summaryQuery.data ?? {}, lastCheckedAt) && !data?.total;
   const checkedEmpty = lastCheckedAt !== null && summary.open === 0 && (!includeIgnored || summary.kinds.every(counts => counts.ignored === 0));
   const runValidation = () => { ignore.reset(); run.mutate(); };
-  const chipClass = (active: boolean) => `rounded-full border px-3 py-1 text-body focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg ${active ? "border-accent-fg bg-accent-muted text-accent-fg" : "border-border bg-surface text-text-muted hover:bg-surface-muted"}`;
+  const chipClass = (active: boolean, chipKind?: string) => `rounded-full border px-3 py-1 text-body focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg ${chipKind && qaIsAdvisoryKind(chipKind) ? `${active ? "border-warning" : "border-border"} bg-warning-muted text-warning` : active ? "border-accent-fg bg-accent-muted text-accent-fg" : "border-border bg-surface text-text-muted hover:bg-surface-muted"}`;
 
   return (
     <div className="flex h-full flex-col bg-surface text-text">
@@ -103,7 +103,7 @@ function ProjectQa({ project, projectKey }: { project: ProjectInfo | null; proje
         </div>
         {!noProject && <div className="flex flex-wrap items-center gap-2" role="group" aria-label={t("qa.filterKind")}>
           <button type="button" className={chipClass(kind === undefined)} aria-pressed={kind === undefined} onClick={() => { setKind(undefined); setOffset(0); }}>{t("qa.all")} ({summary.open})</button>
-          {summary.kinds.map(counts => <button key={counts.kind} type="button" className={chipClass(kind === counts.kind)} aria-pressed={kind === counts.kind} onClick={() => { setKind(counts.kind); setOffset(0); }}>{validationBadgeLabel(counts.kind, t)} ({counts.open})</button>)}
+          {summary.kinds.map(counts => <button key={counts.kind} type="button" className={chipClass(kind === counts.kind, counts.kind)} title={validationKindHint(counts.kind, t)} aria-pressed={kind === counts.kind} onClick={() => { setKind(counts.kind); setOffset(0); }}>{validationBadgeLabel(counts.kind, t)} ({counts.open})</button>)}
           <label className="ml-2 inline-flex items-center gap-2 text-body"><input type="checkbox" checked={includeIgnored} onChange={e => { setIncludeIgnored(e.target.checked); setOffset(0); }} />{t("qa.showIgnored")}</label>
         </div>}
       </header>
@@ -123,7 +123,7 @@ function ProjectQa({ project, projectKey }: { project: ProjectInfo | null; proje
               <th scope="col" className="px-4 py-2">{t("qa.col.kind")}</th><th scope="col" className="px-4 py-2">{t("qa.col.file")}</th><th scope="col" className="px-4 py-2">{t("qa.col.source")}</th><th scope="col" className="px-4 py-2">{t("qa.col.message")}</th><th scope="col" className="px-4 py-2">{t("qa.col.actions")}</th>
             </tr></thead>
             <tbody>{data.issues.map(issue => <tr key={issue.id} className="border-b border-border hover:bg-surface-muted">
-              <td className="px-4 py-2"><span className="rounded bg-accent-muted px-2 py-1 text-caption text-accent-fg">{validationBadgeLabel(issue.kind, t)}</span>{issue.ignored && <span className="ml-2 text-caption text-text-muted">{t("qa.ignored")}</span>}</td>
+              <td className="px-4 py-2"><span className={`rounded px-2 py-1 text-caption ${qaKindBadgeClass(issue.kind)}`} title={validationKindHint(issue.kind, t)}>{validationBadgeLabel(issue.kind, t)}</span>{issue.ignored && <span className="ml-2 text-caption text-text-muted">{t("qa.ignored")}</span>}</td>
               <td className="max-w-48 truncate px-4 py-2" title={issue.file_path ?? undefined}>{issue.file_path ? qaRelativePath(issue.file_path, project!.path) : t("qa.unavailable")}</td>
               <td className="max-w-xs truncate px-4 py-2" title={issue.source ?? undefined}>{issue.source ?? t("qa.unavailable")}</td>
               <td className="px-4 py-2">{issue.message}</td>

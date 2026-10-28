@@ -614,6 +614,7 @@ impl Validator {
         let mut issues: Vec<ValidationIssue> =
             entries.iter().flat_map(Self::validate_entry).collect();
         issues.extend(crate::textasset_group::group_validation_issues(entries));
+        issues.extend(crate::consistency::translation_consistency_issues(entries));
         issues
     }
 
@@ -651,6 +652,7 @@ impl Validator {
                 ValidationKind::UnencodableTranslation { .. } => "UnencodableTranslation",
                 ValidationKind::EmptyTranslation => "EmptyTranslation",
                 ValidationKind::IdenticalToSource => "IdenticalToSource",
+                ValidationKind::InconsistentTranslation { .. } => "InconsistentTranslation",
                 ValidationKind::InvalidInjectionProvenance => "InvalidInjectionProvenance",
                 ValidationKind::StaleTranslation => "StaleTranslation",
             };

@@ -4,6 +4,14 @@ export const QA_PAGE_SIZE = 50;
 
 export const qaLastRunKey = (projectKey: string) => ["validation-last-run", projectKey] as const;
 
+export function qaIsAdvisoryKind(kind: string): boolean {
+  return kind === "IdenticalToSource" || kind === "InconsistentTranslation";
+}
+
+export function qaKindBadgeClass(kind: string): string {
+  return qaIsAdvisoryKind(kind) ? "bg-warning-muted text-warning" : "bg-accent-muted text-accent-fg";
+}
+
 /** Issue rows prove prior validation, but an empty summary carries no run metadata. */
 export function qaHasBeenChecked(summary: ValidationSummary, lastCheckedAt: number | null): boolean {
   return lastCheckedAt !== null || Object.values(summary).some(counts => counts.open + counts.ignored > 0);

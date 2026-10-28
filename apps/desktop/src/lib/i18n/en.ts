@@ -1252,6 +1252,8 @@ export const en = {
   "validate.message.identical": "Translation is identical to the source.",
   "validate.kind.emptyLabel": "Empty translation",
   "validate.kind.identicalLabel": "Identical to source",
+  "validate.kind.inconsistentLabel": "Inconsistent translation",
+  "validate.kind.inconsistentHint": "Same source translated differently — review for consistency",
   "validate.kind.provenanceLabel": "Invalid injection provenance",
   "validate.kind.staleLabel": "Source text changed",
   "validate.kind.staleDetail": "Translate this entry again or mark it reviewed/approved before injecting or pivoting it.",
