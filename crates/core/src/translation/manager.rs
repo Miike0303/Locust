@@ -160,6 +160,7 @@ struct GroupAccumulator {
     placeholders: HashMap<String, RecordProtection>,
     failed: HashSet<String>,
     finalized: HashSet<String>,
+    retain_on_cancel: bool,
 }
 
 impl GroupAccumulator {
@@ -181,6 +182,7 @@ impl GroupAccumulator {
             placeholders: HashMap::new(),
             failed: HashSet::new(),
             finalized: HashSet::new(),
+            retain_on_cancel: false,
         }
     }
 
@@ -388,7 +390,7 @@ impl TranslationManager {
         total_output_tokens: &mut u64,
     ) -> Result<()> {
         'groups: for group_id in acc.ready_group_ids() {
-            if cancel.is_cancelled() {
+            if cancel.is_cancelled() && !acc.retain_on_cancel {
                 return Ok(());
             }
             acc.finalized.insert(group_id.clone());
@@ -400,8 +402,9 @@ impl TranslationManager {
                 continue;
             };
             let mut attempts = 0usize;
+            let mut partial_repair_failed = false;
             'rounds: loop {
-                if cancel.is_cancelled() {
+                if cancel.is_cancelled() && !acc.retain_on_cancel {
                     return Ok(());
                 }
                 let owned = collect_group_owned_patches(
@@ -451,7 +454,7 @@ impl TranslationManager {
                         if to_save.is_empty() {
                             break;
                         }
-                        if cancel.is_cancelled() {
+                        if cancel.is_cancelled() && !acc.retain_on_cancel {
                             return Ok(());
                         }
                         self.db
@@ -486,7 +489,11 @@ impl TranslationManager {
                         }
                         break;
                     }
-                    Ok(false) if attempts < MAX_BINARY_SLOT_LENGTH_RETRIES => {
+                    Ok(false)
+                        if attempts < MAX_BINARY_SLOT_LENGTH_RETRIES
+                            && !partial_repair_failed
+                            && !cancel.is_cancelled() =>
+                    {
                         let actual = crate::textasset_group::reconstructed_len(&meta, &patches)
                             .unwrap_or(meta.capacity.saturating_add(1));
                         let retry_reqs: Vec<TranslationRequest> = selected_ids
@@ -544,6 +551,9 @@ impl TranslationManager {
                         attempts += 1;
                         for retry_reqs in retry_batches {
                             if cancel.is_cancelled() {
+                                if acc.retain_on_cancel {
+                                    continue 'rounds;
+                                }
                                 return Ok(());
                             }
                             if budget_error.is_some() {
@@ -618,12 +628,19 @@ impl TranslationManager {
                                     let ProviderCall {
                                         mut results,
                                         attempts: transport_attempts,
+                                        rejected_results,
+                                        failed_ids,
+                                        partial,
+                                        ..
                                     } = retry_call;
+                                    acc.retain_on_cancel |= partial;
                                     observed_cost.observe_batch(
-                                        results.iter().map(|r| r.cost_usd),
+                                        results.iter().chain(&rejected_results).map(|r| r.cost_usd),
                                         self.provider.is_free(),
                                     );
-                                    if transport_attempts > 1 && !self.provider.is_free() {
+                                    if (transport_attempts > 1 || !failed_ids.is_empty())
+                                        && !self.provider.is_free()
+                                    {
                                         observed_cost.complete = false;
                                     }
                                     if budget_error.is_none() {
@@ -632,7 +649,7 @@ impl TranslationManager {
                                             opts.cost_limit_usd,
                                         );
                                     }
-                                    for usage in &results {
+                                    for usage in results.iter().chain(&rejected_results) {
                                         *total_tokens += usage.tokens_used.unwrap_or(0) as u64;
                                         *total_input_tokens +=
                                             usage.input_tokens.unwrap_or(0) as u64;
@@ -641,14 +658,21 @@ impl TranslationManager {
                                     }
                                     let expected: HashSet<_> =
                                         retry_reqs.iter().map(|r| r.entry_id.as_str()).collect();
-                                    let actual_ids: HashSet<_> =
-                                        results.iter().map(|r| r.entry_id.as_str()).collect();
-                                    if results.len() != retry_reqs.len()
-                                        || actual_ids.len() != results.len()
+                                    let actual_ids: HashSet<_> = results
+                                        .iter()
+                                        .map(|r| r.entry_id.as_str())
+                                        .chain(failed_ids.iter().map(String::as_str))
+                                        .collect();
+                                    if results.len() + failed_ids.len() != retry_reqs.len()
+                                        || actual_ids.len() != results.len() + failed_ids.len()
                                         || actual_ids != expected
                                     {
                                         continue 'rounds;
                                     }
+                                    // Retain successful shortening receipts. A terminal
+                                    // partial failure must not start another whole-group
+                                    // dispatch solely because its vector was incomplete.
+                                    partial_repair_failed |= !failed_ids.is_empty();
                                     for result in &mut results {
                                         if !restore_placeholders_in_result(
                                             result,
@@ -1300,12 +1324,17 @@ impl TranslationManager {
                     let ProviderCall {
                         mut results,
                         attempts,
+                        failed_ids,
+                        partial,
+                        rejected_results,
+                        error,
                     } = call;
-                    observed_cost
-                        .observe_batch(results.iter().map(|r| r.cost_usd), self.provider.is_free());
-                    if attempts > 1 && !self.provider.is_free() {
-                        // A successful response describes the final attempt only.
-                        // Earlier transport attempts may have been processed remotely.
+                    observed_cost.observe_batch(
+                        results.iter().chain(&rejected_results).map(|r| r.cost_usd),
+                        self.provider.is_free(),
+                    );
+                    if (attempts > 1 || !failed_ids.is_empty()) && !self.provider.is_free() {
+                        // Failed paid attempts may have unreported remote charges.
                         observed_cost.complete = false;
                     }
                     if budget_error.is_none() {
@@ -1313,18 +1342,30 @@ impl TranslationManager {
                     }
                     // Account provider work before validation or fan-out,
                     // including malformed/partial responses that cannot save.
-                    for result in &results {
+                    for result in results.iter().chain(&rejected_results) {
                         total_tokens += result.tokens_used.unwrap_or(0) as u64;
                         total_input_tokens += result.input_tokens.unwrap_or(0) as u64;
                         total_output_tokens += result.output_tokens.unwrap_or(0) as u64;
                     }
+                    if let Some(error) = error {
+                        let _ = tx
+                            .send(ProgressEvent::BatchFailed {
+                                entry_id: None,
+                                error,
+                            })
+                            .await;
+                    }
                     let expected: std::collections::HashSet<_> =
                         requests.iter().map(|r| r.entry_id.as_str()).collect();
-                    let actual: std::collections::HashSet<_> =
-                        results.iter().map(|r| r.entry_id.as_str()).collect();
-                    if results.len() != requests.len()
-                        || actual.len() != results.len()
+                    let actual: std::collections::HashSet<_> = results
+                        .iter()
+                        .map(|r| r.entry_id.as_str())
+                        .chain(failed_ids.iter().map(String::as_str))
+                        .collect();
+                    if results.len() + failed_ids.len() != requests.len()
+                        || actual.len() != results.len() + failed_ids.len()
                         || actual != expected
+                        || (!partial && !failed_ids.is_empty())
                     {
                         // Invalid IDs prevent storage, not billing: account for
                         // the provider usage before considering another batch.
@@ -1341,9 +1382,20 @@ impl TranslationManager {
                     }
                     if cancel.is_cancelled() {
                         cancelled = true;
-                        in_flight.abort_all();
-                        break;
+                        if !partial {
+                            continue;
+                        }
                     }
+                    for id in &failed_ids {
+                        let _ = tx
+                            .send(ProgressEvent::BatchFailed {
+                                entry_id: Some(id.clone()),
+                                error: "provider failed to translate entry; entry remains pending"
+                                    .into(),
+                            })
+                            .await;
+                    }
+                    group_acc.retain_on_cancel |= partial;
                     // Restore/collapse first, then repair controls before any length fitting.
                     let mut invalid_controls = HashSet::new();
                     for result in &mut results {
@@ -1396,15 +1448,17 @@ impl TranslationManager {
                                     // Billing precedes ID/content acceptance, even for a
                                     // malformed retry or a response cancelled before saving.
                                     observed_cost.observe_batch(
-                                        call.results.iter().map(|r| r.cost_usd),
+                                        call.reported_usage().map(|r| r.cost_usd),
                                         self.provider.is_free(),
                                     );
-                                    if call.attempts > 1 && !self.provider.is_free() {
+                                    if (call.attempts > 1 || !call.failed_ids.is_empty())
+                                        && !self.provider.is_free()
+                                    {
                                         observed_cost.complete = false;
                                     }
                                     budget_error =
                                         observed_budget_error(observed_cost, opts.cost_limit_usd);
-                                    for usage in &call.results {
+                                    for usage in call.reported_usage() {
                                         total_tokens += usage.tokens_used.unwrap_or(0) as u64;
                                         total_input_tokens +=
                                             usage.input_tokens.unwrap_or(0) as u64;
@@ -1532,12 +1586,20 @@ impl TranslationManager {
                                     let ProviderCall {
                                         results: mut retry_batch,
                                         attempts,
+                                        rejected_results,
+                                        failed_ids,
+                                        ..
                                     } = retry_call;
                                     observed_cost.observe_batch(
-                                        retry_batch.iter().map(|r| r.cost_usd),
+                                        retry_batch
+                                            .iter()
+                                            .chain(&rejected_results)
+                                            .map(|r| r.cost_usd),
                                         self.provider.is_free(),
                                     );
-                                    if attempts > 1 && !self.provider.is_free() {
+                                    if (attempts > 1 || !failed_ids.is_empty())
+                                        && !self.provider.is_free()
+                                    {
                                         observed_cost.complete = false;
                                     }
                                     if budget_error.is_none() {
@@ -1548,7 +1610,7 @@ impl TranslationManager {
                                     }
                                     // Account every returned retry result, even when its IDs
                                     // are invalid. The original result retains original usage.
-                                    for usage in &retry_batch {
+                                    for usage in retry_batch.iter().chain(&rejected_results) {
                                         total_tokens += usage.tokens_used.unwrap_or(0) as u64;
                                         total_input_tokens +=
                                             usage.input_tokens.unwrap_or(0) as u64;
@@ -1693,8 +1755,9 @@ impl TranslationManager {
 
                     if cancel.is_cancelled() {
                         cancelled = true;
-                        in_flight.abort_all();
-                        break;
+                        if !partial {
+                            continue;
+                        }
                     }
                     let results =
                         repeated.expand(results, &mut placeholders_by_id, &mut budgets_by_id);
@@ -1875,13 +1938,15 @@ impl TranslationManager {
                 match joined {
                     Ok((_, _, _, Ok(call))) => {
                         observed_cost.observe_batch(
-                            call.results.iter().map(|r| r.cost_usd),
+                            call.reported_usage().map(|r| r.cost_usd),
                             self.provider.is_free(),
                         );
-                        if call.attempts > 1 && !self.provider.is_free() {
+                        if (call.attempts > 1 || !call.failed_ids.is_empty())
+                            && !self.provider.is_free()
+                        {
                             observed_cost.complete = false;
                         }
-                        for result in &call.results {
+                        for result in call.reported_usage() {
                             total_tokens += result.tokens_used.unwrap_or(0) as u64;
                             total_input_tokens += result.input_tokens.unwrap_or(0) as u64;
                             total_output_tokens += result.output_tokens.unwrap_or(0) as u64;

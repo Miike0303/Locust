@@ -36,6 +36,20 @@ pub trait TranslationProvider: Send + Sync {
         vec![]
     }
     async fn translate(&self, requests: &[TranslationRequest]) -> Result<Vec<TranslationResult>>;
+    /// Opt in to partial success. Append complete subchunk receipts as they arrive;
+    /// the caller owns this buffer so dropping the future on cancellation/deadline
+    /// preserves completed work. Return one error per failed ID. On normal return,
+    /// successes and failures must partition the request IDs exactly (no duplicates,
+    /// foreign IDs, overlap or omissions). Core validates before saving or retrying.
+    /// Only retryable failures are resent. `None` opts out and must leave the buffer
+    /// empty; core then uses the existing all-or-nothing `translate` contract.
+    async fn translate_partial(
+        &self,
+        _requests: &[TranslationRequest],
+        _successes: &mut Vec<TranslationResult>,
+    ) -> Option<Vec<(String, crate::error::LocustError)>> {
+        None
+    }
     async fn estimate_cost(&self, char_count: usize, target_lang: &str) -> Option<f64>;
     async fn health_check(&self) -> Result<()>;
 }

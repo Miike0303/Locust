@@ -21,6 +21,351 @@ use super::manager::RepeatedSources;
 use super::protection::MAX_BINARY_SLOT_LENGTH_RETRIES;
 use super::*;
 
+struct PartialReceiptProvider {
+    calls: Mutex<Vec<Vec<String>>>,
+    invalid: Option<&'static str>,
+}
+
+#[async_trait]
+impl TranslationProvider for PartialReceiptProvider {
+    fn id(&self) -> &str {
+        "partial-receipts"
+    }
+    fn name(&self) -> &str {
+        "Partial receipts"
+    }
+    fn is_free(&self) -> bool {
+        false
+    }
+    fn requires_api_key(&self) -> bool {
+        false
+    }
+    async fn translate(&self, _: &[TranslationRequest]) -> Result<Vec<TranslationResult>> {
+        panic!("opted-in provider must use partial receipts")
+    }
+    async fn translate_partial(
+        &self,
+        requests: &[TranslationRequest],
+        successes: &mut Vec<TranslationResult>,
+    ) -> Option<Vec<(String, LocustError)>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(requests.iter().map(|r| r.entry_id.clone()).collect());
+        successes.extend(requests.iter().filter(|r| r.entry_id != "e2").map(|r| {
+            TranslationResult {
+                entry_id: r.entry_id.clone(),
+                translation: format!("Translated {}", r.source),
+                detected_source_lang: None,
+                provider: self.id().into(),
+                tokens_used: Some(7),
+                input_tokens: Some(3),
+                output_tokens: Some(4),
+                cost_usd: Some(0.01),
+            }
+        }));
+        if self.invalid == Some("interrupt") {
+            std::future::pending::<()>().await;
+        }
+        let mut failed = requests
+            .iter()
+            .filter(|r| r.entry_id == "e2")
+            .map(|r| {
+                (
+                    r.entry_id.clone(),
+                    LocustError::ProviderError("503 temporary".into()),
+                )
+            })
+            .collect::<Vec<_>>();
+        match self.invalid {
+            Some("duplicate") => successes.push(successes[0].clone()),
+            Some("foreign") => successes[0].entry_id = "foreign".into(),
+            Some("missing") => {
+                failed.clear();
+            }
+            Some("overlap") => failed.push((
+                successes[0].entry_id.clone(),
+                LocustError::ProviderError("503".into()),
+            )),
+            Some("duplicate failure") => {
+                failed.push(("e2".into(), LocustError::ProviderError("503".into())))
+            }
+            _ => {}
+        }
+        Some(failed)
+    }
+    async fn estimate_cost(&self, _: usize, _: &str) -> Option<f64> {
+        Some(0.03)
+    }
+    async fn health_check(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn partial_success_receipts_retry_only_failed_ids_and_count_usage_once() {
+    let (db, glossary) = setup();
+    let entries = make_entries(3);
+    db.save_entries(&entries).unwrap();
+    let provider = Arc::new(PartialReceiptProvider {
+        calls: Mutex::new(Vec::new()),
+        invalid: None,
+    });
+    let manager = TranslationManager::new(provider.clone(), db.clone(), glossary)
+        .with_retry_config(RetryConfig {
+            initial_delay_ms: 1,
+            max_delay_ms: 1,
+            ..Default::default()
+        });
+    let (tx, _rx) = mpsc::channel(100);
+    manager
+        .translate_entries(
+            entries,
+            TranslationOptions {
+                use_memory: false,
+                use_glossary: false,
+                ..Default::default()
+            },
+            tx,
+            "partial".into(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        *provider.calls.lock().unwrap(),
+        vec![vec!["e0", "e1", "e2"], vec!["e2"], vec!["e2"]]
+    );
+    assert_eq!(
+        load_pending_entries(&db)
+            .unwrap()
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect::<Vec<_>>(),
+        ["e2"]
+    );
+    for id in ["e0", "e1"] {
+        assert_eq!(
+            db.get_entry(id).unwrap().unwrap().provider_used.as_deref(),
+            Some("partial-receipts")
+        );
+    }
+    let runs = db.get_translation_runs().unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        (
+            runs[0].strings_translated,
+            runs[0].tokens_used,
+            runs[0].input_tokens,
+            runs[0].output_tokens
+        ),
+        (2, 14, 6, 8)
+    );
+    assert_eq!(runs[0].cost_usd, 0.02);
+    assert!(!runs[0].cost_is_complete);
+    assert!(runs[0].duration_secs >= 0.0);
+}
+
+#[tokio::test]
+async fn partial_success_rejects_invalid_partitions_before_saving_or_retrying() {
+    for invalid in [
+        "duplicate",
+        "foreign",
+        "missing",
+        "overlap",
+        "duplicate failure",
+    ] {
+        let (db, glossary) = setup();
+        let entries = make_entries(3);
+        db.save_entries(&entries).unwrap();
+        let provider = Arc::new(PartialReceiptProvider {
+            calls: Mutex::new(Vec::new()),
+            invalid: Some(invalid),
+        });
+        let (tx, mut rx) = mpsc::channel(100);
+        TranslationManager::new(provider.clone(), db.clone(), glossary)
+            .translate_entries(
+                entries,
+                TranslationOptions {
+                    use_memory: false,
+                    use_glossary: false,
+                    ..Default::default()
+                },
+                tx,
+                "invalid-partial".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(provider.calls.lock().unwrap().len(), 1, "{invalid}");
+        assert_eq!(load_pending_entries(&db).unwrap().len(), 3, "{invalid}");
+        let mut rejected = false;
+        while let Some(event) = rx.recv().await {
+            if let ProgressEvent::BatchFailed { error, .. } = event {
+                rejected |= error.contains("entry IDs");
+            }
+        }
+        assert!(rejected, "{invalid}");
+        let runs = db.get_translation_runs().unwrap();
+        assert_eq!(
+            runs.len(),
+            1,
+            "reported usage must survive invalid IDs: {invalid}"
+        );
+        assert_eq!(runs[0].strings_translated, 0);
+        assert_eq!(
+            runs[0].tokens_used,
+            if invalid == "duplicate" { 21 } else { 14 }
+        );
+        assert!(!runs[0].cost_is_complete);
+    }
+}
+
+#[tokio::test]
+async fn partial_success_interruptions_keep_receipts_and_bound_waits() {
+    for cancel_job in [false, true] {
+        let (db, glossary) = setup();
+        let entries = make_entries(3);
+        db.save_entries(&entries).unwrap();
+        let provider = Arc::new(PartialReceiptProvider {
+            calls: Mutex::new(Vec::new()),
+            invalid: Some("interrupt"),
+        });
+        let manager = TranslationManager::new(provider.clone(), db.clone(), glossary)
+            .with_retry_config(RetryConfig {
+                overall_deadline: Some(Duration::from_millis(30)),
+                ..Default::default()
+            });
+        let (tx, mut rx) = mpsc::channel(100);
+        let cancel = CancellationToken::new();
+        let token = cancel.clone();
+        let job = tokio::spawn(async move {
+            manager
+                .translate_entries(
+                    entries,
+                    TranslationOptions {
+                        use_memory: false,
+                        use_glossary: false,
+                        ..Default::default()
+                    },
+                    tx,
+                    "interrupt".into(),
+                    token,
+                )
+                .await
+        });
+        if cancel_job {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while provider.calls.lock().unwrap().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            cancel.cancel();
+        }
+        tokio::time::timeout(Duration::from_secs(1), job)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(provider.calls.lock().unwrap().len(), 1);
+        assert_eq!(load_pending_entries(&db).unwrap().len(), 1);
+        let runs = db.get_translation_runs().unwrap();
+        assert_eq!(
+            (
+                runs[0].strings_translated,
+                runs[0].tokens_used,
+                runs[0].input_tokens,
+                runs[0].output_tokens
+            ),
+            (2, 14, 6, 8)
+        );
+        assert_eq!(runs[0].cost_usd, 0.02);
+        assert!(!runs[0].cost_is_complete);
+        let mut paused = false;
+        while let Some(event) = rx.recv().await {
+            paused |= matches!(event, ProgressEvent::Paused);
+        }
+        assert_eq!(paused, cancel_job);
+    }
+}
+
+#[tokio::test]
+async fn partial_success_cancel_saves_fitting_group_receipts_without_repairs() {
+    let (db, glossary) = setup();
+    let original = format!(
+        "Menu.A: First\nMenu.B: Second\nMenu.C: Third\n{}",
+        " ".repeat(100)
+    );
+    let entries = grouped_loc_entries(
+        &original,
+        &[
+            ("e0", "Menu.A", "First"),
+            ("e1", "Menu.B", "Second"),
+            ("e2", "Menu.C", "Third"),
+        ],
+    );
+    db.save_entries(&entries).unwrap();
+    let provider = Arc::new(PartialReceiptProvider {
+        calls: Mutex::new(Vec::new()),
+        invalid: Some("interrupt"),
+    });
+    let manager = TranslationManager::new(provider.clone(), db.clone(), glossary);
+    let cancel = CancellationToken::new();
+    let token = cancel.clone();
+    let (tx, mut rx) = mpsc::channel(100);
+    let job = tokio::spawn(async move {
+        manager
+            .translate_entries(
+                entries,
+                TranslationOptions {
+                    use_memory: false,
+                    use_glossary: false,
+                    ..Default::default()
+                },
+                tx,
+                "group-partial-cancel".into(),
+                token,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while provider.calls.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(1), job)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(provider.calls.lock().unwrap().len(), 1);
+    assert_eq!(
+        load_pending_entries(&db)
+            .unwrap()
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect::<Vec<_>>(),
+        ["e2"]
+    );
+    let loaded = db.get_entries(&Default::default()).unwrap();
+    assert!(crate::textasset_group::group_validation_issues(&loaded).is_empty());
+    let runs = db.get_translation_runs().unwrap();
+    assert_eq!((runs[0].strings_translated, runs[0].tokens_used), (2, 14));
+    let mut writes = 0;
+    let mut paused = false;
+    while let Some(event) = rx.recv().await {
+        writes += usize::from(matches!(event, ProgressEvent::StringTranslated { .. }));
+        paused |= matches!(event, ProgressEvent::Paused);
+    }
+    assert_eq!(writes, 2);
+    assert!(paused);
+}
+
 #[tokio::test(start_paused = true)]
 async fn antigravity_allows_slow_cli_calls_but_remains_cancellable() {
     let db = Arc::new(Database::open_in_memory().unwrap());

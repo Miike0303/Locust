@@ -10,6 +10,11 @@ use locust_core::translation::{rate_limiter_for, RateLimiter, TranslationProvide
 // contains only language/options; source text is never placed in its query.
 const MAX_FORM_BYTES: usize = 64 * 1024;
 
+enum ChunkError {
+    Request(LocustError),
+    Malformed(LocustError),
+}
+
 fn source_form_bytes(source: &str) -> usize {
     4 + source
         .as_bytes()
@@ -104,15 +109,10 @@ impl GoogleTranslateProvider {
         base_url: &str,
         requests: &[TranslationRequest],
         limiter: &RateLimiter,
-    ) -> Result<Vec<TranslationResult>> {
+    ) -> std::result::Result<Vec<TranslationResult>, ChunkError> {
         let url = format!("{base_url}/translate_a/t");
-        let mut results = Vec::with_capacity(requests.len());
-        let mut pending = vec![requests];
-
-        // Traverse the halving retry tree in input order. Each split strictly reduces
-        // the chunk size, so malformed responses eventually fail at a single source.
-        while let Some(chunk) = pending.pop() {
-            if chunk.len() == 1 && source_form_bytes(&chunk[0].source) > MAX_FORM_BYTES {
+        let response: Result<_> = async {
+            if requests.len() == 1 && source_form_bytes(&requests[0].source) > MAX_FORM_BYTES {
                 return Err(LocustError::ProviderError(
                     "Google Translate source exceeds the 64 KiB POST form budget".into(),
                 ));
@@ -122,13 +122,13 @@ impl GoogleTranslateProvider {
                     "Google live probe stopped after consecutive blocked responses".into(),
                 ));
             }
-            let fields: Vec<_> = chunk.iter().map(|r| ("q", r.source.as_str())).collect();
+            let fields: Vec<_> = requests.iter().map(|r| ("q", r.source.as_str())).collect();
             let resp = client
                 .post(&url)
                 .query(&[
                     ("client", "gtx"),
-                    ("sl", chunk[0].source_lang.as_str()),
-                    ("tl", chunk[0].target_lang.as_str()),
+                    ("sl", requests[0].source_lang.as_str()),
+                    ("tl", requests[0].target_lang.as_str()),
                     ("dj", "1"),
                 ])
                 .form(&fields)
@@ -183,29 +183,115 @@ impl GoogleTranslateProvider {
                 ));
             }
 
-            let parsed = decoded
-                .map_err(|e| {
-                    LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
-                        &format!("Google Translate returned invalid JSON: {}", e),
-                        &[],
-                    ))
-                })
-                .and_then(|body| Self::parse_response(&body, chunk));
+            Ok((decoded, status))
+        }
+        .await;
+        let (decoded, status) = response.map_err(ChunkError::Request)?;
+        decoded
+            .map_err(|e| {
+                LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
+                    &format!("Google Translate returned invalid JSON: {}", e),
+                    &[],
+                ))
+            })
+            .and_then(|body| Self::parse_response(&body, requests))
+            .inspect(|_| {
+                limiter.record_google_response(status.as_u16(), false, None);
+            })
+            .map_err(ChunkError::Malformed)
+    }
 
-            match parsed {
-                Ok(translations) => {
-                    limiter.record_google_response(status.as_u16(), false, None);
-                    results.extend(translations);
+    async fn collect_partial(
+        &self,
+        requests: &[TranslationRequest],
+        successes: &mut Vec<TranslationResult>,
+    ) -> Vec<(String, LocustError)> {
+        let mut pending: std::collections::VecDeque<_> = self
+            .chunks(requests)
+            .into_iter()
+            .map(<[TranslationRequest]>::to_vec)
+            .collect();
+        let mut failed = Vec::new();
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut stopped = None;
+        loop {
+            while stopped.is_none() && tasks.len() < self.concurrency {
+                let Some(chunk) = pending.pop_front() else {
+                    break;
+                };
+                let client = self.client.clone();
+                let base_url = self.base_url.clone();
+                let limiter = self.limiter.clone();
+                tasks.spawn(async move {
+                    let result = Self::translate_chunk(&client, &base_url, &chunk, &limiter).await;
+                    (chunk, result)
+                });
+            }
+            let Some(task) = tasks.join_next().await else {
+                break;
+            };
+            match task {
+                Ok((_, Ok(results))) => successes.extend(results),
+                Ok((chunk, Err(ChunkError::Malformed(_))))
+                    if chunk.len() > 1 && stopped.is_none() =>
+                {
+                    let mid = chunk.len() / 2;
+                    pending.push_front(chunk[mid..].to_vec());
+                    pending.push_front(chunk[..mid].to_vec());
                 }
-                Err(_) if chunk.len() > 1 => {
-                    let (left, right) = chunk.split_at(chunk.len() / 2);
-                    pending.push(right);
-                    pending.push(left);
+                // A completed malformed parent drained after a transport stop
+                // still needs splitting on retry, regardless of join order.
+                Ok((chunk, Err(ChunkError::Malformed(_)))) if chunk.len() > 1 => {}
+                Ok((chunk, Err(ChunkError::Malformed(error)))) => {
+                    failed.extend(chunk.iter().map(|r| {
+                        (
+                            r.entry_id.clone(),
+                            LocustError::ProviderError(error.to_string()),
+                        )
+                    }));
                 }
-                Err(error) => return Err(error),
+                Ok((_, Err(ChunkError::Request(error)))) => {
+                    if stopped.is_none() {
+                        stopped = Some(error.to_string());
+                        // Abort queued HTTP waits immediately after a block; waiting
+                        // through their shared cooldown would bury known receipts.
+                        // join_next still yields successful tasks already completed.
+                        tasks.abort_all();
+                    }
+                }
+                Err(error) if !error.is_cancelled() => {
+                    stopped = Some(format!("Google Translate task join error: {error}"));
+                    tasks.abort_all();
+                }
+                Err(_) => {}
             }
         }
-        Ok(results)
+        if let Some(error) = stopped {
+            let accounted: std::collections::HashSet<_> = successes
+                .iter()
+                .map(|r| r.entry_id.as_str())
+                .chain(failed.iter().map(|(id, _)| id.as_str()))
+                .collect();
+            let unsettled = requests
+                .iter()
+                .filter(|r| !accounted.contains(r.entry_id.as_str()))
+                .map(|r| {
+                    (
+                        r.entry_id.clone(),
+                        LocustError::ProviderError(error.clone()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            failed.extend(unsettled);
+        }
+        // Preserve the adapter's existing ordered success API for direct callers.
+        let order: std::collections::HashMap<_, _> = requests
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (r.entry_id.as_str(), i))
+            .collect();
+        successes.sort_by_key(|r| order[r.entry_id.as_str()]);
+        failed
     }
 
     fn traffic_error(status: reqwest::StatusCode) -> LocustError {
@@ -308,38 +394,21 @@ impl TranslationProvider for GoogleTranslateProvider {
     }
 
     async fn translate(&self, requests: &[TranslationRequest]) -> Result<Vec<TranslationResult>> {
-        let chunks = self.chunks(requests);
-        let mut results = vec![Vec::new(); chunks.len()];
-        let mut chunks = chunks.into_iter().enumerate();
-        // Dropping the set on failure or cancellation aborts the remaining tasks.
-        let mut tasks = tokio::task::JoinSet::new();
-        loop {
-            while tasks.len() < self.concurrency {
-                let Some((index, chunk)) = chunks.next() else {
-                    break;
-                };
-                let client = self.client.clone();
-                let base_url = self.base_url.clone();
-                let chunk = chunk.to_vec();
-                let limiter = self.limiter.clone();
-                tasks.spawn(async move {
-                    let translations =
-                        Self::translate_chunk(&client, &base_url, &chunk, &limiter).await;
-                    (index, translations)
-                });
-            }
-            let Some(task) = tasks.join_next().await else {
-                break;
-            };
-            let (index, translations) = task.map_err(|e| {
-                LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
-                    &format!("task join error: {}", e),
-                    &[],
-                ))
-            })?;
-            results[index] = translations?;
+        let mut results = Vec::new();
+        let failed = self.collect_partial(requests, &mut results).await;
+        if let Some((_, error)) = failed.into_iter().next() {
+            Err(error)
+        } else {
+            Ok(results)
         }
-        Ok(results.into_iter().flatten().collect())
+    }
+
+    async fn translate_partial(
+        &self,
+        requests: &[TranslationRequest],
+        successes: &mut Vec<TranslationResult>,
+    ) -> Option<Vec<(String, LocustError)>> {
+        Some(self.collect_partial(requests, successes).await)
     }
 
     async fn estimate_cost(&self, _char_count: usize, _target_lang: &str) -> Option<f64> {
@@ -366,6 +435,499 @@ mod tests {
     use httpmock::prelude::*;
     use locust_core::translation::is_retryable;
     use serde_json::json;
+
+    // Dynamic loopback server: logs every source, including malformed parents,
+    // so retry regressions cannot hide behind a total HTTP request count.
+    async fn partial_server(
+        mode: &'static str,
+    ) -> (
+        String,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = log.clone();
+        let serving = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut bytes = Vec::new();
+                    let body = loop {
+                        let mut buf = [0; 4096];
+                        let read = socket.read(&mut buf).await.unwrap();
+                        if read == 0 {
+                            return;
+                        }
+                        bytes.extend_from_slice(&buf[..read]);
+                        if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers =
+                                String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                            let len = headers
+                                .lines()
+                                .find_map(|line| {
+                                    line.strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap())
+                                })
+                                .unwrap();
+                            if bytes.len() >= end + 4 + len {
+                                break String::from_utf8(bytes[end + 4..end + 4 + len].to_vec())
+                                    .unwrap();
+                            }
+                        }
+                    };
+                    let sources: Vec<_> = body
+                        .split('&')
+                        .map(|q| q.strip_prefix("q=").unwrap())
+                        .collect();
+                    let call = {
+                        let mut log = seen.lock().unwrap();
+                        log.extend(sources.iter().map(|s| (*s).to_string()));
+                        log.iter().filter(|s| *s == "c").count()
+                    };
+                    let blocked = body == "q=c&q=d"
+                        && (mode == "blocked"
+                            || mode == "cancel"
+                            || (mode == "recover" && call == 1));
+                    let malformed = mode == "malformed" && (body == "q=c&q=d" || body == "q=d");
+                    if mode == "cancel-inflight" && body == "q=c&q=d" {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    }
+                    let (status, response) = if blocked {
+                        (
+                            "503 Service Unavailable",
+                            "upstream unavailable".to_string(),
+                        )
+                    } else if malformed {
+                        ("200 OK", "[]".to_string())
+                    } else {
+                        (
+                            "200 OK",
+                            serde_json::to_string(
+                                &sources.iter().map(|s| s.to_uppercase()).collect::<Vec<_>>(),
+                            )
+                            .unwrap(),
+                        )
+                    };
+                    let response = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len());
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (url, log, serving)
+    }
+
+    struct PartialFallback(std::sync::Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl TranslationProvider for PartialFallback {
+        fn id(&self) -> &str {
+            "partial-fallback"
+        }
+        fn name(&self) -> &str {
+            "Partial fallback"
+        }
+        fn is_free(&self) -> bool {
+            true
+        }
+        fn requires_api_key(&self) -> bool {
+            false
+        }
+        async fn translate(
+            &self,
+            requests: &[TranslationRequest],
+        ) -> Result<Vec<TranslationResult>> {
+            self.0
+                .lock()
+                .unwrap()
+                .extend(requests.iter().map(|r| r.entry_id.clone()));
+            Ok(requests
+                .iter()
+                .map(|r| TranslationResult {
+                    entry_id: r.entry_id.clone(),
+                    translation: "Fallback".into(),
+                    detected_source_lang: None,
+                    provider: self.id().into(),
+                    tokens_used: Some(3),
+                    input_tokens: Some(2),
+                    output_tokens: Some(1),
+                    cost_usd: None,
+                })
+                .collect())
+        }
+        async fn estimate_cost(&self, _: usize, _: &str) -> Option<f64> {
+            None
+        }
+        async fn health_check(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn partial_scenario(mode: &'static str, with_fallback: bool) {
+        use locust_core::{
+            database::Database,
+            glossary::Glossary,
+            models::{ProgressEvent, StringEntry},
+            translation::{
+                load_pending_entries, run_fallback_chain, RetryConfig, TranslationManager,
+                TranslationOptions,
+            },
+        };
+        let (base_url, log, serving) = partial_server(mode).await;
+        let provider = Arc::new(GoogleTranslateProvider {
+            base_url,
+            limiter: Arc::new(RateLimiter::unlimited()),
+            max_sources: 2,
+            concurrency: 1,
+            ..GoogleTranslateProvider::new()
+        });
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let glossary = Arc::new(Glossary::new(db.clone()));
+        let entries = ["a", "b", "c", "d"]
+            .iter()
+            .map(|s| StringEntry::new(*s, *s, "file.json".into()))
+            .collect::<Vec<_>>();
+        db.save_entries(&entries).unwrap();
+        let opts = TranslationOptions {
+            source_lang: "en".into(),
+            target_lang: "es".into(),
+            use_memory: false,
+            use_glossary: false,
+            ..Default::default()
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        let cfg = RetryConfig {
+            initial_delay_ms: if mode == "cancel" { 60_000 } else { 1 },
+            max_delay_ms: 60_000,
+            ..Default::default()
+        };
+        let cancel = cfg.cancel.clone().unwrap_or_default();
+        let cancel_job = cancel.clone();
+        let manager = TranslationManager::new(provider.clone(), db.clone(), glossary.clone())
+            .with_retry_config(cfg);
+        let job = tokio::spawn(async move {
+            manager
+                .translate_entries(entries, opts, tx, "partial-google".into(), cancel_job)
+                .await
+        });
+        if mode.starts_with("cancel") {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !log.lock().unwrap().iter().any(|s| s == "d") {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+            // Cancellation while core is backing off, after Google has delivered receipts.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            cancel.cancel();
+        }
+        tokio::time::timeout(Duration::from_secs(5), job)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let expected = match mode {
+            "recover" => [1, 1, 2, 2],
+            "blocked" => [1, 1, 3, 3],
+            "malformed" => [1, 1, 2, 2],
+            "cancel" | "cancel-inflight" => [1, 1, 1, 1],
+            _ => unreachable!(),
+        };
+        for (source, expected) in ["a", "b", "c", "d"].iter().zip(expected) {
+            assert_eq!(
+                log.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|s| s.as_str() == *source)
+                    .count(),
+                expected,
+                "{mode}: {source}"
+            );
+        }
+        let saved = match mode {
+            "recover" => 4,
+            "malformed" => 3,
+            _ => 2,
+        };
+        assert_eq!(load_pending_entries(&db).unwrap().len(), 4 - saved);
+        let mut writes = Vec::new();
+        let mut paused = false;
+        while let Some(event) = rx.recv().await {
+            match event {
+                ProgressEvent::StringTranslated { entry_id, .. } => writes.push(entry_id),
+                ProgressEvent::Paused => paused = true,
+                _ => {}
+            }
+        }
+        assert_eq!(writes.len(), saved);
+        writes.sort();
+        writes.dedup();
+        assert_eq!(writes.len(), saved);
+        assert_eq!(paused, mode.starts_with("cancel"));
+        let runs = db.get_translation_runs().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].strings_translated, saved);
+        assert_eq!(
+            (
+                runs[0].tokens_used,
+                runs[0].cost_usd,
+                runs[0].cost_is_complete
+            ),
+            (0, 0.0, true)
+        );
+        assert_eq!(runs[0].provider, "google");
+        for id in ["a", "b"] {
+            assert_eq!(
+                db.get_entry(id).unwrap().unwrap().provider_used.as_deref(),
+                Some("google")
+            );
+        }
+        if with_fallback {
+            let fallback = Arc::new(PartialFallback(Default::default()));
+            let (tx, _rx) = tokio::sync::mpsc::channel(100);
+            let fallback_dyn: Arc<dyn TranslationProvider> = fallback.clone();
+            run_fallback_chain(
+                &["partial-fallback".into()],
+                &|_| Some(fallback_dyn.clone()),
+                db.clone(),
+                glossary,
+                TranslationOptions {
+                    use_memory: false,
+                    use_glossary: false,
+                    ..Default::default()
+                },
+                tx,
+                "fallback".into(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+            let expected_ids: Vec<_> = if mode == "malformed" {
+                vec!["d"]
+            } else {
+                vec!["c", "d"]
+            };
+            assert_eq!(*fallback.0.lock().unwrap(), expected_ids);
+            assert!(load_pending_entries(&db).unwrap().is_empty());
+            assert_eq!(
+                db.get_entry("d").unwrap().unwrap().provider_used.as_deref(),
+                Some("partial-fallback")
+            );
+            let runs = db.get_translation_runs().unwrap();
+            assert_eq!(runs.len(), 2);
+            assert_eq!(runs.iter().map(|r| r.strings_translated).sum::<usize>(), 4);
+            let fallback_run = runs
+                .iter()
+                .find(|r| r.provider == "partial-fallback")
+                .unwrap();
+            assert_eq!(
+                (
+                    fallback_run.tokens_used,
+                    fallback_run.input_tokens,
+                    fallback_run.output_tokens
+                ),
+                (
+                    (4 - saved) as u64 * 3,
+                    (4 - saved) as u64 * 2,
+                    (4 - saved) as u64
+                )
+            );
+        }
+        serving.abort();
+    }
+
+    #[tokio::test]
+    async fn partial_success_503_then_recovery_never_resends_successes() {
+        partial_scenario("recover", false).await;
+    }
+    #[tokio::test]
+    async fn partial_success_persistent_503_saves_successes_and_falls_back_only_pending() {
+        partial_scenario("blocked", true).await;
+    }
+    #[tokio::test]
+    async fn partial_success_malformed_singleton_preserves_siblings_and_fallback() {
+        partial_scenario("malformed", true).await;
+    }
+    #[tokio::test]
+    async fn partial_success_cancel_mid_retry_preserves_receipts() {
+        partial_scenario("cancel", false).await;
+    }
+    #[tokio::test]
+    async fn partial_success_cancel_inflight_preserves_completed_subchunks() {
+        partial_scenario("cancel-inflight", false).await;
+    }
+
+    struct LegacyGoogle(GoogleTranslateProvider);
+    #[async_trait]
+    impl TranslationProvider for LegacyGoogle {
+        fn id(&self) -> &str {
+            "mock"
+        }
+        fn name(&self) -> &str {
+            "Legacy Google"
+        }
+        fn is_free(&self) -> bool {
+            true
+        }
+        fn requires_api_key(&self) -> bool {
+            false
+        }
+        async fn translate(
+            &self,
+            requests: &[TranslationRequest],
+        ) -> Result<Vec<TranslationResult>> {
+            self.0.translate(requests).await
+        }
+        async fn estimate_cost(&self, _: usize, _: &str) -> Option<f64> {
+            None
+        }
+        async fn health_check(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_success_non_opt_in_provider_stays_all_or_nothing() {
+        use locust_core::{
+            database::Database,
+            glossary::Glossary,
+            models::StringEntry,
+            translation::{
+                load_pending_entries, RetryConfig, TranslationManager, TranslationOptions,
+            },
+        };
+        let (base_url, log, serving) = partial_server("blocked").await;
+        let provider = Arc::new(LegacyGoogle(GoogleTranslateProvider {
+            base_url,
+            limiter: Arc::new(RateLimiter::unlimited()),
+            max_sources: 2,
+            concurrency: 1,
+            ..GoogleTranslateProvider::new()
+        }));
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let entries = ["a", "b", "c", "d"]
+            .iter()
+            .map(|s| StringEntry::new(*s, *s, "file.json".into()))
+            .collect::<Vec<_>>();
+        db.save_entries(&entries).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+        TranslationManager::new(provider, db.clone(), Arc::new(Glossary::new(db.clone())))
+            .with_retry_config(RetryConfig {
+                initial_delay_ms: 1,
+                max_delay_ms: 1,
+                ..Default::default()
+            })
+            .translate_entries(
+                entries,
+                TranslationOptions {
+                    use_memory: false,
+                    use_glossary: false,
+                    ..Default::default()
+                },
+                tx,
+                "legacy".into(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        for source in ["a", "b", "c", "d"] {
+            assert_eq!(
+                log.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|s| s.as_str() == source)
+                    .count(),
+                3
+            );
+        }
+        assert_eq!(load_pending_entries(&db).unwrap().len(), 4);
+        assert!(db.get_translation_runs().unwrap().is_empty());
+        serving.abort();
+    }
+
+    #[tokio::test]
+    async fn partial_success_concurrent_paced_chunks_cancel_queued_retries() {
+        use locust_core::{
+            database::Database,
+            glossary::Glossary,
+            models::StringEntry,
+            translation::{
+                load_pending_entries, RetryConfig, TranslationManager, TranslationOptions,
+            },
+        };
+        for rpm in [None, Some(6000)] {
+            let (base_url, log, serving) = partial_server("blocked").await;
+            let limiter = Arc::new(RateLimiter::google(rpm, None));
+            let provider = Arc::new(GoogleTranslateProvider {
+                base_url,
+                limiter: limiter.clone(),
+                max_sources: 2,
+                concurrency: 3,
+                ..GoogleTranslateProvider::new()
+            });
+            let db = Arc::new(Database::open_in_memory().unwrap());
+            let entries = ["a", "b", "c", "d", "e", "f"]
+                .iter()
+                .map(|s| StringEntry::new(*s, *s, "file.json".into()))
+                .collect::<Vec<_>>();
+            db.save_entries(&entries).unwrap();
+            let manager =
+                TranslationManager::new(provider, db.clone(), Arc::new(Glossary::new(db.clone())))
+                    .with_retry_config(RetryConfig {
+                        initial_delay_ms: 1,
+                        max_delay_ms: 1,
+                        overall_deadline: Some(Duration::from_secs(5)),
+                        ..Default::default()
+                    });
+            let (tx, _rx) = tokio::sync::mpsc::channel(100);
+            let cancel = RetryConfig::default().cancel.unwrap_or_default();
+            let token = cancel.clone();
+            let job = tokio::spawn(async move {
+                manager
+                    .translate_entries(
+                        entries,
+                        TranslationOptions {
+                            use_memory: false,
+                            use_glossary: false,
+                            ..Default::default()
+                        },
+                        tx,
+                        "paced-partial".into(),
+                        token,
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while limiter.google_stats().blocked == 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+            // The next attempt queues behind Google's cooldown, then cancellation
+            // must release its position without another POST or lost receipts.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            cancel.cancel();
+            tokio::time::timeout(Duration::from_secs(1), job)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(*log.lock().unwrap(), ["a", "b", "c", "d"]);
+            let stats = limiter.google_stats();
+            assert_eq!((stats.requests, stats.successes, stats.blocked), (2, 1, 1));
+            assert_eq!(limiter.requests_per_minute(), rpm.unwrap_or(31));
+            assert_eq!(load_pending_entries(&db).unwrap().len(), 4);
+            let runs = db.get_translation_runs().unwrap();
+            assert_eq!((runs.len(), runs[0].strings_translated), (1, 2));
+            assert!(runs[0].cost_is_complete);
+            serving.abort();
+        }
+    }
 
     #[tokio::test]
     async fn google_transport_and_decode_errors_redact_url_queries() {

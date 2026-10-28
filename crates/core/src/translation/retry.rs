@@ -165,6 +165,33 @@ pub fn is_retryable(e: &LocustError) -> bool {
 pub(super) struct ProviderCall {
     pub(super) results: Vec<TranslationResult>,
     pub(super) attempts: usize,
+    pub(super) failed_ids: Vec<String>,
+    pub(super) partial: bool,
+    pub(super) rejected_results: Vec<TranslationResult>,
+    pub(super) error: Option<String>,
+}
+
+impl ProviderCall {
+    pub(super) fn reported_usage(&self) -> impl Iterator<Item = &TranslationResult> {
+        self.results.iter().chain(&self.rejected_results)
+    }
+}
+
+fn valid_partition(
+    requests: &[TranslationRequest],
+    successes: &[TranslationResult],
+    failed: impl Iterator<Item = String>,
+) -> bool {
+    let expected: std::collections::HashSet<_> =
+        requests.iter().map(|r| r.entry_id.as_str()).collect();
+    let mut seen = std::collections::HashSet::new();
+    expected.len() == requests.len()
+        && successes
+            .iter()
+            .map(|r| r.entry_id.clone())
+            .chain(failed)
+            .all(|id| expected.contains(id.as_str()) && seen.insert(id))
+        && seen.len() == expected.len()
 }
 
 pub(super) async fn call_provider(
@@ -196,32 +223,126 @@ async fn call_provider_with_limiter(
     }
     let mut cfg = retry.clone();
     cfg.cancel = Some(cancel.clone());
-    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let provider = provider.clone();
-    let requests = requests.to_vec();
-    let attempts_for_call = attempts.clone();
-    let results = with_retry(&cfg, move || {
+    #[derive(Default)]
+    struct State {
+        pending: Vec<TranslationRequest>,
+        results: Vec<TranslationResult>,
+        receipts: Vec<TranslationResult>,
+        attempts: usize,
+        partial: bool,
+        rejected_results: Vec<TranslationResult>,
+        error: Option<String>,
+    }
+    let state = Arc::new(tokio::sync::Mutex::new(State {
+        pending: requests.to_vec(),
+        ..Default::default()
+    }));
+    let outcome = with_retry(&cfg, || {
         let provider = provider.clone();
-        let requests = requests.clone();
         let limiter = limiter.clone();
-        let is_retry = attempts_for_call.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0;
+        let state = state.clone();
         async move {
+            let mut state = state.lock().await;
+            let is_retry = state.attempts > 0;
+            state.attempts += 1;
             // Every HTTP attempt consumes rate allowance, including retries.
             if is_retry {
                 limiter.acquire().await;
             }
             tracing::debug!(
                 provider = provider.id(),
-                strings = requests.len(),
+                strings = state.pending.len(),
                 "dispatching translation requests"
             );
-            provider.translate(&requests).await
+            let pending = state.pending.clone();
+            match provider
+                .translate_partial(&pending, &mut state.receipts)
+                .await
+            {
+                None if !state.partial && state.receipts.is_empty() => {
+                    state.results = provider.translate(&pending).await?;
+                    Ok(())
+                }
+                Some(failed)
+                    if valid_partition(
+                        &pending,
+                        &state.receipts,
+                        failed.iter().map(|(id, _)| id.clone()),
+                    ) =>
+                {
+                    state.partial = true;
+                    let receipts = std::mem::take(&mut state.receipts);
+                    state.results.extend(receipts);
+                    let retry_ids: std::collections::HashSet<_> = failed
+                        .iter()
+                        .filter(|(_, error)| is_retryable(error))
+                        .map(|(id, _)| id.as_str())
+                        .collect();
+                    state
+                        .pending
+                        .retain(|r| retry_ids.contains(r.entry_id.as_str()));
+                    match failed.into_iter().find(|(_, error)| is_retryable(error)) {
+                        Some((_, error)) => Err(error),
+                        None => Ok(()),
+                    }
+                }
+                _ => {
+                    // Invalid IDs prevent storage, not accounting for reported work.
+                    state.partial = true;
+                    let receipts = std::mem::take(&mut state.receipts);
+                    state.rejected_results.extend(receipts);
+                    let error =
+                        "provider returned mismatched or duplicate entry IDs in partial outcome";
+                    state.error = Some(error.into());
+                    Err(LocustError::ProviderError(error.into()))
+                }
+            }
         }
     })
-    .await?;
+    .await;
+    let mut state = state.lock().await;
+    // The interrupted future may already have published complete subchunks.
+    // Synthesize failures only on interruption; normal omissions remain invalid.
+    if !state.receipts.is_empty() {
+        let completed: std::collections::HashSet<_> =
+            state.receipts.iter().map(|r| r.entry_id.as_str()).collect();
+        let missing = state
+            .pending
+            .iter()
+            .filter(|r| !completed.contains(r.entry_id.as_str()))
+            .map(|r| r.entry_id.clone());
+        if valid_partition(&state.pending, &state.receipts, missing) {
+            state.partial = true;
+            let receipts = std::mem::take(&mut state.receipts);
+            state.results.extend(receipts);
+        } else {
+            state.partial = true;
+            let receipts = std::mem::take(&mut state.receipts);
+            state.rejected_results.extend(receipts);
+            state.error = Some("provider returned mismatched or duplicate entry IDs in interrupted partial outcome".into());
+        }
+    }
+    if !state.partial {
+        outcome?;
+    }
+    let failed_ids = if state.partial {
+        let completed: std::collections::HashSet<_> =
+            state.results.iter().map(|r| r.entry_id.as_str()).collect();
+        requests
+            .iter()
+            .filter(|r| !completed.contains(r.entry_id.as_str()))
+            .map(|r| r.entry_id.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
     Ok(ProviderCall {
-        results,
-        attempts: attempts.load(std::sync::atomic::Ordering::Relaxed),
+        results: std::mem::take(&mut state.results),
+        attempts: state.attempts,
+        failed_ids,
+        partial: state.partial,
+        rejected_results: std::mem::take(&mut state.rejected_results),
+        error: state.error.take(),
     })
 }
 
