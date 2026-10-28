@@ -6,7 +6,35 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
 
-use crate::{err, job_event_is_terminal, publish_job_event, ApiError, AppState, JobKind};
+use crate::{
+    err, job_event_is_terminal, publish_sequenced_job_event as publish_job_event, ApiError,
+    AppState, JobKind,
+};
+
+struct JobSubscription {
+    rx: broadcast::Receiver<serde_json::Value>,
+    snapshot: Vec<serde_json::Value>,
+    replay: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    include_sequence: bool,
+}
+
+impl JobSubscription {
+    fn subscribe(
+        tx: &broadcast::Sender<serde_json::Value>,
+        replay: &Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        kind: JobKind,
+    ) -> Self {
+        // Subscribe before snapshotting; sequence watermarks remove overlap.
+        let rx = tx.subscribe();
+        let snapshot = replay.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        Self {
+            rx,
+            snapshot,
+            replay: replay.clone(),
+            include_sequence: matches!(kind, JobKind::Translate),
+        }
+    }
+}
 
 pub(crate) fn cancel_job(state: &AppState, job_id: &str) -> Result<StatusCode, ApiError> {
     if let Some(job) = state.active_jobs.get(job_id) {
@@ -66,9 +94,11 @@ pub(crate) async fn upgrade_job_ws(
     let mut found = None;
     for _ in 0..20 {
         if let Some(job) = state.active_jobs.get(&job_id) {
-            let rx = job.progress_tx.subscribe();
-            let replay = job.replay.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            found = Some((rx, replay));
+            found = Some(JobSubscription::subscribe(
+                &job.progress_tx,
+                &job.replay,
+                job.kind,
+            ));
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -79,48 +109,54 @@ pub(crate) async fn upgrade_job_ws(
 
 async fn handle_job_ws(
     mut socket: WebSocket,
-    found: Option<(
-        broadcast::Receiver<serde_json::Value>,
-        Vec<serde_json::Value>,
-    )>,
+    found: Option<JobSubscription>,
     not_found: serde_json::Value,
 ) {
-    let Some((mut rx, replay)) = found else {
+    let Some(JobSubscription {
+        mut rx,
+        snapshot,
+        replay,
+        include_sequence,
+    }) = found
+    else {
         let _ = socket.send(Message::Text(not_found.to_string())).await;
         close_job_ws(&mut socket).await;
         return;
     };
 
-    let mut seen = std::collections::HashSet::new();
-    for event in replay {
-        let key = event.to_string();
-        seen.insert(key);
-        if socket.send(Message::Text(event.to_string())).await.is_err() {
-            close_job_ws(&mut socket).await;
-            return;
-        }
-        if job_event_is_terminal(&event) {
-            close_job_ws(&mut socket).await;
-            return;
-        }
-    }
-
+    let mut last_sent = 0;
+    let mut pending = snapshot;
     loop {
-        match rx.recv().await {
-            Ok(event) => {
-                if !seen.insert(event.to_string()) {
+        for mut event in pending.drain(..) {
+            // Unsequenced frames only occur in legacy lifecycle test fixtures.
+            if let Some(seq) = event.get("seq").and_then(|seq| seq.as_u64()) {
+                if seq <= last_sent {
                     continue;
                 }
-                let is_terminal = job_event_is_terminal(&event);
-                if socket.send(Message::Text(event.to_string())).await.is_err() {
-                    break;
-                }
-                if is_terminal {
-                    break;
+                last_sent = seq;
+            }
+            // Translation sessions use stable JSON identity across reconnects.
+            // Patch consumers need only internal dedupe; preserve their schema.
+            if !include_sequence {
+                if let Some(fields) = event.as_object_mut() {
+                    fields.remove("seq");
                 }
             }
+            if socket.send(Message::Text(event.to_string())).await.is_err()
+                || job_event_is_terminal(&event)
+            {
+                close_job_ws(&mut socket).await;
+                return;
+            }
+        }
+        match rx.recv().await {
+            Ok(event) => pending.push(event),
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 tracing::warn!("WS client lagged by {} messages", n);
+                // A live ring can lose informational frames or a terminal.
+                // Retain the replay Arc even after active_jobs cleanup, and
+                // resume from compact state without redelivering the prefix.
+                pending = replay.lock().unwrap_or_else(|e| e.into_inner()).clone();
             }
             Err(broadcast::error::RecvError::Closed) => {
                 break;

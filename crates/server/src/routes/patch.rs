@@ -10,8 +10,9 @@ use tokio::sync::broadcast;
 
 use super::jobs::{cancel_job, upgrade_job_ws};
 use crate::{
-    active_patch_job_for_game, err, patch_game_key, publish_job_event, try_project_operation,
-    ApiError, AppState, JobKind, JobState, PATCH_APPLY_IN_FLIGHT_MESSAGE,
+    active_patch_job_for_game, err, patch_game_key,
+    publish_sequenced_job_event as publish_job_event, try_project_operation, ApiError, AppState,
+    JobKind, JobState, PATCH_APPLY_IN_FLIGHT_MESSAGE,
 };
 
 fn apply_report_json(report: locust_core::patch::ApplyReport) -> serde_json::Value {

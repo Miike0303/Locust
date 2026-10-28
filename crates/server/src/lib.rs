@@ -215,10 +215,80 @@ where
     .await
 }
 
+/// Maximum retained frames, including initial/latest state and the terminal.
+/// Older informational history yields to these snapshots; see JOB-RETENTION.md.
+const JOB_REPLAY_LIMIT: usize = 256;
+
+fn job_event_state_slot(event: &serde_json::Value) -> Option<usize> {
+    match event.get("type").and_then(|kind| kind.as_str()) {
+        Some("started") => Some(0),
+        Some("batch_completed") => Some(1),
+        Some("progress") => Some(2),
+        Some("string_translated") => Some(3),
+        Some("provider_switched") => Some(4),
+        Some("validation_failed") => Some(5),
+        Some("paused") => Some(6),
+        Some("resumed") => Some(7),
+        Some("batch_failed") => Some(8),
+        _ => None,
+    }
+}
+
+fn retain_job_event(log: &mut Vec<serde_json::Value>, event: serde_json::Value) {
+    let progress = matches!(job_event_state_slot(&event), Some(1 | 2));
+    if progress
+        && log
+            .last()
+            .is_some_and(|last| job_event_state_slot(last) == job_event_state_slot(&event))
+    {
+        *log.last_mut().unwrap() = event;
+    } else {
+        log.push(event);
+    }
+    if log.len() > JOB_REPLAY_LIMIT {
+        let mut latest = [false; 9];
+        let mut pinned = [false; JOB_REPLAY_LIMIT + 1];
+        // Keep the initial frame and newest frame (also the sequence watermark).
+        pinned[0] = true;
+        pinned[log.len() - 1] = true;
+        for (index, event) in log.iter().enumerate().rev() {
+            if let Some(slot) = job_event_state_slot(event) {
+                if !latest[slot] {
+                    pinned[index] = true;
+                    latest[slot] = true;
+                }
+            }
+        }
+        // At most eleven entries are pinned, so a full buffer always has a victim.
+        let oldest = pinned.iter().position(|keep| !keep).unwrap();
+        log.remove(oldest);
+    }
+}
+
+fn publish_sequenced_job_event(
+    tx: &broadcast::Sender<serde_json::Value>,
+    replay: &std::sync::Mutex<Vec<serde_json::Value>>,
+    event: serde_json::Value,
+) {
+    publish_job_event_inner(tx, replay, event, true);
+}
+
+// Existing lifecycle fixtures assert raw JSON equality. Keep their entry point
+// on the same terminal/retention implementation; production always sequences.
+#[cfg(test)]
 fn publish_job_event(
     tx: &broadcast::Sender<serde_json::Value>,
     replay: &std::sync::Mutex<Vec<serde_json::Value>>,
     event: serde_json::Value,
+) {
+    publish_job_event_inner(tx, replay, event, false);
+}
+
+fn publish_job_event_inner(
+    tx: &broadcast::Sender<serde_json::Value>,
+    replay: &std::sync::Mutex<Vec<serde_json::Value>>,
+    mut event: serde_json::Value,
+    sequence: bool,
 ) {
     if let Ok(mut log) = replay.lock() {
         // Cancellation and the worker race to publish a terminal event. The
@@ -226,7 +296,19 @@ fn publish_job_event(
         if log.last().is_some_and(job_event_is_terminal) {
             return;
         }
-        log.push(event.clone());
+        if sequence {
+            // Allocation, compaction and send share one lock: replay and live
+            // have the same total order, even when cancellation wins the race.
+            let seq = log
+                .last()
+                .and_then(|last| last.get("seq"))
+                .and_then(|seq| seq.as_u64())
+                .unwrap_or(0)
+                .checked_add(1)
+                .expect("job sequence exhausted");
+            event["seq"] = seq.into();
+        }
+        retain_job_event(&mut log, event.clone());
         let _ = tx.send(event);
     }
 }

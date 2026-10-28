@@ -12,8 +12,8 @@ use tokio::sync::{broadcast, mpsc};
 
 use super::jobs::{cancel_job, upgrade_job_ws};
 use crate::{
-    err, publish_job_event, try_project_operation, ApiError, AppState, JobKind, JobState,
-    PROJECT_BUSY_MESSAGE, TRANSLATION_IN_FLIGHT_MESSAGE,
+    err, publish_sequenced_job_event as publish_job_event, try_project_operation, ApiError,
+    AppState, JobKind, JobState, PROJECT_BUSY_MESSAGE, TRANSLATION_IN_FLIGHT_MESSAGE,
 };
 
 #[derive(Deserialize)]
