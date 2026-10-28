@@ -651,6 +651,44 @@ impl Database {
         Ok(preview)
     }
 
+    /// Fingerprint only the catalog's affected rows, including absent IDs. Raw
+    /// stored values include review/source metadata and timestamps, avoiding
+    /// HashMap serialization order and preserving NULL versus empty text.
+    /// The transport holds project admission across preview/fingerprint and
+    /// across fingerprint verification/save, so edits cannot interleave them.
+    pub fn import_rows_fingerprint(
+        &self,
+        updates: &[crate::export::ImportedTranslation],
+    ) -> Result<String> {
+        validate_import_ids(updates)?;
+        let conn = lock_connection(&self.conn);
+        let mut current = BTreeMap::new();
+        for entry in updates {
+            current.insert(entry.id.clone(), None);
+        }
+        for chunk in updates.chunks(500) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let mut statement = conn.prepare_cached(&format!(
+                "SELECT id, source, translation, status, file_path, context, tags, metadata, CAST(char_limit AS TEXT), provider_used, created_at, translated_at, reviewed_at FROM strings WHERE id IN ({placeholders})"
+            ))?;
+            let columns = statement.column_count();
+            let rows = statement.query_map(
+                rusqlite::params_from_iter(chunk.iter().map(|entry| &entry.id)),
+                |row| {
+                    let fields = (1..columns)
+                        .map(|column| row.get::<_, Option<String>>(column))
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    Ok((row.get::<_, String>(0)?, fields))
+                },
+            )?;
+            for row in rows {
+                let (id, fields) = row?;
+                current.insert(id, Some(fields));
+            }
+        }
+        Ok(sha256_hex(&serde_json::to_vec(&current)?))
+    }
+
     /// Commit a provider batch atomically. Unlike an import, a missing entry is
     /// an error: the caller must never announce translations that were not saved.
     pub async fn save_translation_results(&self, results: &[TranslationResult]) -> Result<()> {

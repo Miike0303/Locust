@@ -585,7 +585,60 @@ async fn apply_export_translations(
     }))
 }
 
-/// Import translations from a PO or XLIFF file into the open project DB.
+/// Preview a reviewer catalog without modifying the open project.
+#[tauri::command]
+pub async fn preview_import_translations(
+    format: String,
+    path: String,
+    keep_existing: bool,
+    state: State<'_, AppStateWrapper>,
+) -> Result<serde_json::Value, String> {
+    preview_import_file(&state.0, format, path, keep_existing).await
+}
+
+async fn preview_import_file(
+    s: &Arc<AppState>,
+    format: String,
+    path: String,
+    keep_existing: bool,
+) -> Result<serde_json::Value, String> {
+    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let preview = locust_server::preview_catalog(s.clone(), format, content, keep_existing)
+        .await
+        .map_err(|(_, message)| message)?;
+    serde_json::to_value(preview).map_err(|e| e.to_string())
+}
+
+/// Apply only the exact catalog and affected rows reviewed by the translator.
+#[tauri::command]
+pub async fn apply_import_preview(
+    format: String,
+    path: String,
+    keep_existing: bool,
+    plan_token: String,
+    state: State<'_, AppStateWrapper>,
+) -> Result<serde_json::Value, String> {
+    apply_import_file_preview(&state.0, format, path, keep_existing, plan_token).await
+}
+
+async fn apply_import_file_preview(
+    s: &Arc<AppState>,
+    format: String,
+    path: String,
+    keep_existing: bool,
+    plan_token: String,
+) -> Result<serde_json::Value, String> {
+    let content = std::fs::read_to_string(&path).map_err(|error| {
+        format!(
+            "stale import plan; catalog could not be read. Preview again before applying. {error}"
+        )
+    })?;
+    locust_server::apply_catalog_preview(s.clone(), format, content, keep_existing, plan_token)
+        .await
+        .map_err(|(_, message)| message)
+}
+
+/// Compatibility import; the desktop UI uses preview and token-checked apply.
 #[tauri::command]
 pub async fn import_translations(
     format: String,
@@ -605,17 +658,8 @@ async fn apply_import_translations(
     if content.trim().is_empty() {
         return Err("import file is empty".into());
     }
-    let (updates, pre_skipped) = match format.as_str() {
-        "po" => {
-            let entries = locust_core::export::import_po(&content).map_err(|e| e.to_string())?;
-            locust_core::export::po_entries_for_batch(&entries)
-        }
-        "xliff" => {
-            let units = locust_core::export::import_xliff(&content).map_err(|e| e.to_string())?;
-            locust_core::export::xliff_units_for_batch(&units)
-        }
-        other => return Err(format!("unknown import format: {other}")),
-    };
+    let (updates, pre_skipped) =
+        locust_core::export::parse_import_catalog(&format, &content).map_err(|e| e.to_string())?;
     let attempted = updates.len();
     let exclusive = try_project_operation(&s)?;
     run_owned_project_operation(exclusive, async move {
@@ -1150,6 +1194,8 @@ mod tests {
         for case in [
             "missing",
             "empty",
+            "missing_file",
+            "invalid_utf8",
             "blank",
             "pending",
             "error",
@@ -2160,6 +2206,362 @@ mod tests {
             );
         }
         std::fs::remove_file(&input).unwrap();
+    }
+
+    async fn import_preview_fixture() -> (tempfile::TempDir, Arc<AppState>) {
+        let directory = tempfile::tempdir().unwrap();
+        let state = locust_server::create_test_state_with_db(&directory.path().join("project.db"));
+        *state.current_project.write().await = Some(ProjectInfo::default());
+        let mut reviewed = translated_entry("replace", "Replace", "Reviewed local text");
+        reviewed.status = StringStatus::Reviewed;
+        let mut identical = translated_entry("same", "Same", "Identical");
+        identical.status = StringStatus::Approved;
+        state
+            .db
+            .save_entries(&[
+                StringEntry::new("fill", "Fill", "story/a.rpy".into()),
+                reviewed,
+                identical,
+                translated_entry("stale", "Current source", "Keep stale source"),
+            ])
+            .unwrap();
+        (directory, state)
+    }
+
+    fn import_preview_catalog(format: &str) -> String {
+        let entries = [
+            translated_entry("fill", "Fill", "Filled"),
+            translated_entry("replace", "Replace", "Reviewer text"),
+            translated_entry("same", "Same", "Identical"),
+            translated_entry("stale", "Old source", "Wrong"),
+            translated_entry("unknown", "Unknown", "Unknown text"),
+        ];
+        match format {
+            "po" => locust_core::export::export_po(&entries, "en", "es"),
+            "xliff" => locust_core::export::export_xliff(&entries, "en", "es"),
+            "tmx" => locust_core::export::export_tmx(&entries, "en", "es").unwrap(),
+            _ => unreachable!(),
+        }
+    }
+
+    fn import_preview_rows(state: &AppState) -> serde_json::Value {
+        serde_json::to_value(state.db.get_entries(&EntryFilter::default()).unwrap()).unwrap()
+    }
+
+    async fn http_import_preview(
+        base: &str,
+        format: &str,
+        operation: &str,
+        body: &serde_json::Value,
+    ) -> (u16, Vec<u8>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let address = base.strip_prefix("http://").unwrap();
+        let body = serde_json::to_vec(body).unwrap();
+        let mut connection = tokio::net::TcpStream::connect(address).await.unwrap();
+        let headers = format!("POST /api/import/{format}/{operation} HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+        connection.write_all(headers.as_bytes()).await.unwrap();
+        connection.write_all(&body).await.unwrap();
+        let mut response = Vec::new();
+        connection.read_to_end(&mut response).await.unwrap();
+        let split = response
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .unwrap();
+        let headers = std::str::from_utf8(&response[..split]).unwrap();
+        let status = headers.split_whitespace().nth(1).unwrap().parse().unwrap();
+        (status, response[split + 4..].to_vec())
+    }
+
+    #[tokio::test]
+    async fn import_preview_native_matches_http_and_never_writes() {
+        let (directory, state) = import_preview_fixture().await;
+        let (base, server) = locust_server::start_test_server(state.clone()).await;
+        let before = import_preview_rows(&state);
+        for format in ["po", "xliff", "tmx"] {
+            let content = import_preview_catalog(format);
+            let input = directory.path().join(format!("catalog.{format}"));
+            std::fs::write(&input, &content).unwrap();
+            for keep_existing in [true, false] {
+                let native = preview_import_file(
+                    &state,
+                    format.into(),
+                    input.to_string_lossy().into_owned(),
+                    keep_existing,
+                )
+                .await
+                .unwrap();
+                let (status, body) = http_import_preview(
+                    &base,
+                    format,
+                    "preview",
+                    &serde_json::json!({
+                        "content": content, "keep_existing": keep_existing,
+                    }),
+                )
+                .await;
+                assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+                let http: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(native, http, "{format}, keep_existing={keep_existing}");
+                assert_eq!(native["fill"], 1);
+                assert_eq!(native["replace"], if keep_existing { 0 } else { 1 });
+                assert_eq!(native["kept_existing"], if keep_existing { 1 } else { 0 });
+                assert_eq!(native["unchanged"], 1);
+                assert_eq!(native["unknown_ids"], 1);
+                assert_eq!(native["stale_sources"], 1);
+                if !keep_existing {
+                    assert_eq!(native["replacements"][0]["id"], "replace");
+                    assert_eq!(native["replacements"][0]["previous_status"], "reviewed");
+                    assert_eq!(
+                        native["replacements"][0]["previous_text"],
+                        "Reviewed local text"
+                    );
+                    assert_eq!(native["replacements"][0]["new_text"], "Reviewer text");
+                }
+                assert_eq!(import_preview_rows(&state), before);
+            }
+        }
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn import_preview_apply_native_matches_http_for_all_catalogs() {
+        for format in ["po", "xliff", "tmx"] {
+            for keep_existing in [true, false] {
+                let (directory, native_state) = import_preview_fixture().await;
+                let (_http_directory, http_state) = import_preview_fixture().await;
+                let (base, server) = locust_server::start_test_server(http_state.clone()).await;
+                let content = import_preview_catalog(format);
+                let input = directory.path().join(format!("catalog.{format}"));
+                std::fs::write(&input, &content).unwrap();
+                let preview = preview_import_file(
+                    &native_state,
+                    format.into(),
+                    input.to_string_lossy().into_owned(),
+                    keep_existing,
+                )
+                .await
+                .unwrap();
+                let (status, body) = http_import_preview(
+                    &base,
+                    format,
+                    "preview",
+                    &serde_json::json!({
+                        "content": content, "keep_existing": keep_existing,
+                    }),
+                )
+                .await;
+                assert_eq!(status, 200);
+                let http_preview: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let native = apply_import_file_preview(
+                    &native_state,
+                    format.into(),
+                    input.to_string_lossy().into_owned(),
+                    keep_existing,
+                    preview["plan_token"].as_str().unwrap().into(),
+                )
+                .await
+                .unwrap();
+                let (status, body) = http_import_preview(
+                    &base,
+                    format,
+                    "apply",
+                    &serde_json::json!({
+                        "content": content, "keep_existing": keep_existing,
+                        "plan_token": http_preview["plan_token"],
+                    }),
+                )
+                .await;
+                assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+                let http: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(native, http, "{format}, keep_existing={keep_existing}");
+                for id in ["fill", "replace", "same", "stale"] {
+                    let native = native_state.db.get_entry(id).unwrap().unwrap();
+                    let http = http_state.db.get_entry(id).unwrap().unwrap();
+                    assert_eq!(native.translation, http.translation);
+                    assert_eq!(native.status, http.status);
+                }
+                assert_eq!(
+                    native_state
+                        .db
+                        .get_entry("fill")
+                        .unwrap()
+                        .unwrap()
+                        .translation
+                        .as_deref(),
+                    Some("Filled")
+                );
+                assert_eq!(
+                    native_state
+                        .db
+                        .get_entry("replace")
+                        .unwrap()
+                        .unwrap()
+                        .translation
+                        .as_deref(),
+                    Some(if keep_existing {
+                        "Reviewed local text"
+                    } else {
+                        "Reviewer text"
+                    })
+                );
+                assert_eq!(
+                    native_state.db.get_entry("same").unwrap().unwrap().status,
+                    StringStatus::Approved
+                );
+                server.abort();
+                let _ = server.await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn import_preview_native_refuses_changed_catalog_options_rows_or_project() {
+        for change in [
+            "catalog",
+            "malformed",
+            "empty",
+            "options",
+            "translation",
+            "status",
+            "source",
+            "project",
+            "closed_project",
+        ] {
+            let (directory, state) = import_preview_fixture().await;
+            let input = directory.path().join("catalog.po");
+            let content = import_preview_catalog("po");
+            std::fs::write(&input, &content).unwrap();
+            let path = input.to_string_lossy().into_owned();
+            let preview = preview_import_file(&state, "po".into(), path.clone(), false)
+                .await
+                .unwrap();
+            match change {
+                "catalog" => std::fs::write(&input, format!("{content}\n")).unwrap(),
+                "malformed" => std::fs::write(&input, "msgctxt \"unterminated").unwrap(),
+                "empty" => std::fs::write(&input, "").unwrap(),
+                "missing_file" => std::fs::remove_file(&input).unwrap(),
+                "invalid_utf8" => std::fs::write(&input, [0xff]).unwrap(),
+                "options" => {}
+                "closed_project" => *state.current_project.write().await = None,
+                "project" => {
+                    state.current_project.write().await.as_mut().unwrap().path =
+                        "other-project".into()
+                }
+                _ => {
+                    let mut entry = state.db.get_entry("replace").unwrap().unwrap();
+                    match change {
+                        "translation" => entry.translation = Some("Concurrent edit".into()),
+                        "status" => entry.status = StringStatus::Approved,
+                        "source" => entry.source = "Concurrent source edit".into(),
+                        _ => unreachable!(),
+                    }
+                    state.db.save_entries(&[entry]).unwrap();
+                }
+            }
+            let before = import_preview_rows(&state);
+            let error = apply_import_file_preview(
+                &state,
+                "po".into(),
+                path,
+                change == "options",
+                preview["plan_token"].as_str().unwrap().into(),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains("stale import plan"), "{change}: {error}");
+            assert!(error.contains("Preview again"), "{error}");
+            assert_eq!(import_preview_rows(&state), before, "{change}");
+        }
+    }
+
+    #[tokio::test]
+    async fn import_preview_native_and_http_share_guard_and_validation() {
+        let (directory, state) = import_preview_fixture().await;
+        let (base, server) = locust_server::start_test_server(state.clone()).await;
+        let input = directory.path().join("catalog.po");
+        let content = import_preview_catalog("po");
+        std::fs::write(&input, &content).unwrap();
+        let path = input.to_string_lossy().into_owned();
+        let preview = preview_import_file(&state, "po".into(), path.clone(), true)
+            .await
+            .unwrap();
+        let held = try_project_operation(&state).unwrap();
+        let before = import_preview_rows(&state);
+        assert_eq!(
+            preview_import_file(&state, "po".into(), path.clone(), true)
+                .await
+                .unwrap_err(),
+            locust_server::PROJECT_BUSY_MESSAGE
+        );
+        assert_eq!(
+            apply_import_file_preview(
+                &state,
+                "po".into(),
+                path.clone(),
+                true,
+                preview["plan_token"].as_str().unwrap().into()
+            )
+            .await
+            .unwrap_err(),
+            locust_server::PROJECT_BUSY_MESSAGE
+        );
+        for operation in ["preview", "apply"] {
+            let (status, body) = http_import_preview(
+                &base,
+                "po",
+                operation,
+                &serde_json::json!({
+                    "content": content, "keep_existing": true, "plan_token": preview["plan_token"],
+                }),
+            )
+            .await;
+            assert_eq!(status, 409);
+            assert_eq!(body, locust_server::PROJECT_BUSY_MESSAGE.as_bytes());
+        }
+        drop(held);
+        for (format, content) in [
+            ("po", "msgid \"unterminated"),
+            ("xliff", "<xliff>"),
+            ("tmx", "<tmx>"),
+            ("unknown", "text"),
+        ] {
+            std::fs::write(&input, content).unwrap();
+            let error = preview_import_file(&state, format.into(), path.clone(), true)
+                .await
+                .unwrap_err();
+            let (status, body) = http_import_preview(
+                &base,
+                format,
+                "preview",
+                &serde_json::json!({
+                    "content": content, "keep_existing": true,
+                }),
+            )
+            .await;
+            assert_eq!(status, 400);
+            assert_eq!(body, error.as_bytes(), "{format}");
+            assert_eq!(import_preview_rows(&state), before);
+        }
+        std::fs::write(&input, "").unwrap();
+        let native = preview_import_file(&state, "po".into(), path, true)
+            .await
+            .unwrap();
+        let (status, body) = http_import_preview(
+            &base,
+            "po",
+            "preview",
+            &serde_json::json!({"content": "", "keep_existing": true}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            native,
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        );
+        assert_eq!(import_preview_rows(&state), before);
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]

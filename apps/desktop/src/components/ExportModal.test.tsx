@@ -3,7 +3,7 @@ import { after, beforeEach, test } from "node:test";
 import { registerHooks } from "node:module";
 import { setLocale, t } from "../lib/i18n";
 import * as a11y from "../lib/modalA11y";
-import type { FileStats, ProjectInfo, StringStatus } from "../lib/api";
+import type { FileStats, ProjectInfo, StringStatus, ImportPreview } from "../lib/api";
 
 const FILE = "C:\\fixture\\scenarios\\Scene 1_日本語.rpy";
 const OTHER = "scenarios/other.rpy";
@@ -17,11 +17,19 @@ const files: FileStats[] = [
 ];
 const project: ProjectInfo = { path: "C:\\fixture", name: "Fixture", format_id: "renpy", database_path: "fixture/source.db" };
 const ready = <T,>(data: T) => ({ data, isPending: false, isFetching: false, isError: false });
+const importPreview = (keep: boolean): ImportPreview => ({
+  fill: 1, replace: keep ? 0 : 1, unchanged: 2, unknown_ids: 3, kept_existing: keep ? 1 : 0,
+  stale_sources: 4, imported: keep ? 1 : 2, skipped: keep ? 10 : 9,
+  replacements: keep ? [] : [{ id: "reviewed", file: FILE, previous_text: "Old reviewed text", previous_status: "reviewed", new_text: "Reviewer replacement" }],
+  truncated: !keep, plan_token: keep ? "keep-plan" : "replace-plan",
+});
 const h = {
   t, a11y, project: project as ProjectInfo | null, scopeAllowed: true,
   states: [] as any[], cursor: 0, effects: [] as (() => void)[], changed: false,
   facets: ready(facets), files: ready(files), queries: [] as any[],
   calls: [] as { command: string; args: any }[], requests: [] as URL[],
+  bodies: [] as { path: string; body: any }[],
+  previewHandler: null as null | ((keep: boolean) => Promise<ImportPreview>),
   toasts: [] as any[], logs: [] as any[], downloads: [] as any[], revoked: [] as string[],
   closed: 0, imported: 0, output: "assignment.po" as string | null, failure: "",
   setTauri: (_value: boolean) => {},
@@ -55,7 +63,7 @@ const hooks = registerHooks({
   resolve(specifier, context, nextResolve) {
     if (context.parentURL?.endsWith("/components/ExportModal.tsx")) {
       const stubs: Record<string, string> = {
-        react: "export const useState=initial=>h.state(initial);export const useRef=initial=>({current:initial});export const useEffect=(fn,deps)=>h.effect(fn,deps);export const useId=()=> 'export-scope';",
+        react: "export const useState=initial=>h.state(initial);export const useRef=initial=>h.state(()=>({current:initial}))[0];export const useEffect=(fn,deps)=>h.effect(fn,deps);export const useId=()=> 'export-scope';",
         "@tanstack/react-query": "export const useQuery=options=>{h.queries.push(options);return options.queryKey[0]==='file-stats'?h.files:h.facets;};",
         "../lib/projectScope": "export const draftProjectKey=p=>JSON.stringify([p.database_path??null,p.path,p.format_id]);export const useProjectScopedQueryEnabled=(_key,enabled)=>()=>enabled&&h.scopeAllowed;export const projectScopedQueryFn=(_key,fn)=>fn;",
         "../lib/i18n": "export const useT=()=>h.t;",
@@ -80,6 +88,15 @@ Object.defineProperty(globalThis, "window", { configurable: true, value: {
     if (command === "get_server_port") return 7842;
     if (command === "get_string_facets") return facets;
     if (command === "plugin:dialog|save") return h.output;
+    if (command === "plugin:dialog|open") return h.output;
+    if (command === "preview_import_translations") {
+      if (h.failure) throw h.failure;
+      return h.previewHandler ? h.previewHandler(args.keepExisting) : importPreview(args.keepExisting);
+    }
+    if (command === "apply_import_preview") {
+      if (h.failure) throw h.failure;
+      return { path: args.path, format: args.format, imported: 1, skipped: 10, stale_sources: 4 };
+    }
     assert.equal(command, "export_translations");
     if (h.failure) throw h.failure;
     return { path: args.path, format: args.format, lang: args.lang, entries: 3, bytes: 20 };
@@ -95,12 +112,20 @@ Object.defineProperty(globalThis, "document", { configurable: true, value: {
 } });
 URL.createObjectURL = () => "blob:assignment";
 URL.revokeObjectURL = url => { h.revoked.push(url); };
-globalThis.fetch = async input => {
+globalThis.fetch = async (input, init) => {
   const url = new URL(String(input));
   h.requests.push(url);
   if (url.pathname === "/api/project/current") return new Response("null");
   if (url.pathname === "/api/stats/files") return new Response(JSON.stringify({ files }));
   if (url.pathname === "/api/strings/facets") return new Response(JSON.stringify(facets));
+  if (/^\/api\/import\/(po|xliff|tmx)\/(preview|apply)$/.test(url.pathname)) {
+    const body = JSON.parse(String(init?.body));
+    h.bodies.push({ path: url.pathname, body });
+    if (h.failure) return new Response(h.failure, { status: h.failure.includes("stale") ? 409 : 400 });
+    return new Response(JSON.stringify(url.pathname.endsWith("/preview")
+      ? h.previewHandler ? await h.previewHandler(body.keep_existing) : importPreview(body.keep_existing)
+      : { imported: 1, skipped: 10, stale_sources: 4 }));
+  }
   assert.match(url.pathname, /^\/api\/export\/(po|xliff)$/);
   return h.failure ? new Response(h.failure, { status: 400 }) : new Response("assignment contents");
 };
@@ -110,6 +135,7 @@ const api = await import("../lib/api");
 await api.getCurrentProject();
 beforeEach(() => {
   h.states = []; h.effects = []; h.queries = []; h.calls = []; h.requests = [];
+  h.bodies = []; h.previewHandler = null;
   h.toasts = []; h.logs = []; h.downloads = []; h.revoked = []; h.closed = 0; h.imported = 0;
   h.output = "assignment.po"; h.failure = ""; h.scopeAllowed = true; h.project = project;
   h.facets = ready(facets); h.files = ready(files); h.setTauri(true); setLocale("en");
@@ -290,8 +316,8 @@ test("closing, changing database and importing gate the preview and reset the sc
   const importTab = nodes(render()).find(node => node.type === "button" && text(node) === t("export.import"));
   importTab.props.onClick(); h.files.isPending = true;
   const importing = render();
-  assert.ok(!nodes(importing).some(node => node.type === "fieldset"));
-  assert.equal(primary().props.disabled, false);
+  assert.ok(!nodes(importing).some(node => node.type === "fieldset" && text(node).includes(t("export.scope.title"))));
+  assert.equal(primary().props.disabled, true);
   assert.ok(h.queries.slice(-2).every(query => !query.enabled()));
   h.project = null;
   assert.equal(render(), null);
@@ -311,3 +337,205 @@ test("an unconfirmed project cannot start an export", () => {
   primary().props.onClick();
   assert.equal(h.calls.length, 0);
 });
+
+const flush = () => new Promise(resolve => setImmediate(resolve));
+function button(label: string) {
+  const control = nodes(render()).find(node => node.type === "button" && text(node) === t(label as Parameters<typeof t>[0]));
+  assert.ok(control, label);
+  return control;
+}
+async function click(label: string) {
+  const control = button(label);
+  assert.equal(control.props.disabled ?? false, false, label);
+  control.props.onClick();
+  await flush();
+}
+function radio(keep: boolean) {
+  const label = nodes(render()).find(node => node.type === "label" && text(node) === t(keep ? "export.preview.keep" : "export.preview.replace"));
+  assert.ok(label);
+  return nodes(label).find(node => node.type === "input");
+}
+async function chooseImport(native: boolean, format = "po") {
+  h.setTauri(native);
+  await click("export.import");
+  select("format", format);
+  render();
+  if (native) await click("export.chooseFile");
+  else {
+    const input = nodes(render()).find(node => node.type === "input" && node.props.type === "file");
+    input.props.onChange({ target: { files: [{ name: `assignment.${format}`, arrayBuffer: async () => new TextEncoder().encode("reviewer catalog").buffer }], value: "chosen" } });
+    await flush();
+  }
+}
+
+for (const locale of ["en", "es"] as const) {
+  for (const native of [true, false]) {
+    for (const format of ["po", "xliff", "tmx"]) {
+      test(`${locale} ${native ? "Tauri" : "browser"} ${format}: select, protected preview, replacement preview and token apply`, async () => {
+        setLocale(locale);
+        await chooseImport(native, format);
+        assert.equal(radio(true).props.checked, true);
+        assert.equal(button("export.preview.apply").props.disabled, true);
+        assert.equal(h.calls.filter(call => call.command.includes("import")).length, 0);
+        assert.equal(h.bodies.length, 0);
+        await click("export.preview.action");
+        assert.equal(h.imported, 0);
+        assert.equal(h.closed, 0);
+        assert.ok(text(render()).includes(t("export.preview.kept", { count: 1 })));
+        assert.ok(text(render()).includes(t("export.preview.staleSources", { count: 4 })));
+        const live = nodes(render()).find(node => node.props?.["aria-live"] === "polite");
+        assert.equal(live.props["aria-atomic"], "true");
+        assert.ok(text(live).includes(t("export.preview.summary", { fill: 1, replace: 0, unchanged: 2, unknown: 3 })));
+        assert.equal(button("export.preview.apply").props.disabled, false);
+        radio(false).props.onChange();
+        assert.equal(button("export.preview.apply").props.disabled, true);
+        await flush();
+        const tree = render();
+        assert.ok(text(tree).includes("Old reviewed text"));
+        assert.ok(text(tree).includes("Reviewer replacement"));
+        assert.ok(text(tree).includes("scenarios/Scene 1_日本語.rpy"));
+        assert.ok(text(tree).includes(t("export.preview.truncated", { count: 1 })));
+        assert.ok(!text(tree).includes(t("export.preview.kept", { count: 1 })));
+        assert.ok(nodes(tree).some(node => node.props?.status === "reviewed"));
+        assert.ok(nodes(tree).some(node => node.type === "thead" && node.props.className.includes("sticky")));
+        assert.ok(nodes(tree).some(node => node.props?.role === "region" && node.props.tabIndex === 0 && node.props.className.includes("max-h-64")));
+        await click("export.preview.apply");
+        assert.equal(h.imported, 1);
+        assert.equal(h.closed, 1);
+        if (native) {
+          assert.deepEqual(h.calls.filter(call => call.command.includes("import")).map(call => [call.command, call.args]), [
+            ["preview_import_translations", { format, path: "assignment.po", keepExisting: true }],
+            ["preview_import_translations", { format, path: "assignment.po", keepExisting: false }],
+            ["apply_import_preview", { format, path: "assignment.po", keepExisting: false, planToken: "replace-plan" }],
+          ]);
+        } else {
+          assert.deepEqual(h.bodies, [
+            { path: `/api/import/${format}/preview`, body: { content: "reviewer catalog", keep_existing: true } },
+            { path: `/api/import/${format}/preview`, body: { content: "reviewer catalog", keep_existing: false } },
+            { path: `/api/import/${format}/apply`, body: { content: "reviewer catalog", keep_existing: false, plan_token: "replace-plan" } },
+          ]);
+        }
+      });
+    }
+  }
+}
+
+for (const native of [true, false]) {
+  test(`${native ? "Tauri" : "browser"}: stale plan stays inline, disables apply and can be previewed again`, async () => {
+    setLocale("es"); await chooseImport(native); await click("export.preview.action");
+    h.failure = "import preview is stale; preview again";
+    await click("export.preview.apply");
+    assert.equal(h.imported, 0); assert.equal(h.closed, 0);
+    assert.equal(button("export.preview.apply").props.disabled, true);
+    assert.ok(nodes(render()).some(node => node.props?.role === "alert" && text(node).includes(t("export.preview.stale"))));
+    h.failure = "";
+    await click("export.preview.again");
+    assert.equal(button("export.preview.apply").props.disabled, false);
+    assert.ok(!nodes(render()).some(node => node.props?.role === "alert"));
+  });
+
+  test(`${native ? "Tauri" : "browser"}: preview failure keeps file selected and permits retry`, async () => {
+    await chooseImport(native); h.failure = "invalid catalog";
+    await click("export.preview.action");
+    assert.ok(nodes(render()).some(node => node.props?.role === "alert" && text(node).includes("invalid catalog")));
+    assert.equal(button("export.preview.apply").props.disabled, true);
+    h.failure = ""; await click("export.preview.action");
+    assert.equal(button("export.preview.apply").props.disabled, false);
+  });
+}
+
+test("out-of-order radio previews cannot restore an obsolete token", async () => {
+  await chooseImport(true);
+  const pending: ((value: ImportPreview) => void)[] = [];
+  h.previewHandler = () => new Promise(resolve => pending.push(resolve));
+  button("export.preview.action").props.onClick();
+  await flush();
+  radio(false).props.onChange();
+  await flush();
+  assert.equal(pending.length, 2);
+  pending[1](importPreview(false)); await flush();
+  assert.equal(button("export.preview.apply").props.disabled, false);
+  pending[0](importPreview(true)); await flush();
+  await click("export.preview.apply");
+  assert.equal(h.calls.find(call => call.command === "apply_import_preview")?.args.planToken, "replace-plan");
+});
+
+test("an obsolete apply handler cannot use a token after synchronous invalidation", async () => {
+  await chooseImport(true); await click("export.preview.action");
+  const oldApply = button("export.preview.apply").props.onClick;
+  radio(false).props.onChange();
+  oldApply();
+  await flush();
+  assert.ok(!h.calls.some(call => call.command === "apply_import_preview"));
+  assert.equal(button("export.preview.apply").props.disabled, false);
+});
+
+test("apply consumes the preview before another click can submit it", async () => {
+  await chooseImport(true); await click("export.preview.action");
+  const apply = button("export.preview.apply").props.onClick;
+  apply(); apply(); await flush();
+  assert.equal(h.calls.filter(call => call.command === "apply_import_preview").length, 1);
+  assert.equal(h.imported, 1);
+});
+
+test("format, database, close and mode changes discard in-flight previews", async () => {
+  for (const change of ["format", "database", "close", "mode"] as const) {
+    h.states = []; h.effects = []; h.project = project;
+    await chooseImport(true);
+    let finish!: (value: ImportPreview) => void;
+    h.previewHandler = () => new Promise(resolve => { finish = resolve; });
+    button("export.preview.action").props.onClick(); await flush();
+    if (change === "format") select("format", "xliff");
+    if (change === "database") { h.project = { ...project, database_path: "fixture/other.db" }; render(); }
+    if (change === "close") render(false);
+    if (change === "mode") await click("export.export");
+    finish(importPreview(true)); await flush();
+    if (change === "mode") await click("export.import");
+    else render();
+    assert.equal(button("export.preview.apply").props.disabled, true, change);
+    assert.ok(!text(render()).includes(t("export.preview.kept", { count: 1 })), change);
+  }
+});
+
+test("selecting another catalog invalidates the preview before reading finishes", async () => {
+  await chooseImport(false); await click("export.preview.action");
+  let finish!: (bytes: ArrayBuffer) => void;
+  const input = nodes(render()).find(node => node.type === "input" && node.props.type === "file");
+  input.props.onChange({ target: { files: [{ name: "changed.po", arrayBuffer: () => new Promise<ArrayBuffer>(resolve => { finish = resolve; }) }], value: "chosen" } });
+  assert.equal(button("export.preview.apply").props.disabled, true);
+  assert.equal(button("export.preview.action").props.disabled, true);
+  finish(new TextEncoder().encode("changed catalog").buffer); await flush();
+  assert.equal(button("export.preview.apply").props.disabled, true);
+  assert.equal(button("export.preview.action").props.disabled, false);
+});
+
+test("native import file cancellation never previews or applies", async () => {
+  h.output = null; await chooseImport(true);
+  assert.equal(button("export.preview.action").props.disabled, true);
+  assert.ok(!h.calls.some(call => call.command === "preview_import_translations" || call.command === "apply_import_preview"));
+});
+
+test("browser import preserves the exact UTF-8 BOM and non-ASCII catalog content", async () => {
+  await chooseImport(false);
+  const content = "\uFEFFmsgctxt \"日本語\"\r\nmsgid \"Hello\"\r\nmsgstr \"¡Hola!\"\r\n";
+  const input = nodes(render()).find(node => node.type === "input" && node.props.type === "file");
+  input.props.onChange({ target: { files: [{ name: "bom.po", arrayBuffer: async () => new TextEncoder().encode(content).buffer }], value: "chosen" } });
+  await flush(); await click("export.preview.action"); await click("export.preview.apply");
+  assert.equal(h.bodies[0].body.content, content);
+  assert.equal(h.bodies[1].body.content, content);
+  assert.equal(h.bodies[1].body.plan_token, "keep-plan");
+});
+
+for (const locale of ["en", "es"] as const) {
+  test(`${locale}: malformed UTF-8 clears the browser preview and shows a readable error without submitting`, async () => {
+    setLocale(locale); await chooseImport(false); await click("export.preview.action");
+    const input = nodes(render()).find(node => node.type === "input" && node.props.type === "file");
+    input.props.onChange({ target: { files: [{ name: "invalid.po", arrayBuffer: async () => new Uint8Array([0xc3, 0x28]).buffer }], value: "chosen" } });
+    await flush();
+    assert.equal(button("export.preview.apply").props.disabled, true);
+    assert.equal(button("export.preview.action").props.disabled, true);
+    assert.ok(nodes(render()).some(node => node.props?.role === "alert" && text(node).includes(t("export.preview.readFailed"))));
+    assert.equal(h.bodies.length, 1);
+    assert.equal(h.imported, 0);
+  });
+}

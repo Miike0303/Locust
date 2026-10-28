@@ -4,7 +4,27 @@ The CLI and core codec support a **restricted bilingual TMX 1.4b Level-1 project
 catalog**, not general translation-memory interchange. Catalogs preserve exact
 project identities, source text and review provenance. CLI import writes only the
 selected project through the existing transactional importer, never global memory.
-There is no TMX desktop/HTTP UI or generic CAT/Level-2 support.
+Generic CAT/Level-2 support remains outside this profile.
+
+## Desktop and browser import preview
+
+PO, XLIFF and TMX imports in the desktop/browser dialog first show a read-only
+preview. Keep existing translations is selected initially; replacing existing
+work is an explicit choice. The summary separates empty rows to fill,
+replacements, unchanged rows, unknown IDs, outdated sources and protected local
+translations. Replacement details include the file, previous text/status and new
+text; at most 200 rows are shown, with a truncation notice when needed.
+
+HTTP clients can POST `{content, keep_existing}` to
+`/api/import/{format}/preview`, then POST the same fields plus the returned
+`plan_token` to `/api/import/{format}/apply`. Native commands
+`preview_import_translations` and `apply_import_preview` use the same parser,
+preview and guarded apply with a catalog `path`. TMX languages come from the
+catalog's declarations and still pass the strict bilingual codec validation.
+Changing the project, catalog bytes, preservation choice or affected rows makes
+the plan stale: apply returns HTTP 409 (or the same native error message), saves
+nothing and asks for a new preview. Legacy direct-import APIs and CLI behavior
+remain available.
 
 ## CLI quick path
 

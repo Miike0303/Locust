@@ -76,6 +76,8 @@ fn main() {
             commands::run_validation,
             commands::export_translations,
             commands::import_translations,
+            commands::preview_import_translations,
+            commands::apply_import_preview,
             commands::run_inject,
             commands::register_lang,
             commands::xai_auth_start,

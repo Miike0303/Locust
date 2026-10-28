@@ -40,10 +40,11 @@ use routes::glossary_memory::{
     memory_lang_pairs, memory_stats, memory_suggestions,
 };
 use routes::inject::{inject, register_lang};
-pub use routes::io::audit_project_fonts;
+pub use routes::io::{apply_catalog_preview, audit_project_fonts, preview_catalog};
 use routes::io::{
-    export_po, export_xliff, import_po, import_xliff, list_validation_issues,
-    set_validation_issue_ignored, validate, validation_summary,
+    apply_import_preview, export_po, export_xliff, import_po, import_tmx, import_xliff,
+    list_validation_issues, preview_import, set_validation_issue_ignored, validate,
+    validation_summary,
 };
 use routes::patch::{
     patch_apply, patch_cancel, patch_identity, patch_pack, patch_recordings, patch_rollback,
@@ -627,6 +628,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/import/po", post(import_po))
         .route("/api/export/xliff", get(export_xliff))
         .route("/api/import/xliff", post(import_xliff))
+        .route("/api/import/tmx", post(import_tmx))
+        .route("/api/import/:format/preview", post(preview_import))
+        .route("/api/import/:format/apply", post(apply_import_preview))
         .route("/api/auth/xai/start", post(auth_xai_start))
         .route("/api/auth/xai/poll", post(auth_xai_poll))
         .route("/api/config", get(get_config).patch(patch_config))

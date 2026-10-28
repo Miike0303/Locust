@@ -12,7 +12,7 @@ use locust_core::validation::{
     ValidationIssueFilter, ValidationIssueUpdateError, ValidationIssuesPage, ValidationSummary,
     Validator,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -254,22 +254,7 @@ async fn import_po_owned(
     state: Arc<AppState>,
     body: String,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if state.current_project.read().await.is_none() {
-        return Err(err(StatusCode::BAD_REQUEST, "no project open"));
-    }
-    let po_entries = export::import_po(&body).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
-    let (updates, pre_skipped) = export::po_entries_for_batch(&po_entries);
-    let attempted = updates.len();
-    let report = state
-        .db
-        .save_imported_translations_batch(updates)
-        .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let (imported, skipped) =
-        export::import_counts_after_batch(pre_skipped, attempted, report.imported);
-    Ok(Json(
-        serde_json::json!({"imported": imported, "skipped": skipped, "stale_sources": report.stale_sources, "unknown_ids": report.unknown_ids}),
-    ))
+    import_catalog_owned(state, "po", body).await.map(Json)
 }
 
 pub(crate) async fn export_xliff(
@@ -324,22 +309,267 @@ async fn import_xliff_owned(
     state: Arc<AppState>,
     body: String,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    import_catalog_owned(state, "xliff", body).await.map(Json)
+}
+
+pub(crate) async fn import_tmx(
+    State(state): State<Arc<AppState>>,
+    body: String,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
+    run_owned_project_operation(guard, async move {
+        import_catalog_owned(state, "tmx", body).await.map(Json)
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+}
+
+async fn import_catalog_owned(
+    state: Arc<AppState>,
+    format: &str,
+    body: String,
+) -> Result<serde_json::Value, ApiError> {
     if state.current_project.read().await.is_none() {
         return Err(err(StatusCode::BAD_REQUEST, "no project open"));
     }
-    let units = export::import_xliff(&body).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
-    let (updates, pre_skipped) = export::xliff_units_for_batch(&units);
+    let (updates, pre_skipped) =
+        export::parse_import_catalog(format, &body).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let attempted = updates.len();
+    // Also validate duplicate IDs with the same read-only validation as preview.
+    state
+        .db
+        .preview_imported_translations(&updates, false)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let report = state
         .db
         .save_imported_translations_batch(updates)
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(import_result(&report, pre_skipped, attempted))
+}
+
+fn import_result(
+    report: &locust_core::database::ImportApplyReport,
+    pre_skipped: usize,
+    attempted: usize,
+) -> serde_json::Value {
     let (imported, skipped) =
         export::import_counts_after_batch(pre_skipped, attempted, report.imported);
-    Ok(Json(
-        serde_json::json!({"imported": imported, "skipped": skipped, "stale_sources": report.stale_sources, "unknown_ids": report.unknown_ids}),
+    serde_json::json!({
+        "imported": imported, "skipped": skipped,
+        "unchanged": report.unchanged, "kept_existing": report.kept_existing,
+        "stale_sources": report.stale_sources, "unknown_ids": report.unknown_ids,
+    })
+}
+
+const STALE_IMPORT_PLAN: &str = "stale import plan; project, catalog, options, or affected rows changed. Preview again before applying.";
+const IMPORT_PREVIEW_LIMIT: usize = 200;
+
+#[derive(Debug, Serialize)]
+pub struct CatalogImportReplacement {
+    pub id: String,
+    pub file: String,
+    pub previous_text: String,
+    pub previous_status: String,
+    pub new_text: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CatalogImportPreview {
+    pub fill: usize,
+    pub replace: usize,
+    pub unchanged: usize,
+    pub unknown_ids: usize,
+    pub kept_existing: usize,
+    pub stale_sources: usize,
+    pub imported: usize,
+    pub skipped: usize,
+    pub replacements: Vec<CatalogImportReplacement>,
+    pub truncated: bool,
+    pub plan_token: String,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct PreviewImportRequest {
+    content: String,
+    #[serde(default = "protect_existing")]
+    keep_existing: bool,
+}
+
+fn protect_existing() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ApplyImportRequest {
+    content: String,
+    #[serde(default = "protect_existing")]
+    keep_existing: bool,
+    plan_token: String,
+}
+
+pub(crate) async fn preview_import(
+    State(state): State<Arc<AppState>>,
+    AxumPath(format): AxumPath<String>,
+    Json(request): Json<PreviewImportRequest>,
+) -> Result<Json<CatalogImportPreview>, ApiError> {
+    preview_catalog(state, format, request.content, request.keep_existing)
+        .await
+        .map(Json)
+}
+
+pub(crate) async fn apply_import_preview(
+    State(state): State<Arc<AppState>>,
+    AxumPath(format): AxumPath<String>,
+    Json(request): Json<ApplyImportRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    apply_catalog_preview(
+        state,
+        format,
+        request.content,
+        request.keep_existing,
+        request.plan_token,
+    )
+    .await
+    .map(Json)
+}
+
+fn import_plan_token(
+    state: &AppState,
+    project: &crate::ProjectInfo,
+    format: &str,
+    content: &str,
+    keep_existing: bool,
+    updates: &[export::ImportedTranslation],
+) -> Result<String, ApiError> {
+    let fingerprint = state
+        .db
+        .import_rows_fingerprint(updates)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let bytes = serde_json::to_vec(&(
+        "locust-import-plan-v1",
+        project,
+        state.db.path(),
+        format,
+        content,
+        keep_existing,
+        fingerprint,
     ))
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(locust_core::database::sha256_hex(&bytes))
+}
+
+/// Shared HTTP/native preview. Admission keeps classification, file names and
+/// the affected-row fingerprint on the same project snapshot. No DB writes.
+pub async fn preview_catalog(
+    state: Arc<AppState>,
+    format: String,
+    content: String,
+    keep_existing: bool,
+) -> Result<CatalogImportPreview, ApiError> {
+    let _guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
+    let project = state
+        .current_project
+        .read()
+        .await
+        .clone()
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "no project open"))?;
+    let (updates, pre_skipped) = export::parse_import_catalog(&format, &content)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    let preview = state
+        .db
+        .preview_imported_translations(&updates, keep_existing)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    let replace = preview.replacements.len() + preview.confirmations.len();
+    let replacements = preview
+        .replacements
+        .into_iter()
+        .chain(preview.confirmations)
+        .take(IMPORT_PREVIEW_LIMIT)
+        .map(|change| {
+            let entry = state
+                .db
+                .get_entry(&change.id)
+                .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+                .ok_or_else(|| err(StatusCode::CONFLICT, STALE_IMPORT_PLAN))?;
+            Ok(CatalogImportReplacement {
+                id: change.id,
+                file: entry.file_path.to_string_lossy().into_owned(),
+                previous_text: change.previous,
+                previous_status: change.previous_status,
+                new_text: change.new_text,
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    let (imported, skipped) =
+        export::import_counts_after_batch(pre_skipped, updates.len(), preview.report.imported);
+    Ok(CatalogImportPreview {
+        fill: preview.fill_ids.len(),
+        replace,
+        unchanged: preview.report.unchanged,
+        unknown_ids: preview.report.unknown_ids,
+        kept_existing: preview.report.kept_existing,
+        stale_sources: preview.report.stale_sources,
+        imported,
+        skipped,
+        replacements,
+        truncated: replace > IMPORT_PREVIEW_LIMIT,
+        plan_token: import_plan_token(
+            &state,
+            &project,
+            &format,
+            &content,
+            keep_existing,
+            &updates,
+        )?,
+    })
+}
+
+/// Verify and apply under one cancellation-safe project guard. Every desktop
+/// edit/open/provider operation uses this admission, so none can write between
+/// verification and the core import transaction (even if the caller disconnects).
+pub async fn apply_catalog_preview(
+    state: Arc<AppState>,
+    format: String,
+    content: String,
+    keep_existing: bool,
+    plan_token: String,
+) -> Result<serde_json::Value, ApiError> {
+    let guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
+    run_owned_project_operation(guard, async move {
+        let stale = || err(StatusCode::CONFLICT, STALE_IMPORT_PLAN);
+        let project = state
+            .current_project
+            .read()
+            .await
+            .clone()
+            .ok_or_else(stale)?;
+        if plan_token.len() != 64 || !plan_token.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(stale());
+        }
+        // A valid preview cannot have an invalid catalog. Changed/malformed
+        // bytes are stale too, with no partial writes during parsing.
+        let (updates, pre_skipped) =
+            export::parse_import_catalog(&format, &content).map_err(|_| stale())?;
+        state
+            .db
+            .preview_imported_translations(&updates, keep_existing)
+            .map_err(|_| stale())?;
+        if import_plan_token(&state, &project, &format, &content, keep_existing, &updates)?
+            != plan_token
+        {
+            return Err(stale());
+        }
+        let attempted = updates.len();
+        let report = state
+            .db
+            .save_imported_translations_batch_with(updates, keep_existing)
+            .await
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        Ok(import_result(&report, pre_skipped, attempted))
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
 }
 
 #[cfg(test)]

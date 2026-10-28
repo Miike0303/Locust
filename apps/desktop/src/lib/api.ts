@@ -743,6 +743,7 @@ export const importXliff = (content: string) =>
   }), result => result.imported > 0);
 
 export type ExportFormat = "po" | "xliff";
+export type ImportFormat = ExportFormat | "tmx";
 
 export interface ExportResult {
   path: string;
@@ -762,6 +763,59 @@ export interface ImportCounts {
 export interface ImportResult extends ImportCounts {
   path: string;
   format: string;
+}
+
+export interface ImportReplacement {
+  id: string;
+  file: string;
+  previous_text: string;
+  previous_status: StringStatus;
+  new_text: string;
+}
+
+export interface ImportPreview extends ImportCounts {
+  fill: number;
+  replace: number;
+  unchanged: number;
+  unknown_ids: number;
+  kept_existing: number;
+  stale_sources: number;
+  replacements: ImportReplacement[];
+  truncated: boolean;
+  plan_token: string;
+}
+
+/** Preview is read-only. Native callers pass a path; browser callers pass catalog text. */
+export function previewImportTranslations(
+  format: ImportFormat,
+  pathOrContent: string,
+  keepExisting: boolean,
+): Promise<ImportPreview> {
+  return IS_TAURI
+    ? tauriInvoke("preview_import_translations", { format, path: pathOrContent, keepExisting })
+    : request(`/import/${format}/preview`, {
+      method: "POST", body: JSON.stringify({ content: pathOrContent, keep_existing: keepExisting }),
+    });
+}
+
+/** Apply only the plan returned for these exact inputs and the current affected rows. */
+export function applyImportPreview(
+  format: ImportFormat,
+  pathOrContent: string,
+  keepExisting: boolean,
+  planToken: string,
+): Promise<ImportCounts> {
+  return trackTranslationWrite(() => {
+    if (IS_TAURI) {
+      return tauriInvoke<ImportCounts>("apply_import_preview", {
+        format, path: pathOrContent, keepExisting, planToken,
+      });
+    }
+    return request<ImportCounts>(`/import/${format}/apply`, {
+      method: "POST",
+      body: JSON.stringify({ content: pathOrContent, keep_existing: keepExisting, plan_token: planToken }),
+    });
+  }, result => result.imported > 0);
 }
 
 /** Save translations to a PO or XLIFF file.

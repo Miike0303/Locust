@@ -669,6 +669,81 @@ pub struct ImportedTranslation {
     pub translation: String,
 }
 
+/// Desktop/browser catalogs use the same parsers and skip rules for preview and
+/// apply. TMX declares its bilingual pair; the strict parser still validates the
+/// entire document, including every variant and the header.
+pub fn parse_import_catalog(
+    format: &str,
+    content: &str,
+) -> Result<(Vec<ImportedTranslation>, usize)> {
+    match format {
+        "po" => Ok(po_entries_for_batch(&import_po(content)?)),
+        "xliff" => Ok(xliff_units_for_batch(&import_xliff(content)?)),
+        "tmx" => {
+            let invalid = |message: String| LocustError::ParseError {
+                file: "tmx".into(),
+                message: format!("TMX profile error: {message}"),
+            };
+            if content.len() > 32 * 1024 * 1024 {
+                return Err(invalid("document exceeds 32 MiB".into()));
+            }
+            let mut reader = quick_xml::Reader::from_str(content);
+            let mut source = None;
+            let mut target = None;
+            loop {
+                match reader.read_event().map_err(|e| invalid(e.to_string()))? {
+                    quick_xml::events::Event::Start(element)
+                    | quick_xml::events::Event::Empty(element) => {
+                        let key = match element.name().as_ref() {
+                            b"header" => b"srclang".as_slice(),
+                            b"tuv" => b"xml:lang".as_slice(),
+                            _ => continue,
+                        };
+                        for attr in element.attributes() {
+                            let attr = attr.map_err(|e| invalid(e.to_string()))?;
+                            if attr.key.as_ref() != key {
+                                continue;
+                            }
+                            let raw = std::str::from_utf8(&attr.value)
+                                .map_err(|e| invalid(e.to_string()))?;
+                            let lang = quick_xml::escape::unescape(raw)
+                                .map_err(|e| invalid(e.to_string()))?
+                                .into_owned();
+                            if key == b"srclang" {
+                                source = Some(lang);
+                            } else if source
+                                .as_ref()
+                                .is_some_and(|s: &String| !s.eq_ignore_ascii_case(&lang))
+                            {
+                                target = Some(lang);
+                                break;
+                            }
+                        }
+                        if target.is_some() {
+                            break;
+                        }
+                    }
+                    quick_xml::events::Event::Eof => break,
+                    _ => {}
+                }
+            }
+            let source = source.ok_or_else(|| invalid("missing source language".into()))?;
+            // Empty catalogs have no variants. Either distinct concrete target
+            // validates the same empty document; incomplete units still fail.
+            let target = target.unwrap_or_else(|| {
+                if source.eq_ignore_ascii_case("en") {
+                    "es"
+                } else {
+                    "en"
+                }
+                .into()
+            });
+            Ok(tmx_units_for_batch(&import_tmx(content, &source, &target)?))
+        }
+        other => Err(LocustError::UnsupportedFormat(other.into())),
+    }
+}
+
 /// Empty msgstr / missing id / fuzzy count toward `skipped`; the database checks source identity.
 pub fn po_entries_for_batch(entries: &[PoEntry]) -> (Vec<ImportedTranslation>, usize) {
     let mut skipped = 0usize;
