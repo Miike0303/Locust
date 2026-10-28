@@ -26,7 +26,7 @@ const importPreview = (keep: boolean): ImportPreview => ({
 const h = {
   t, a11y, project: project as ProjectInfo | null, scopeAllowed: true,
   states: [] as any[], cursor: 0, effects: [] as (() => void)[], changed: false,
-  facets: ready(facets), files: ready(files), queries: [] as any[],
+  facets: ready(facets), files: ready(files), source: ready({ source_lang: "ja" }), queries: [] as any[],
   calls: [] as { command: string; args: any }[], requests: [] as URL[],
   bodies: [] as { path: string; body: any }[],
   previewHandler: null as null | ((keep: boolean) => Promise<ImportPreview>),
@@ -64,7 +64,7 @@ const hooks = registerHooks({
     if (context.parentURL?.endsWith("/components/ExportModal.tsx")) {
       const stubs: Record<string, string> = {
         react: "export const useState=initial=>h.state(initial);export const useRef=initial=>h.state(()=>({current:initial}))[0];export const useEffect=(fn,deps)=>h.effect(fn,deps);export const useId=()=> 'export-scope';",
-        "@tanstack/react-query": "export const useQuery=options=>{h.queries.push(options);return options.queryKey[0]==='file-stats'?h.files:h.facets;};",
+        "@tanstack/react-query": "export const useQuery=options=>{h.queries.push(options);return options.queryKey[0]==='export-source-language'?h.source:options.queryKey[0]==='file-stats'?h.files:h.facets;};",
         "../lib/projectScope": "export const draftProjectKey=p=>JSON.stringify([p.database_path??null,p.path,p.format_id]);export const useProjectScopedQueryEnabled=(_key,enabled)=>()=>enabled&&h.scopeAllowed;export const projectScopedQueryFn=(_key,fn)=>fn;",
         "../lib/i18n": "export const useT=()=>h.t;",
         "../stores/projectStore": "export const useProjectStore=()=>({project:h.project});",
@@ -118,6 +118,7 @@ globalThis.fetch = async (input, init) => {
   if (url.pathname === "/api/project/current") return new Response("null");
   if (url.pathname === "/api/stats/files") return new Response(JSON.stringify({ files }));
   if (url.pathname === "/api/strings/facets") return new Response(JSON.stringify(facets));
+  if (url.pathname === "/api/export/source-language") return new Response(JSON.stringify(h.source.data));
   if (/^\/api\/import\/(po|xliff|tmx)\/(preview|apply)$/.test(url.pathname)) {
     const body = JSON.parse(String(init?.body));
     h.bodies.push({ path: url.pathname, body });
@@ -126,7 +127,7 @@ globalThis.fetch = async (input, init) => {
       ? h.previewHandler ? await h.previewHandler(body.keep_existing) : importPreview(body.keep_existing)
       : { imported: 1, skipped: 10, stale_sources: 4 }));
   }
-  assert.match(url.pathname, /^\/api\/export\/(po|xliff)$/);
+  assert.match(url.pathname, /^\/api\/export\/(po|xliff|tmx)$/);
   return h.failure ? new Response(h.failure, { status: 400 }) : new Response("assignment contents");
 };
 const { default: ExportModal } = await import("./ExportModal");
@@ -138,7 +139,7 @@ beforeEach(() => {
   h.bodies = []; h.previewHandler = null;
   h.toasts = []; h.logs = []; h.downloads = []; h.revoked = []; h.closed = 0; h.imported = 0;
   h.output = "assignment.po"; h.failure = ""; h.scopeAllowed = true; h.project = project;
-  h.facets = ready(facets); h.files = ready(files); h.setTauri(true); setLocale("en");
+  h.facets = ready(facets); h.files = ready(files); h.source = ready({ source_lang: "ja" }); h.setTauri(true); setLocale("en");
 });
 after(() => {
   hooks.deregister(); globalThis.fetch = originalFetch;
@@ -235,18 +236,23 @@ for (const locale of ["en", "es"] as const) {
 }
 
 for (const native of [true, false]) {
-  for (const format of ["po", "xliff"] as const) {
+  for (const format of ["po", "xliff", "tmx"] as const) {
     test(`${native ? "Tauri" : "browser"} ${format}: export sends the exact file and selected statuses`, async () => {
       h.setTauri(native); render(); select("format", format); select("file", FILE); selectStatuses(["translated", "reviewed"]);
       await clickExport();
       if (native) {
         const call = h.calls.find(call => call.command === "export_translations");
-        assert.deepEqual(call?.args, { format, lang: "es", path: "assignment.po", file: FILE, status: ["translated", "reviewed"] });
+        assert.deepEqual(call?.args, { format, lang: "es", path: "assignment.po", file: FILE, status: ["translated", "reviewed"], ...(format === "tmx" ? { sourceLang: "ja" } : {}) });
+        const dialog = h.calls.find(call => call.command === "plugin:dialog|save");
+        assert.equal(dialog?.args.options.defaultPath, `translation_es.${format}`);
+        if (format === "tmx") assert.deepEqual(dialog?.args.options.filters, [{ name: "TMX", extensions: ["tmx"] }]);
         assert.equal(h.downloads.length, 0);
       } else {
         const url = h.requests.find(url => url.pathname === `/api/export/${format}`)!;
         assert.equal(url.searchParams.get("file"), FILE);
         assert.deepEqual(url.searchParams.getAll("status"), ["translated", "reviewed"]);
+        assert.equal(url.searchParams.get("lang"), "es");
+        assert.equal(url.searchParams.get("source_lang"), format === "tmx" ? "ja" : null);
         assert.deepEqual(h.downloads, [{ href: "blob:assignment", download: `translation_es.${format}` }]);
         assert.deepEqual(h.revoked, ["blob:assignment"]);
       }
@@ -285,6 +291,86 @@ test("omitted and explicitly empty status lists keep distinct HTTP and Tauri pay
   assert.deepEqual(h.calls[h.calls.length - 1]?.args, { format: "po", lang: "es", path: "assignment.po" });
   await api.exportTranslations("xliff", "es", "assignment.xliff", { status: [] });
   assert.deepEqual(h.calls[h.calls.length - 1]?.args.status, []);
+});
+
+for (const locale of ["en", "es"] as const) {
+  test(`${locale}: TMX alone shows associated source and target selects and requires distinct languages`, async () => {
+    setLocale(locale);
+    for (const format of ["po", "xliff"]) {
+      select("format", format);
+      assert.ok(!nodes(render()).some(node => node.props?.id === "export-scope-source-lang"));
+      assert.equal(primary().props.disabled, false);
+    }
+    select("format", "tmx");
+    const tree = render();
+    const source = nodes(tree).find(node => node.props?.id === "export-scope-source-lang");
+    assert.equal(source.props.value, "ja");
+    assert.ok(nodes(tree).some(node => node.type === "label" && node.props.htmlFor === source.props.id
+      && text(node) === (locale === "en" ? "Source language" : "Idioma de origen")));
+    assert.equal(nodes(tree).find(node => node.props?.id === "export-scope-lang").props.value, "es");
+    select("source-lang", "es");
+    assert.equal(primary().props.disabled, true);
+    assert.ok(text(render()).includes(t("export.distinctLanguages")));
+    select("source-lang", "en-US");
+    await clickExport();
+    assert.equal(h.calls.find(call => call.command === "export_translations")?.args.sourceLang, "en-US");
+    await click("export.import");
+    assert.ok(!nodes(render()).some(node => node.props?.id === "export-scope-source-lang"));
+  });
+}
+
+for (const native of [true, false]) {
+  test(`${native ? "Tauri" : "browser"}: TMX uses the project language query and reports codec refusal without a download`, async () => {
+    h.setTauri(native); render();
+    let query = [...h.queries].reverse().find(query => query.queryKey[0] === "export-source-language");
+    assert.equal(query.enabled(), false);
+    select("format", "tmx"); render();
+    query = [...h.queries].reverse().find(query => query.queryKey[0] === "export-source-language");
+    assert.equal(query.enabled(), true);
+    assert.deepEqual(await query.queryFn(), { source_lang: "ja" });
+    assert.equal([...h.requests].reverse().find(url => url.pathname === "/api/export/source-language")?.search, "?lang=es");
+    h.failure = "TMX profile error: document exceeds 32 MiB";
+    await clickExport();
+    assert.equal(h.closed, 0);
+    assert.equal(h.downloads.length, 0);
+    assert.equal(h.toasts[0][0], "error");
+    assert.equal(primary().props.disabled, false);
+  });
+
+  test(`${native ? "Tauri" : "browser"}: API requires an explicit TMX source before issuing requests`, async () => {
+    h.setTauri(native);
+    await assert.rejects(api.exportTranslations("tmx", "es", "catalog.tmx"), /source_lang/);
+    assert.equal(h.requests.length, 0);
+    assert.equal(h.calls.length, 0);
+    assert.equal(h.downloads.length, 0);
+  });
+}
+
+test("TMX source defaults arrive asynchronously, preserve manual choices and reset with the project or dialog", () => {
+  h.source = { ...ready({ source_lang: "" }), isPending: true };
+  select("format", "tmx");
+  assert.equal(primary().props.disabled, true);
+  select("source-lang", "en");
+  h.source = ready({ source_lang: "ja" });
+  assert.equal(nodes(render()).find(node => node.props?.id === "export-scope-source-lang").props.value, "en");
+  h.project = { ...project, database_path: "fixture/new.db" };
+  h.source = ready({ source_lang: "pt-PT" });
+  let source = nodes(render()).find(node => node.props?.id === "export-scope-source-lang");
+  assert.equal(source.props.value, "pt-PT");
+  assert.ok(nodes(source).some(node => node.type === "option" && node.props.value === "pt-PT"));
+  select("source-lang", "de"); render(false); render();
+  source = nodes(render()).find(node => node.props?.id === "export-scope-source-lang");
+  assert.equal(source.props.value, "pt-PT");
+  for (const source_lang of ["auto", "und", "", "bad_tag"]) {
+    h.source = ready({ source_lang });
+    assert.equal(primary().props.disabled, true);
+    assert.equal(nodes(render()).find(node => node.props?.id === "export-scope-source-lang").props.value, "");
+  }
+  h.source.isError = true;
+  select("source-lang", "ja");
+  assert.equal(primary().props.disabled, false);
+  select("format", "po");
+  assert.equal(primary().props.disabled, false);
 });
 
 test("pending, refreshing and failed scope data disable export without claiming an empty selection", () => {

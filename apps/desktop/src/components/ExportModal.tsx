@@ -9,6 +9,7 @@ import {
 	applyImportPreview,
 	getStringFacets,
 	getFileStats,
+	getExportSourceLanguage,
 	type ImportFormat,
 	type ImportPreview,
 	type ImportCounts,
@@ -55,6 +56,7 @@ export default function ExportModal({
 	const [mode, setMode] = useState<Mode>("export");
 	const [format, setFormat] = useState<ImportFormat>("po");
 	const [lang, setLang] = useState("es");
+	const [sourceLang, setSourceLang] = useState<string | null>(null);
 	const [loading, setLoading] = useState(false);
 	const [file, setFile] = useState("");
 	const [statuses, setStatuses] = useState<StringStatus[]>(STATUSES);
@@ -72,6 +74,18 @@ export default function ExportModal({
 	const currentImportContext = useRef(importContext);
 	currentImportContext.current = importContext;
 	const scopeEnabled = useProjectScopedQueryEnabled(projectKey, open && !!project && mode === "export");
+	const sourceQuery = useQuery({
+		queryKey: ["export-source-language", projectKey, lang],
+		queryFn: projectScopedQueryFn(projectKey, () => getExportSourceLanguage(lang)),
+		enabled: () => scopeEnabled() && format === "tmx",
+		staleTime: 0,
+		retry: false,
+	});
+	const suggestedSource = sourceQuery.data?.source_lang ?? "";
+	const concreteSource = /^[a-z]{2,8}(?:-[a-z0-9]{1,8})*$/i.test(suggestedSource)
+		&& !["auto", "und", "mul", "zxx"].includes(suggestedSource.split("-")[0].toLowerCase());
+	const tmxSource = sourceLang ?? (concreteSource ? suggestedSource : "");
+	const sameLanguage = !!tmxSource && tmxSource.toLowerCase() === lang.toLowerCase();
 	const facetsQuery = useQuery({
 		queryKey: ["string-facets", projectKey],
 		queryFn: projectScopedQueryFn(projectKey, () => getStringFacets()),
@@ -91,6 +105,7 @@ export default function ExportModal({
 		setFile("");
 		setStatuses(STATUSES);
 		setKeepExisting(true);
+		setSourceLang(null);
 	}, [open, projectKey]);
 	useEffect(() => {
 		importGeneration.current++;
@@ -105,7 +120,8 @@ export default function ExportModal({
 		.reduce((sum, row) => sum + statuses.reduce((total, status) => total + row[status], 0), 0);
 	const scopePending = facetsQuery.isPending || filesQuery.isPending || filesQuery.isFetching;
 	const scopeFailed = facetsQuery.isError || filesQuery.isError;
-	const exportDisabled = loading || !scopeEnabled() || scopePending || scopeFailed || count === undefined || count === 0;
+	const exportDisabled = loading || !scopeEnabled() || scopePending || scopeFailed || count === undefined || count === 0
+		|| (format === "tmx" && (!tmxSource || sameLanguage));
 	const fileInputRef = useRef<HTMLInputElement>(null);
 	const { dialogRef, dialogProps, titleProps } = useModalA11y({
 		open,
@@ -114,10 +130,10 @@ export default function ExportModal({
 
 	if (!open || !project) return null;
 
-	const defaultName = `translation_${lang}.${format === "po" ? "po" : "xliff"}`;
+	const defaultName = `translation_${lang}.${format}`;
 
 	const handleExport = async () => {
-		if (exportDisabled || format === "tmx") return;
+		if (exportDisabled) return;
 		setLoading(true);
 		try {
 			let path: string | undefined;
@@ -129,7 +145,8 @@ export default function ExportModal({
 					filters: [
 						format === "po"
 							? { name: t("export.filter.po"), extensions: ["po"] }
-							: { name: t("export.filter.xliff"), extensions: ["xliff", "xlf"] },
+							: format === "tmx" ? { name: "TMX", extensions: ["tmx"] }
+								: { name: t("export.filter.xliff"), extensions: ["xliff", "xlf"] },
 					],
 				});
 				if (typeof selected !== "string" || !selected) {
@@ -139,7 +156,8 @@ export default function ExportModal({
 				path = selected;
 			}
 
-			const result = await exportTranslations(format, lang, path, { file: file || undefined, status: statuses });
+			const result = await exportTranslations(format, lang, path, { file: file || undefined, status: statuses },
+				format === "tmx" ? tmxSource : undefined);
 			addToast("success", t("export.toast.exported", { format: format.toUpperCase(), path: result.path }));
 			addLog(
 				"info",
@@ -295,7 +313,7 @@ export default function ExportModal({
 				<div className="flex gap-1 mb-4 p-1 bg-surface-muted rounded">
 					<button
 						type="button"
-						onClick={() => { clearImportPreview(); if (format === "tmx") setFormat("po"); setMode("export"); }}
+						onClick={() => { clearImportPreview(); setMode("export"); }}
 						disabled={loading}
 						className={`flex-1 py-1.5 text-body rounded transition-colors ${
 							mode === "export"
@@ -331,7 +349,7 @@ export default function ExportModal({
 						>
 							<option value="po">Gettext PO (.po)</option>
 							<option value="xliff">XLIFF 1.2 (.xliff)</option>
-							{mode === "import" && <option value="tmx">TMX (.tmx)</option>}
+							<option value="tmx">TMX (.tmx)</option>
 						</select>
 					</div>
 
@@ -382,7 +400,20 @@ export default function ExportModal({
 					)}
 
 					{mode === "export" && (
-						<div>
+						<div className={clsx(format === "tmx" && "grid grid-cols-1 sm:grid-cols-2 gap-4")}>
+							{format === "tmx" && (
+								<div>
+									<label htmlFor={`${scopeId}-source-lang`} className="text-body font-medium">{t("export.sourceLang")}</label>
+									<select id={`${scopeId}-source-lang`} value={tmxSource}
+										onChange={event => setSourceLang(event.target.value)} disabled={loading}
+										className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg">
+										<option value="">{t("export.chooseSourceLang")}</option>
+										{tmxSource && !LANGUAGES.some(language => language.code === tmxSource) && <option value={tmxSource}>{tmxSource}</option>}
+										{LANGUAGES.map(language => <option key={language.code} value={language.code}>{language.label} ({language.code})</option>)}
+									</select>
+								</div>
+							)}
+							<div>
 							<label htmlFor={`${scopeId}-lang`} className="text-body font-medium">{t("export.targetLang")}</label>
 							<select
 								id={`${scopeId}-lang`}
@@ -396,6 +427,8 @@ export default function ExportModal({
 									</option>
 								))}
 							</select>
+							</div>
+							{format === "tmx" && sameLanguage && <p role="status" className="text-caption text-text-muted sm:col-span-2">{t("export.distinctLanguages")}</p>}
 						</div>
 					)}
 

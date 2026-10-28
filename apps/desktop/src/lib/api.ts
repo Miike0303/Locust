@@ -744,8 +744,9 @@ export interface ExportScope {
   status?: StringStatus[];
 }
 
-function exportQuery(lang: string, scope: ExportScope): string {
+function exportQuery(lang: string, scope: ExportScope, sourceLang?: string): string {
   const params = new URLSearchParams({ lang });
+  if (sourceLang !== undefined) params.set("source_lang", sourceLang);
   if (scope.file !== undefined) params.set("file", scope.file);
   if (scope.status !== undefined) {
     if (scope.status.length === 0) params.set("status", "");
@@ -756,6 +757,10 @@ function exportQuery(lang: string, scope: ExportScope): string {
 
 export const exportPo = (lang: string, scope: ExportScope = {}) => requestText(`/export/po?${exportQuery(lang, scope)}`);
 export const exportXliff = (lang: string, scope: ExportScope = {}) => requestText(`/export/xliff?${exportQuery(lang, scope)}`);
+export const exportTmx = (sourceLang: string, lang: string, scope: ExportScope = {}) =>
+  requestText(`/export/tmx?${exportQuery(lang, scope, sourceLang)}`);
+export const getExportSourceLanguage = (lang: string) =>
+  request<{ source_lang: string }>(`/export/source-language?${new URLSearchParams({ lang })}`);
 export const importPo = (content: string) =>
   trackTranslationWrite(() => request<ImportCounts>(`/import/po`, {
     method: "POST",
@@ -770,8 +775,8 @@ export const importXliff = (content: string) =>
     headers: { "Content-Type": "text/plain" },
   }), result => result.imported > 0);
 
-export type ExportFormat = "po" | "xliff";
-export type ImportFormat = ExportFormat | "tmx";
+export type ExportFormat = "po" | "xliff" | "tmx";
+export type ImportFormat = ExportFormat;
 
 export interface ExportResult {
   path: string;
@@ -846,7 +851,7 @@ export function applyImportPreview(
   }, result => result.imported > 0);
 }
 
-/** Save translations to a PO or XLIFF file.
+/** Save translations to a PO, XLIFF or restricted TMX file.
  *  Tauri: writes via `export_translations` after the UI picks a path.
  *  Browser: fetches text and triggers a download (path ignored).
  */
@@ -855,13 +860,18 @@ export async function exportTranslations(
   lang: string,
   path?: string,
   scope: ExportScope = {},
+  sourceLang?: string,
 ): Promise<ExportResult> {
+  if (format === "tmx" && sourceLang === undefined) throw new ApiError("missing field `source_lang`");
   if (IS_TAURI) {
     if (!path) throw new Error("path required for Tauri export");
-    return tauriInvoke<ExportResult>("export_translations", { format, lang, path, ...scope });
+    return tauriInvoke<ExportResult>("export_translations", {
+      format, lang, path, ...scope, ...(format === "tmx" ? { sourceLang } : {}),
+    });
   }
-  const text = format === "po" ? await exportPo(lang, scope) : await exportXliff(lang, scope);
-  const filename = path?.split(/[/\\]/).pop() || `translation_${lang}.${format === "po" ? "po" : "xliff"}`;
+  const text = format === "po" ? await exportPo(lang, scope)
+    : format === "tmx" ? await exportTmx(sourceLang!, lang, scope) : await exportXliff(lang, scope);
+  const filename = path?.split(/[/\\]/).pop() || `translation_${lang}.${format}`;
   const blob = new Blob([text], {
     type: format === "po" ? "text/plain;charset=utf-8" : "application/xml;charset=utf-8",
   });
@@ -876,7 +886,7 @@ export async function exportTranslations(
 
 /** Import translations from a PO/XLIFF file path (Tauri) or raw content (browser). */
 export async function importTranslations(
-  format: ExportFormat,
+  format: "po" | "xliff",
   pathOrContent: string
 ): Promise<ImportResult> {
   if (IS_TAURI) {

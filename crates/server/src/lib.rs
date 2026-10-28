@@ -42,9 +42,9 @@ use routes::glossary_memory::{
 use routes::inject::{inject, register_lang};
 pub use routes::io::{apply_catalog_preview, audit_project_fonts, preview_catalog};
 use routes::io::{
-    apply_import_preview, export_po, export_xliff, import_po, import_tmx, import_xliff,
-    list_validation_issues, preview_import, set_validation_issue_ignored, validate,
-    validation_summary,
+    apply_import_preview, export_po, export_source_language, export_tmx, export_xliff, import_po,
+    import_tmx, import_xliff, list_validation_issues, preview_import, set_validation_issue_ignored,
+    validate, validation_summary,
 };
 use routes::patch::{
     patch_apply, patch_cancel, patch_identity, patch_pack, patch_recordings, patch_rollback,
@@ -634,6 +634,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/export/po", get(export_po))
         .route("/api/import/po", post(import_po))
         .route("/api/export/xliff", get(export_xliff))
+        .route("/api/export/tmx", get(export_tmx))
+        .route("/api/export/source-language", get(export_source_language))
         .route("/api/import/xliff", post(import_xliff))
         .route("/api/import/tmx", post(import_tmx))
         .route("/api/import/:format/preview", post(preview_import))

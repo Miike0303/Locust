@@ -170,6 +170,7 @@ pub async fn audit_project_fonts(
 
 struct ExportQuery {
     lang: String,
+    source_lang: Option<String>,
     scope: export::ExportScope,
 }
 
@@ -196,8 +197,71 @@ impl ExportQuery {
         let scope =
             export::ExportScope::parse(value("file"), has_status.then_some(statuses.as_slice()))
                 .map_err(|message| err(StatusCode::BAD_REQUEST, message))?;
-        Ok(Self { lang, scope })
+        Ok(Self {
+            lang,
+            source_lang: value("source_lang"),
+            scope,
+        })
     }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ExportLanguageQuery {
+    lang: String,
+}
+
+/// A suggested project language for the TMX selector, never an implicit TMX input.
+pub(crate) async fn export_source_language(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ExportLanguageQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let _guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
+    if state.current_project.read().await.is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, "no project open"));
+    }
+    let config = state.config.read().await;
+    let source = state
+        .db
+        .resolve_export_source_lang(&query.lang, &config.default_source_lang)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(serde_json::json!({ "source_lang": source })))
+}
+
+pub(crate) async fn export_tmx(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Result<(StatusCode, [(String, String); 2], String), ApiError> {
+    let _guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
+    if state.current_project.read().await.is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, "no project open"));
+    }
+    let q = ExportQuery::parse(params)?;
+    let entries = q
+        .scope
+        .entries(&state.db)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if entries.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "no entries to export"));
+    }
+    let source = q
+        .source_lang
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "missing field `source_lang`"))?;
+    let body = export::export_tmx(&entries, &source, &q.lang)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    Ok((
+        StatusCode::OK,
+        [
+            (
+                "Content-Type".into(),
+                "application/xml; charset=utf-8".into(),
+            ),
+            (
+                "Content-Disposition".into(),
+                format!("attachment; filename=\"translation_{}.tmx\"", q.lang),
+            ),
+        ],
+        body,
+    ))
 }
 
 pub(crate) async fn export_po(

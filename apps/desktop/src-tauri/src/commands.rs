@@ -543,7 +543,7 @@ async fn apply_run_validation(s: &Arc<AppState>) -> Result<serde_json::Value, St
     .map_err(|e| e.to_string())?
 }
 
-/// Export current project translations to a PO or XLIFF file at `path`.
+/// Export current project translations to a PO, XLIFF or restricted TMX file.
 /// Frontend picks the path via the native save dialog.
 #[tauri::command]
 pub async fn export_translations(
@@ -552,9 +552,10 @@ pub async fn export_translations(
     path: String,
     file: Option<String>,
     status: Option<Vec<String>>,
+    source_lang: Option<String>,
     state: State<'_, AppStateWrapper>,
 ) -> Result<serde_json::Value, String> {
-    apply_export_translations(&state.0, format, lang, path, file, status).await
+    apply_export_translations(&state.0, format, lang, path, file, status, source_lang).await
 }
 
 async fn apply_export_translations(
@@ -564,6 +565,7 @@ async fn apply_export_translations(
     path: String,
     file: Option<String>,
     status: Option<Vec<String>>,
+    source_lang: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let _exclusive = try_project_operation(s)?;
     if s.current_project.read().await.is_none() {
@@ -574,13 +576,19 @@ async fn apply_export_translations(
     if entries.is_empty() {
         return Err("no entries to export".into());
     }
-    let default_source = s.config.read().await.default_source_lang.clone();
-    let source =
+    let source = if format == "tmx" {
+        source_lang.ok_or("missing field `source_lang`")?
+    } else {
+        let default_source = s.config.read().await.default_source_lang.clone();
         s.db.resolve_export_source_lang(&lang, &default_source)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?
+    };
     let body = match format.as_str() {
         "po" => locust_core::export::export_po(&entries, &source, &lang),
         "xliff" => locust_core::export::export_xliff(&entries, &source, &lang),
+        "tmx" => {
+            locust_core::export::export_tmx(&entries, &source, &lang).map_err(|e| e.to_string())?
+        }
         other => return Err(format!("unknown export format: {other}")),
     };
     let out = PathBuf::from(&path);
@@ -1906,7 +1914,7 @@ mod tests {
         let before = serde_json::to_value(state.db.get_entry("leftover").unwrap()).unwrap();
         let output = std::env::temp_dir().join(format!("locust_export_{}", uuid::Uuid::new_v4()));
 
-        for format in ["po", "xliff"] {
+        for format in ["po", "xliff", "tmx"] {
             let file = output.with_extension(format);
             assert_eq!(
                 apply_export_translations(
@@ -1916,6 +1924,7 @@ mod tests {
                     file.to_string_lossy().into_owned(),
                     None,
                     None,
+                    Some("ja".into()),
                 )
                 .await
                 .unwrap_err(),
@@ -1947,7 +1956,7 @@ mod tests {
             serde_json::to_value(state.db.get_entries(&EntryFilter::default()).unwrap()).unwrap();
         let before_bytes = std::fs::read(&project).unwrap();
 
-        for format in ["po", "xliff"] {
+        for format in ["po", "xliff", "tmx"] {
             for suffix in ["", "-wal", "-shm", "-journal"] {
                 let output = dir.join(format!("project.locust.db{suffix}"));
                 let before_output = output.exists().then(|| std::fs::read(&output).unwrap());
@@ -1958,6 +1967,7 @@ mod tests {
                     output.to_string_lossy().into_owned(),
                     None,
                     None,
+                    Some("ja".into()),
                 )
                 .await
                 .unwrap_err();
@@ -2004,6 +2014,7 @@ mod tests {
             output.to_string_lossy().into_owned(),
             None,
             None,
+            Some("ja".into()),
         )
         .await
         .unwrap();
@@ -2049,7 +2060,12 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let address = base.strip_prefix("http://").unwrap();
         let mut connection = tokio::net::TcpStream::connect(address).await.unwrap();
-        connection.write_all(format!("GET /api/export/{format}?lang=es{query} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        let source = if format == "tmx" {
+            "&source_lang=ja"
+        } else {
+            ""
+        };
+        connection.write_all(format!("GET /api/export/{format}?lang=es{source}{query} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
         let mut response = Vec::new();
         connection.read_to_end(&mut response).await.unwrap();
         let split = response
@@ -2104,7 +2120,7 @@ mod tests {
                 .filter(|row| ids.contains(&row.id.as_str()))
                 .cloned()
                 .collect();
-            for format in ["po", "xliff"] {
+            for format in ["po", "xliff", "tmx"] {
                 let output = dir.path().join(format!("assignment.{format}"));
                 let result = apply_export_translations(
                     &state,
@@ -2115,15 +2131,17 @@ mod tests {
                     statuses
                         .as_ref()
                         .map(|values| values.iter().map(|value| (*value).into()).collect()),
+                    Some("ja".into()),
                 )
                 .await
                 .unwrap();
                 assert_eq!(result["entries"], expected.len());
                 let bytes = std::fs::read(&output).unwrap();
-                let legacy = if format == "po" {
-                    locust_core::export::export_po(&expected, "ja", "es")
-                } else {
-                    locust_core::export::export_xliff(&expected, "ja", "es")
+                let legacy = match format {
+                    "po" => locust_core::export::export_po(&expected, "ja", "es"),
+                    "xliff" => locust_core::export::export_xliff(&expected, "ja", "es"),
+                    "tmx" => locust_core::export::export_tmx(&expected, "ja", "es").unwrap(),
+                    _ => unreachable!(),
                 };
                 assert_eq!(bytes, legacy.as_bytes());
                 assert_eq!(result["bytes"], bytes.len());
@@ -2147,11 +2165,13 @@ mod tests {
             (None, Some(vec![]), "&status=", "no entries to export"),
             (None, Some(vec!["bogus"]), "&status=bogus", "invalid export status 'bogus'; valid values: pending, translated, reviewed, approved, error"),
         ] {
-            for format in ["po", "xliff"] {
+            for format in ["po", "xliff", "tmx"] {
                 for existing in [false, true] {
                     let output = dir.path().join(if existing { "existing.po" } else { "absent/assignment.po" });
                     if existing { std::fs::write(&output, b"keep this catalog").unwrap(); }
-                    let result = apply_export_translations(&state, format.into(), "es".into(), output.to_string_lossy().into_owned(), file.map(str::to_owned), statuses.as_ref().map(|values| values.iter().map(|value| (*value).into()).collect())).await;
+                    let result = apply_export_translations(&state, format.into(), "es".into(), output.to_string_lossy().into_owned(), file.map(str::to_owned), statuses.as_ref().map(|values| values.iter().map(|value| (*value).into()).collect()),
+                    Some("ja".into()),
+                ).await;
                     assert_eq!(result.unwrap_err(), error);
                     if existing {
                         assert_eq!(std::fs::read(&output).unwrap(), b"keep this catalog");
@@ -2166,7 +2186,7 @@ mod tests {
         }
         let held = try_project_operation(&state).unwrap();
         let output = dir.path().join("blocked.po");
-        for format in ["po", "xliff"] {
+        for format in ["po", "xliff", "tmx"] {
             assert_eq!(
                 apply_export_translations(
                     &state,
@@ -2174,7 +2194,8 @@ mod tests {
                     "es".into(),
                     output.to_string_lossy().into_owned(),
                     Some("story/a.rpy".into()),
-                    Some(vec!["translated".into()])
+                    Some(vec!["translated".into()]),
+                    Some("ja".into()),
                 )
                 .await
                 .unwrap_err(),
@@ -2183,6 +2204,223 @@ mod tests {
             assert!(!output.exists());
         }
         drop(held);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn tmx_scoped_native_export_round_trips_through_preview_and_apply() {
+        use locust_core::models::STALE_TRANSLATION_METADATA_KEY;
+        let (dir, state) = export_scope_state().await;
+        let exact = " \t日本語 & <same>\r\n\\V[7] e\u{301}  ";
+        let mut stale = state.db.get_entry("b").unwrap().unwrap();
+        stale.metadata.insert(
+            STALE_TRANSLATION_METADATA_KEY.into(),
+            serde_json::json!(false),
+        );
+        let mut first = state.db.get_entry("z").unwrap().unwrap();
+        first.source = exact.into();
+        first.translation = Some(" ¡Hola!\r\n<&> ".into());
+        let mut duplicate = translated_entry("id:\t日本語\r\n\"|", exact, "Otro destino");
+        duplicate.file_path = "story/a.rpy".into();
+        state
+            .db
+            .save_entries(&[stale.clone(), first.clone(), duplicate.clone()])
+            .unwrap();
+        let output = dir.path().join("assignment.tmx");
+        let path = output.to_string_lossy().into_owned();
+        std::fs::write(&output, "previous catalog").unwrap();
+        let result = apply_export_translations(
+            &state,
+            "tmx".into(),
+            "es-MX".into(),
+            path.clone(),
+            Some("story/a.rpy".into()),
+            Some(vec![
+                "reviewed".into(),
+                "translated".into(),
+                "reviewed".into(),
+            ]),
+            Some("en-US".into()),
+        )
+        .await
+        .unwrap();
+        let content = std::fs::read_to_string(&output).unwrap();
+        assert_eq!(result["entries"], 3);
+        assert_eq!(result["bytes"], content.len());
+        let units = locust_core::export::import_tmx(&content, "en-US", "es-MX").unwrap();
+        assert_eq!(units.len(), 3);
+        assert!(content.contains("srclang=\"en-US\""));
+        assert!(content.contains("xml:lang=\"es-MX\""));
+        assert!(locust_core::export::import_tmx(&content, "en", "es-MX").is_err());
+        for row in [&stale, &first, &duplicate] {
+            let unit = units.iter().find(|unit| unit.id == row.id).unwrap();
+            assert_eq!(unit.source, row.source);
+            assert_eq!(unit.target, row.translation.as_deref().unwrap());
+            assert_eq!(unit.needs_review, row.id == stale.id);
+        }
+        let originals = [first, duplicate];
+        for row in &originals {
+            let mut empty = row.clone();
+            empty.translation = None;
+            empty.status = StringStatus::Pending;
+            state.db.save_entries(&[empty]).unwrap();
+        }
+        let before =
+            serde_json::to_value(state.db.get_entries(&EntryFilter::default()).unwrap()).unwrap();
+        let preview = preview_import_file(&state, "tmx".into(), path.clone(), true)
+            .await
+            .unwrap();
+        assert_eq!(preview["fill"], 2);
+        assert_eq!(preview["skipped"], 1);
+        assert_eq!(
+            serde_json::to_value(state.db.get_entries(&EntryFilter::default()).unwrap()).unwrap(),
+            before
+        );
+        let report = apply_import_file_preview(
+            &state,
+            "tmx".into(),
+            path,
+            true,
+            preview["plan_token"].as_str().unwrap().into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report["imported"], 2);
+        assert_eq!(report["skipped"], 1);
+        for row in originals {
+            let saved = state.db.get_entry(&row.id).unwrap().unwrap();
+            assert_eq!(saved.source, row.source);
+            assert_eq!(saved.translation, row.translation);
+            assert_eq!(saved.status, StringStatus::Translated);
+            assert_eq!(saved.provider_used.as_deref(), Some("import"));
+        }
+        assert_eq!(
+            serde_json::to_value(state.db.get_entry(&stale.id).unwrap().unwrap()).unwrap(),
+            serde_json::to_value(stale).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn tmx_codec_refusals_match_http_without_touching_destinations() {
+        let (dir, state) = export_scope_state().await;
+        let (base, server) = locust_server::start_test_server(state.clone()).await;
+        for (source, target, expected) in [
+            (
+                "illegal \u{1} XML".into(),
+                "target".into(),
+                "illegal XML 1.0 character",
+            ),
+            (
+                "x".repeat(1024 * 1024 + 1),
+                "target".into(),
+                "decoded field exceeds byte limit",
+            ),
+            (
+                "source".into(),
+                "x".repeat(1024 * 1024 + 1),
+                "decoded field exceeds byte limit",
+            ),
+        ] {
+            let mut row = translated_entry("refusal", &source, &target);
+            row.file_path = "refusal.rpy".into();
+            state.db.save_entries(&[row]).unwrap();
+            let (status, http_error) = http_export(&base, "tmx", "&file=refusal.rpy").await;
+            assert_eq!(status, 400);
+            for existing in [false, true] {
+                let output = dir.path().join(if existing {
+                    "existing.tmx"
+                } else {
+                    "absent/catalog.tmx"
+                });
+                if existing {
+                    std::fs::write(&output, b"keep this catalog").unwrap();
+                }
+                let error = apply_export_translations(
+                    &state,
+                    "tmx".into(),
+                    "es".into(),
+                    output.to_string_lossy().into_owned(),
+                    Some("refusal.rpy".into()),
+                    None,
+                    Some("ja".into()),
+                )
+                .await
+                .unwrap_err();
+                assert!(error.contains(expected), "{error}");
+                assert_eq!(error.as_bytes(), http_error);
+                if existing {
+                    assert_eq!(std::fs::read(output).unwrap(), b"keep this catalog");
+                } else {
+                    assert!(!output.parent().unwrap().exists());
+                }
+            }
+        }
+        // Field limits hold individually; escaping makes the complete document too large.
+        let rows: Vec<_> = (0..7)
+            .map(|id| {
+                StringEntry::new(
+                    format!("large-{id}"),
+                    "&".repeat(1024 * 1024),
+                    "large.rpy".into(),
+                )
+            })
+            .collect();
+        state.db.save_entries(&rows).unwrap();
+        let output = dir.path().join("existing.tmx");
+        let error = apply_export_translations(
+            &state,
+            "tmx".into(),
+            "es".into(),
+            output.to_string_lossy().into_owned(),
+            Some("large.rpy".into()),
+            None,
+            Some("ja".into()),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("document exceeds 32 MiB"), "{error}");
+        assert_eq!(std::fs::read(&output).unwrap(), b"keep this catalog");
+        let (status, body) = http_export(&base, "tmx", "&file=large.rpy").await;
+        assert_eq!(status, 400);
+        assert_eq!(body, error.as_bytes());
+        for source in [None, Some(""), Some("und"), Some("ES")] {
+            let error = apply_export_translations(
+                &state,
+                "tmx".into(),
+                "es".into(),
+                output.to_string_lossy().into_owned(),
+                Some("story/a.rpy".into()),
+                None,
+                source.map(str::to_owned),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.contains(if source.is_none() {
+                    "missing field `source_lang`"
+                } else if source == Some("ES") {
+                    "languages must differ"
+                } else {
+                    "concrete ASCII language tag"
+                }),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(&output).unwrap(), b"keep this catalog");
+        }
+        // Invalid rows outside a valid file/status scope cannot poison that export.
+        let result = apply_export_translations(
+            &state,
+            "tmx".into(),
+            "es".into(),
+            output.to_string_lossy().into_owned(),
+            Some("story/a.rpy".into()),
+            Some(vec!["reviewed".into()]),
+            Some("ja".into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["entries"], 1);
         server.abort();
         let _ = server.await;
     }

@@ -26,6 +26,55 @@ the plan stale: apply returns HTTP 409 (or the same native error message), saves
 nothing and asks for a new preview. Legacy direct-import APIs and CLI behavior
 remain available.
 
+## Desktop and HTTP export
+
+Choose TMX in the desktop/browser export dialog to export the same restricted
+project catalog as the CLI. The file selector intersects the selected statuses;
+omitting a scope exports all rows, while an empty status selection exports none.
+TMX displays source and target language selectors side by side. The source
+suggestion uses the project's latest translation run for the target language,
+then its latest run for any target, then the configured source default. An
+unknown/automatic source requires a concrete choice. Both selected tags are
+submitted explicitly; TMX export never silently resolves a missing source.
+PO/XLIFF retain their existing language resolution and target-only controls.
+
+HTTP clients use `GET /api/export/tmx?source_lang=en&lang=es`, optionally adding
+an exact `file` and repeated `status` parameters. Success returns UTF-8 XML with
+an attachment filename `translation_es.tmx`. Missing languages, invalid tags,
+equal languages, an empty scope or codec-limit failures return HTTP 400 without
+an attachment. `GET /api/export/source-language?lang=es` returns the read-only
+`{source_lang}` suggestion, with the same project admission checks as export.
+
+Native `export_translations` accepts `format: "tmx"`, `sourceLang`, `lang`,
+`path` and the existing optional `file`/`status` scope. The save dialog selects
+the destination and confirms replacements. The whole catalog must serialize
+successfully before directories or output files are written. The existing
+project-database, SQLite-sidecar and alias destination protection also applies
+to TMX. Invalid XML text and oversized catalogs leave an existing destination
+intact. Browser downloads begin only after a successful HTTP response.
+
+Exported IDs, exact source/target bytes, language declarations and review
+properties follow the profile below. The existing import preview/apply workflow
+accepts these catalogs; review-marked units remain skipped until explicitly
+reviewed. Export does not change import behavior or widen CAT compatibility.
+
+Local W3-12 verification (2026-10-28): all 12 server export tests, 45 desktop
+tests, 16 core TMX tests and 1,278 frontend tests passed; the frontend production
+build, Rust format check and strict workspace Clippy (all targets) passed.
+Native/HTTP comparisons cover five TMX
+scopes byte for byte. Both transports export catalogs that pass the existing
+preview/apply workflow with exact IDs, duplicate sources, CRLF, Unicode, explicit
+regional language tags and preserved review markers. Refusal tests cover invalid
+XML, oversized source/target fields and escaped documents exceeding 32 MiB;
+native destinations retain their previous bytes.
+
+The complete server run (`--no-fail-fast`) recorded 281 passed, 2 ignored and one
+sandbox hard-link failure:
+`routes::backups::backup_operation_tests::backup_http_delete_preserves_other_shared_backup`
+(backup storage expected 8 shared bytes, observed 16 copied bytes). This is not
+TMX export evidence or a passing full-server gate. These are local synthetic
+checks, not hosted CI or external-CAT certification.
+
 ## CLI quick path
 
 ```sh
