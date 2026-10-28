@@ -70,6 +70,7 @@ function InlineEdit({
 		return (
 			<textarea
 				aria-label={t("table.editTranslation")}
+				aria-description={t("table.inlineKeyboardHelp")}
 				value={value}
 				disabled={saving}
 				onChange={(e) => editDraft(draftKey, e.target.value, entry.translation)}
@@ -83,6 +84,7 @@ function InlineEdit({
 						editDraft(draftKey, initialValue.current);
 						acknowledgeDraft(draftKey, entry.translation || "");
 						setEditing(false);
+						e.currentTarget.closest("tr")?.focus();
 					}
 				}}
 				autoFocus
@@ -96,6 +98,8 @@ function InlineEdit({
 		<div onClick={e => e.stopPropagation()}>
 		<button type="button" disabled={!project || saving}
 			aria-label={t("table.editTranslation")}
+			title={t("table.inlineKeyboardHelp")}
+			data-inline-edit
 			tabIndex={-1}
 			onClick={(e) => {
 				e.stopPropagation();
@@ -290,7 +294,7 @@ export default function StringTable({
 						<tr
 							key={row.id}
 							tabIndex={focusedRowId === row.original.id ? 0 : -1}
-							aria-selected={focusedRowId === row.original.id}
+							aria-selected={selectedEntryId === row.original.id}
 							onFocus={() => setFocusedEntryId(row.original.id)}
 							onClick={event => {
 								event.currentTarget.focus();
@@ -308,6 +312,10 @@ export default function StringTable({
 								} else if (event.key === "Enter") {
 									event.preventDefault();
 									setSelected(row.original.id);
+								} else if (event.key === "F2") {
+									event.preventDefault();
+									// Use the pointer entry path, including its disabled/save guards.
+									event.currentTarget.querySelector<HTMLButtonElement>("[data-inline-edit]")?.click();
 								}
 							}}
 							style={{ height: rowHeight }}

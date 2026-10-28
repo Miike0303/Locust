@@ -1,5 +1,9 @@
 # Current task index
 
+## Overnight UI/API polish
+
+Owner **"hazlo, lo  voy a dejar toda la  noche"** authorizes the accepted audit queue under [overnight UI/API polish](tasks/overnight-ui-api-polish.md). Base `d2ac99a`, new local feature branch `feat/overnight-ui-api-polish`; accessible table and notification units start first, then public reproductions, bounded memory API, measurements and current-candidate isolated screenshots. Baseline frontend1126/0, Rust3006/0/25ignored, build/fmt/Clippy PASS; no new UI/runtime acceptance yet. B2 history, retained evidence and unrelated human config are preserved. Local-only delivery remains.
+
 ## Renewed continuation
 
 User **"corrige los oendietes de registros y avisos"**: [B2 S8/D10-D16](tasks/b2-dependencies.md) owns the work. D10-D13 complete locally; latest accepted source `c21fc75` has comparable audit6/12 and full gates/independent PASS. D14 candidate3/12 passed self-checks but independent S8FAIL and public CP437/malformed-Unicode-extra reproductions proved regressions; all13ownedproductfiles were restored with500hashguards, candidate/proof retained, no ZIP acceptance. D14 waits on compatible upstream behavior or owner-expanded archive scope. D15 next maintained-warning family is in read-only selection; D16 final audit/checkpoint pending. [Current report](../docs/B2-REMEDIATION-2026-10-26.md). Local only; human configuration preserved.

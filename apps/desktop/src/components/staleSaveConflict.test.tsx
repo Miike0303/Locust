@@ -157,9 +157,31 @@ test("inline: cancelling a further edit does not disable explicit Overwrite", as
   reset();
   await editAndSave("inline");
   nodes(render("inline")).find(n => n.type === "button" && n.props["aria-label"] === t("table.editTranslation")).props.onClick({ stopPropagation() {} });
-  nodes(render("inline")).find(n => n.type === "textarea").props.onKeyDown({ key: "Escape", preventDefault() {}, stopPropagation() {} });
+  const textarea = nodes(render("inline")).find(n => n.type === "textarea");
+  textarea.props.onChange({ target: { value: "Further edit to cancel" } });
+  let focused = 0, prevented = false, stopped = false;
+  let blur: Promise<void> | undefined;
+  const row = { focus() { focused++; blur = textarea.props.onBlur(); } };
+  textarea.props.onKeyDown({
+    key: "Escape",
+    currentTarget: { closest(selector: string) { assert.equal(selector, "tr"); return row; } },
+    preventDefault() { prevented = true; },
+    stopPropagation() { stopped = true; },
+  });
+  await blur;
+  assert.equal(focused, 1, "Escape returns focus to the containing row");
+  assert.equal(prevented, true);
+  assert.equal(stopped, true, "inline cancellation does not close the detail panel");
+  assert.equal(nodes(render("inline")).some(n => n.type === "textarea"), false);
+  assert.equal(drafts.useDraftStore.getState().drafts[key].text, "A draft", "cancel restores the retained conflicted draft");
+  assert.equal(drafts.useDraftStore.getState().drafts[key].conflict, true);
+  assert.equal(h.server, "V1");
+  assert.equal(h.calls.length, 1, "focus-transfer blur does not save cancelled text");
   await nodes(render("inline")).find(n => n.type === "button" && n.props.children === t("detail.overwrite")).props.onClick();
   assert.equal(h.server, "A draft");
+  assert.equal(h.calls.length, 2);
+  assert.deepEqual(h.calls[1], { translation: "A draft" }, "explicit Overwrite still omits the guard after cancellation");
+  assert.equal(drafts.useDraftStore.getState().drafts[key].conflict, false);
 });
 
 for (const translation of ["V0", null, ""] as const) {

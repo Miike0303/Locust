@@ -8,11 +8,17 @@ import { useEditorStore } from "../stores/editorStore";
 import { useProjectStore } from "../stores/projectStore";
 import * as drafts from "../stores/draftStore";
 import type { StringEntry } from "../lib/api";
+import { ApiError } from "../lib/apiError";
 
 // Invoke authored event handlers with controlled hooks; keep sorting and stores real.
 const h = {
   states: [] as any[], cursor: 0, tableCore, t, drafts, useEditorStore, useProjectStore,
   effects: [] as (() => void)[], hotkeys: [] as any[], queryData: {} as Record<string, unknown>,
+  writes: [] as { id: string; patch: any }[], reads: [] as string[],
+  write: async (_id: string, _patch: any): Promise<void> => {},
+  latest: "Latest translation",
+  async patchString(id: string, patch: any) { h.writes.push({ id, patch }); await h.write(id, patch); },
+  async getString(id: string) { h.reads.push(id); return { translation: h.latest }; },
   useState(initial: any) {
     const index = h.cursor++;
     const states = h.states;
@@ -48,13 +54,16 @@ const hooks = registerHooks({
         "../lib/i18n": "export const useT=()=>h.t;",
         "../stores/editorStore": "export const useEditorStore=selector=>selector?selector(h.useEditorStore.getState()):h.useEditorStore.getState();",
         "../stores/projectStore": "export const useProjectStore=Object.assign(selector=>selector?selector(h.useProjectStore.getState()):h.useProjectStore.getState(),{getState:h.useProjectStore.getState});",
-        "../stores/draftStore": `export const useDraftStore=selector=>selector(h.drafts.useDraftStore.getState());${Object.keys(drafts).filter(k => k !== "useDraftStore").map(k => `export const ${k}=h.drafts.${k};`).join("")}`,
+        "../stores/draftStore": `export const useDraftStore=Object.assign(selector=>selector(h.drafts.useDraftStore.getState()),{getState:h.drafts.useDraftStore.getState});${Object.keys(drafts).filter(k => k !== "useDraftStore").map(k => `export const ${k}=h.drafts.${k};`).join("")}`,
         "@tanstack/react-query": "export const useIsMutating=()=>0;export const useQuery=options=>({data:h.queryData[options.queryKey[0]],isLoading:false,isError:false});export const useQueryClient=()=>({invalidateQueries:async()=>{}});",
         "@tanstack/react-table": "export const useReactTable=h.createTable;export const getCoreRowModel=h.tableCore.getCoreRowModel;export const getSortedRowModel=h.tableCore.getSortedRowModel;export const flexRender=(value,context)=>typeof value==='function'?value(context):value;",
         "react-router-dom": "export const useNavigate=()=>()=>{};",
         "../lib/projectScope": "export const useProjectScopedQueryEnabled=()=>true;export const projectScopedQueryFn=(_key,fn)=>fn;",
         "../lib/hotkeys": "export const useHotkey=(action,callback,enabled=true,allowInEditable=false)=>h.hotkeys.push({action,callback,enabled,allowInEditable});",
       };
+      if (specifier === "../lib/api" && /\/StringTable\.tsx$/.test(context.parentURL ?? "")) {
+        return { shortCircuit: true, url: `data:text/javascript,${encodeURIComponent("const h=globalThis.__editorAccess;export const getConfig=async()=>({});export const getString=h.getString;export const patchString=h.patchString;")}` };
+      }
       if (stubs[specifier]) return { shortCircuit: true, url: `data:text/javascript,${encodeURIComponent("const h=globalThis.__editorAccess;" + stubs[specifier])}` };
     }
     return nextResolve(specifier, context);
@@ -93,6 +102,7 @@ function key(row: any, value: string, extras = {}) {
 beforeEach(() => {
   h.states = [];
   h.effects = []; h.hotkeys = []; h.queryData = {};
+  h.writes = []; h.reads = []; h.write = async () => {}; h.latest = "Latest translation";
   useEditorStore.setState({ selectedEntryId: null, filter: { limit: 100, offset: 0 } });
   useProjectStore.setState({ project });
   drafts.useDraftStore.setState({ drafts: {}, records: [], persistenceIssue: null, persistenceIssues: {} });
@@ -170,13 +180,46 @@ test("ArrowDown then Enter opens second row details through the shared selection
   assert.equal(focused, 1);
   bodyRows = rows(renderTable());
   assert.deepEqual(bodyRows.map(n => n.props.tabIndex), [-1, 0, -1]);
-  assert.equal(bodyRows[1].props["aria-selected"], true);
+  assert.deepEqual(bodyRows.map(row => row.props["aria-selected"]), [false, false, false]);
   assert.match(bodyRows[1].props.className, /ring-1 ring-accent-fg/);
   assert.match(bodyRows[1].props.className, /bg-surface-muted/);
   assert.equal(useEditorStore.getState().selectedEntryId, null, "navigation does not open details");
   assert.equal(key(bodyRows[1], "Enter"), true);
   assert.equal(useEditorStore.getState().selectedEntryId, entries[1].id);
+  assert.deepEqual(rows(renderTable()).map(row => row.props["aria-selected"]), [false, true, false]);
 });
+
+test("opened selection, not keyboard focus, determines aria-selected and the detail highlight", () => {
+  useEditorStore.setState({ selectedEntryId: entries[0].id });
+  let bodyRows = rows(renderTable());
+  bodyRows[1].props.onFocus();
+  bodyRows = rows(renderTable());
+  assert.deepEqual(bodyRows.map(row => row.props["aria-selected"]), [true, false, false]);
+  assert.match(bodyRows[0].props.className, /bg-accent-muted/);
+  assert.doesNotMatch(bodyRows[1].props.className, /bg-accent-muted/);
+  assert.equal(key(bodyRows[1], "Enter"), true);
+  assert.deepEqual(rows(renderTable()).map(row => row.props["aria-selected"]), [false, true, false]);
+  assert.deepEqual(rows(renderTable(entries.slice(2))).map(row => row.props["aria-selected"]), [false], "off-page details do not select a different visible row");
+});
+
+for (const locale of ["en", "es"] as const) {
+  test(`${locale}: F2 invokes the current row's inline editor without opening details`, () => {
+    setLocale(locale);
+    const tree = renderTable();
+    const row = rows(tree)[1];
+    let clicked = 0;
+    const target = { querySelector(selector: string) {
+      assert.equal(selector, "[data-inline-edit]");
+      return { click() { clicked++; } };
+    } };
+    assert.equal(key(row, "F2", { target, currentTarget: target }), true);
+    assert.equal(clicked, 1);
+    assert.equal(useEditorStore.getState().selectedEntryId, null);
+    const caption = nodes(tree).find(node => node.type === "caption");
+    assert.match(caption.props.children, /F2/);
+    assert.match(caption.props.children, /Escape/);
+  });
+}
 
 test("row navigation clamps at boundaries, follows sorting, and recovers when its row disappears", () => {
   let bodyRows = rows(renderTable());
@@ -197,9 +240,13 @@ test("row navigation clamps at boundaries, follows sorting, and recovers when it
 
 test("row keys ignore nested controls and modifiers and preserve action hotkeys", () => {
   const row = rows(renderTable())[0];
-  for (const value of ["ArrowDown", "Enter"]) {
-    assert.equal(key(row, value, { target: { tagName: "TEXTAREA" } }), false);
-    assert.equal(key(row, value, { ctrlKey: true }), false);
+  for (const value of ["ArrowDown", "ArrowUp", "Enter", "F2"]) {
+    for (const tagName of ["TEXTAREA", "BUTTON", "INPUT"]) {
+      assert.equal(key(row, value, { target: { tagName } }), false);
+    }
+    for (const modifier of ["ctrlKey", "metaKey", "altKey", "shiftKey"]) {
+      assert.equal(key(row, value, { [modifier]: true }), false);
+    }
   }
   for (const value of ["f", "t", "?", "Escape"]) assert.equal(key(row, value), false);
   assert.equal(shouldRunActionHotkey({ overlayOpen: false, target: { tagName: "TR" } }), true);
@@ -213,6 +260,177 @@ test("inline edit triggers leave one row in the table body's tab order", () => {
   const button = nodes(inline.type(inline.props)).find(n => n.type === "button");
   assert.equal(button.props.tabIndex, -1);
   assert.equal(rows(tree).filter(n => n.props.tabIndex === 0).length, 1);
+});
+
+// Model native row/button focus and dispatch while executing the authored handlers/effects.
+// Each component keeps its own hook slots; draft persistence and save guards remain real.
+function inlineHarness(index = 1) {
+  const tableState: any[] = [], inlineState: any[] = [];
+  let focused = 0, refetched = 0, stopped = 0;
+  function scoped(states: any[], render: () => any) {
+    h.states = states; h.cursor = 0; h.effects = [];
+    const tree = render();
+    h.effects.forEach(effect => effect());
+    return tree;
+  }
+  const table = () => scoped(tableState, () => StringTable({ data: entries, onRefetch() { refetched++; } }));
+  const row = () => rows(table())[index];
+  const inline = () => {
+    const cell = nodes(row()).find(n => typeof n.type === "function" && n.type.name === "InlineEdit");
+    return scoped(inlineState, () => cell.type(cell.props));
+  };
+  const button = () => nodes(inline()).find(n => n.type === "button" && n.props.tabIndex === -1);
+  const input = () => nodes(inline()).find(n => n.type === "textarea");
+  const domRow = {
+    focus() { focused++; row().props.onFocus(); },
+    querySelector(selector: string) {
+      assert.equal(selector, "[data-inline-edit]");
+      const trigger = button();
+      assert.equal(trigger.props["data-inline-edit"], true);
+      return { click() { if (!trigger.props.disabled) trigger.props.onClick({ stopPropagation() { stopped++; } }); } };
+    },
+  };
+  return {
+    inline, input, button, table,
+    enter() { return key(row(), "F2", { target: domRow, currentTarget: domRow }); },
+    click() { button().props.onClick({ stopPropagation() { stopped++; } }); },
+    change(text: string) { input().props.onChange({ target: { value: text } }); },
+    press(value: string, extras = {}) {
+      let prevented = false, propagationStopped = false;
+      input().props.onKeyDown({ key: value, currentTarget: { closest(selector: string) {
+        assert.equal(selector, "tr"); return domRow;
+      } }, preventDefault() { prevented = true; }, stopPropagation() { propagationStopped = true; }, ...extras });
+      return { prevented, propagationStopped };
+    },
+    counts: () => ({ focused, refetched, stopped }),
+  };
+}
+const settleWrites = () => new Promise(resolve => setImmediate(resolve));
+
+for (const locale of ["en", "es"] as const) {
+  test(`${locale}: F2 edits the current draft; Escape cancels only this session and restores row focus`, () => {
+    setLocale(locale);
+    const draftKey = drafts.draftEntryKey(projectKey, entries[1].id);
+    drafts.editDraft(draftKey, "Earlier draft", entries[1].translation);
+    useEditorStore.setState({ selectedEntryId: entries[0].id });
+    const view = inlineHarness();
+    assert.equal(view.enter(), true);
+    const input = view.input();
+    assert.equal(input.props.autoFocus, true);
+    assert.equal(input.props.value, "Earlier draft");
+    assert.equal(input.props["aria-label"], t("table.editTranslation"));
+    assert.match(input.props["aria-description"], /F2.*Ctrl\+Enter.*Escape/);
+    view.change("Cancelled text");
+    assert.deepEqual(view.press("Escape"), { prevented: true, propagationStopped: true });
+    // React's removal/focus transfer may blur the old textarea: never save cancelled text.
+    void input.props.onBlur();
+    assert.equal(view.input(), undefined);
+    assert.equal(drafts.useDraftStore.getState().drafts[draftKey].text, "Earlier draft");
+    assert.deepEqual(h.writes, []);
+    assert.deepEqual(view.counts(), { focused: 1, refetched: 0, stopped: 1 });
+    assert.equal(useEditorStore.getState().selectedEntryId, entries[0].id);
+    assert.deepEqual(rows(view.table()).map(row => row.props.tabIndex), [-1, 0, -1]);
+  });
+}
+
+test("pointer inline entry stays independent of row selection; cancelling a fresh edit clears its draft", () => {
+  const view = inlineHarness();
+  view.click();
+  assert.equal(useEditorStore.getState().selectedEntryId, null);
+  view.change("Discard");
+  assert.deepEqual(view.press("Escape", { shiftKey: true }), { prevented: true, propagationStopped: true }, "modified Escape retains its prior cancel semantics");
+  assert.equal(view.input(), undefined);
+  assert.equal(drafts.useDraftStore.getState().drafts[drafts.draftEntryKey(projectKey, entries[1].id)], undefined);
+  assert.deepEqual(h.writes, []);
+});
+
+test("plain/Meta Enter stay in the textarea; Ctrl+Enter saves once with the existing optimistic guard", async () => {
+  const view = inlineHarness();
+  view.enter();
+  view.change("Saved text");
+  assert.deepEqual(view.press("Enter"), { prevented: false, propagationStopped: false });
+  assert.deepEqual(view.press("Enter", { metaKey: true }), { prevented: false, propagationStopped: false });
+  const input = view.input();
+  assert.equal(view.press("Enter", { ctrlKey: true }).prevented, true);
+  await input.props.onBlur();
+  await settleWrites();
+  assert.deepEqual(h.writes, [{ id: entries[1].id, patch: { translation: "Saved text", expected_translation: "Translation" } }]);
+  assert.equal(view.input(), undefined);
+  assert.equal(view.counts().refetched, 1);
+});
+
+test("blur saves, ordinary errors retain draft and Retry uses the same guard", async () => {
+  const view = inlineHarness();
+  view.enter(); view.change("Retry text");
+  h.write = async () => { throw new Error("Offline"); };
+  await view.input().props.onBlur();
+  const draftKey = drafts.draftEntryKey(projectKey, entries[1].id);
+  assert.equal(drafts.useDraftStore.getState().drafts[draftKey].text, "Retry text");
+  const tree = nodes(view.inline());
+  assert.ok(tree.some(n => n.props.role === "alert" && n.props.children === "Offline"));
+  h.write = async () => {};
+  tree.find(n => n.type === "button" && n.props.children === t("common.retry")).props.onClick();
+  await settleWrites();
+  assert.equal(h.writes.length, 2);
+  assert.deepEqual(h.writes[1], h.writes[0]);
+  assert.equal(view.counts().refetched, 1);
+});
+
+for (const recovery of ["loadLatest", "overwrite"] as const) {
+  test(`inline conflicts block blur and preserve explicit ${recovery} recovery`, async () => {
+    const view = inlineHarness();
+    view.enter(); view.change("Local text");
+    h.write = async () => { throw new ApiError("409: translation changed since it was loaded"); };
+    await view.input().props.onBlur();
+    const draftKey = drafts.draftEntryKey(projectKey, entries[1].id);
+    assert.equal(drafts.useDraftStore.getState().drafts[draftKey].conflict, true);
+    view.enter(); await view.input().props.onBlur();
+    assert.equal(h.writes.length, 1, "ordinary blur never overwrites a conflict");
+    h.write = async () => {};
+    await nodes(view.inline()).find(n => n.type === "button" && n.props.children === t(`detail.${recovery}`)).props.onClick();
+    await settleWrites();
+    assert.equal(drafts.useDraftStore.getState().drafts[draftKey].conflict, false);
+    if (recovery === "loadLatest") {
+      assert.deepEqual(h.reads, [entries[1].id]);
+      assert.equal(drafts.useDraftStore.getState().drafts[draftKey].text, h.latest);
+    } else {
+      assert.deepEqual(h.writes[1].patch, { translation: "Local text" }, "explicit overwrite omits the optimistic guard");
+    }
+    assert.equal(view.counts().refetched, 1);
+  });
+}
+
+test("F2 respects disabled entry and in-flight saves; project changes cannot write a stale draft", async () => {
+  const view = inlineHarness();
+  useProjectStore.setState({ project: null });
+  assert.equal(view.button().props.disabled, true);
+  view.enter(); assert.equal(view.input(), undefined);
+  useProjectStore.setState({ project });
+  view.enter(); view.change("Project A draft");
+  const oldInput = view.input();
+  const other = { ...project, path: "C:/other" };
+  useProjectStore.setState({ project: other });
+  await oldInput.props.onBlur();
+  assert.deepEqual(h.writes, []);
+  assert.equal(view.button().props.children, "Translation");
+  assert.equal(drafts.useDraftStore.getState().drafts[drafts.draftEntryKey(projectKey, entries[1].id)].text, "Project A draft");
+  useProjectStore.setState({ project });
+  let complete!: () => void;
+  h.write = () => new Promise<void>(resolve => { complete = resolve; });
+  view.enter(); const pending = view.input().props.onBlur();
+  await Promise.resolve();
+  assert.equal(view.button().props.disabled, true);
+  view.enter(); assert.equal(view.input(), undefined);
+  complete(); await pending;
+  assert.equal(view.button().props.disabled, false);
+});
+
+test("row pointer selection still opens details and focuses the clicked row", () => {
+  let focused = 0;
+  rows(renderTable())[2].props.onClick({ currentTarget: { focus() { focused++; } } });
+  assert.equal(focused, 1);
+  assert.equal(useEditorStore.getState().selectedEntryId, entries[2].id);
+  assert.deepEqual(rows(renderTable()).map(row => row.props["aria-selected"]), [false, false, true]);
 });
 
 test("detail describes save conflicts and storage errors without dangling references", () => {
