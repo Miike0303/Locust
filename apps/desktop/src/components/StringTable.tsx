@@ -27,7 +27,7 @@ function InlineEdit({
 	onSave,
 }: {
 	entry: StringEntry;
-	onSave: () => void;
+	onSave: (saved?: StringEntry, previous?: StringEntry) => void;
 }) {
 	const [editing, setEditing] = useState(false);
 	const t = useT();
@@ -53,8 +53,8 @@ function InlineEdit({
 		if (!isCurrentProject()) return;
 		await saveDraft(draftKey, entry.translation || "", async (text, expectedTranslation) => {
 			if (!isCurrentProject()) throw new Error(t("detail.projectChanged"));
-			await patchString(entry.id, { translation: text, ...(expectedTranslation === undefined ? {} : { expected_translation: expectedTranslation }) });
-			if (isCurrentProject()) onSave();
+			const saved = await patchString(entry.id, { translation: text, ...(expectedTranslation === undefined ? {} : { expected_translation: expectedTranslation }) });
+			if (isCurrentProject()) onSave(saved, entry);
 		}, overwrite);
 	};
 
@@ -149,7 +149,7 @@ function InlineEdit({
 
 interface StringTableProps {
 	data: StringEntry[];
-	onRefetch: () => void;
+	onRefetch: (saved?: StringEntry, previous?: StringEntry) => void;
 	hasActiveFilters?: boolean;
 	tableRef?: Ref<HTMLTableElement>;
 }

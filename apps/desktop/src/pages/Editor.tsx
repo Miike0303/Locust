@@ -23,11 +23,12 @@ import {
 	validate,
 	type ProjectStats,
 	type ValidationResponse,
+	type StringEntry,
 } from "../lib/api";
 import { useEditorStore } from "../stores/editorStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useHotkey } from "../lib/hotkeys";
-import { invalidateProjectData } from "../lib/queryClient";
+import { invalidateProjectData, refreshEditedString } from "../lib/queryClient";
 import {
 	readSkipReviewPreference,
 	readWorkflowGuideDismissed,
@@ -197,7 +198,8 @@ export default function Editor() {
 		setPatchStatusRefreshKey((key) => key + 1);
 	}, []);
 
-	const handleRefetch = useCallback(() => {
+	const handleRefetch = useCallback((saved?: StringEntry, previous?: StringEntry) => {
+		if (saved && previous) return refreshEditedString(queryClient, projectKey, saved, previous);
 		return invalidateProjectData(queryClient, projectKey);
 	}, [queryClient, projectKey]);
 
