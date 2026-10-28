@@ -1,6 +1,84 @@
 use super::super::tests::{make_entry, recording_tempdir, shared_textasset_rows};
 use super::*;
 
+#[test]
+fn project_bound_entry_snapshot_rejects_replacement_with_same_row_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let path_a = dir.path().join("a.db");
+    let path_b = dir.path().join("b.db");
+    let db = Database::open(&path_a).unwrap();
+    db.save_entries(&[make_entry("shared-id", "Project A")])
+        .unwrap();
+    let other = Database::open(&path_b).unwrap();
+    other
+        .save_entries(&[make_entry("shared-id", "Project B")])
+        .unwrap();
+
+    let snapshot = db
+        .get_entry_for_project(&path_a, "shared-id")
+        .unwrap()
+        .unwrap();
+    assert!(db
+        .get_entry_for_project(&path_a, "missing")
+        .unwrap()
+        .is_none());
+    db.replace_with(other);
+    assert_eq!(snapshot.source, "Project A");
+    assert_eq!(
+        db.get_entry("shared-id").unwrap().unwrap().source,
+        "Project B"
+    );
+    assert_eq!(
+        db.get_entry_for_project(&path_a, "shared-id")
+            .unwrap_err()
+            .to_string(),
+        "project changed while reading; retry"
+    );
+    assert_eq!(
+        db.get_entry_for_project(&path_b, "shared-id")
+            .unwrap()
+            .unwrap()
+            .source,
+        "Project B"
+    );
+}
+
+#[test]
+fn project_bound_entry_snapshot_races_connection_replacement() {
+    use std::sync::Barrier;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path_a = dir.path().join("a.db");
+    let path_b = dir.path().join("b.db");
+    let db = Arc::new(Database::open(&path_a).unwrap());
+    db.save_entries(&[make_entry("shared-id", "Project A")])
+        .unwrap();
+    Database::open(&path_b)
+        .unwrap()
+        .save_entries(&[make_entry("shared-id", "Project B")])
+        .unwrap();
+
+    for _ in 0..32 {
+        db.reopen(&path_a).unwrap();
+        let replacement = Database::open(&path_b).unwrap();
+        let start = Arc::new(Barrier::new(2));
+        let reader = Arc::clone(&db);
+        let expected = path_a.clone();
+        let reading = Arc::clone(&start);
+        let snapshot = std::thread::spawn(move || {
+            reading.wait();
+            reader.get_entry_for_project(&expected, "shared-id")
+        });
+        start.wait();
+        db.replace_with(replacement);
+        match snapshot.join().unwrap() {
+            Ok(Some(entry)) => assert_eq!(entry.source, "Project A"),
+            Err(error) => assert_eq!(error.to_string(), "project changed while reading; retry"),
+            Ok(None) => panic!("both projects contain the requested row"),
+        }
+    }
+}
+
 // Retained pre-NEXT-06 implementation: both the parity oracle and benchmark
 // baseline exercise the original window query and the real row hydration.
 fn legacy_entries_page(db: &Database, filter: &EntryFilter) -> Result<(Vec<StringEntry>, usize)> {

@@ -3053,6 +3053,17 @@ mod text_fit_tests {
             usable_width_px: 56.0,
             draft_text: Some("Hola\n WWW \n".into()),
         };
+        {
+            let _operation = try_project_operation(&state).unwrap();
+            let native = apply_text_fit(&state, request.clone()).await.unwrap();
+            let (status, body) = http_estimate(&base, &request).await;
+            assert_eq!(status, 200);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap(),
+                serde_json::to_value(native).unwrap()
+            );
+            assert_eq!(snapshot(), before);
+        }
         // Same serialized request crosses both actual HTTP and the native
         // command's implementation (Tauri State constructors are private).
         for scenario in 0..5 {

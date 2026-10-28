@@ -171,31 +171,24 @@ impl Database {
 
     pub fn get_entry(&self, id: &str) -> Result<Option<StringEntry>> {
         let conn = lock_connection(&self.conn);
-        let mut stmt = conn.prepare(
-            "SELECT id, source, translation, status, file_path, context, tags, metadata, char_limit, provider_used, created_at, translated_at, reviewed_at FROM strings WHERE id = ?1",
-        )?;
-        let mut rows = stmt.query_map(params![id], |row| {
-            Ok(RawEntry {
-                id: row.get(0)?,
-                source: row.get(1)?,
-                translation: row.get(2)?,
-                status: row.get(3)?,
-                file_path: row.get(4)?,
-                context: row.get(5)?,
-                tags: row.get(6)?,
-                metadata: row.get(7)?,
-                char_limit: row.get(8)?,
-                provider_used: row.get(9)?,
-                created_at: row.get(10)?,
-                translated_at: row.get(11)?,
-                reviewed_at: row.get(12)?,
-            })
-        })?;
+        read_entry(&conn, id)
+    }
 
-        match rows.next() {
-            Some(row) => Ok(Some(raw_to_entry(row?, &conn, &mut OriginalCache::new())?)),
-            None => Ok(None),
+    /// Copy one row only if the live connection still belongs to this project.
+    /// Identity checking and row hydration share the connection mutex used by
+    /// `replace_with` (connection before path), without reserving the whole job.
+    pub fn get_entry_for_project(
+        &self,
+        database_path: &Path,
+        id: &str,
+    ) -> Result<Option<StringEntry>> {
+        let conn = lock_connection(&self.conn);
+        if self.path() != database_path {
+            return Err(LocustError::Other(anyhow::anyhow!(
+                "project changed while reading; retry"
+            )));
         }
+        read_entry(&conn, id)
     }
 
     /// Distinct `file_path` and tag values for the whole project.
@@ -1696,6 +1689,34 @@ fn raw_to_entry(
     };
     hydrate_original(conn, &mut entry, originals)?;
     Ok(entry)
+}
+
+fn read_entry(conn: &Connection, id: &str) -> Result<Option<StringEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, source, translation, status, file_path, context, tags, metadata, char_limit, provider_used, created_at, translated_at, reviewed_at FROM strings WHERE id = ?1",
+    )?;
+    let mut rows = stmt.query_map(params![id], |row| {
+        Ok(RawEntry {
+            id: row.get(0)?,
+            source: row.get(1)?,
+            translation: row.get(2)?,
+            status: row.get(3)?,
+            file_path: row.get(4)?,
+            context: row.get(5)?,
+            tags: row.get(6)?,
+            metadata: row.get(7)?,
+            char_limit: row.get(8)?,
+            provider_used: row.get(9)?,
+            created_at: row.get(10)?,
+            translated_at: row.get(11)?,
+            reviewed_at: row.get(12)?,
+        })
+    })?;
+
+    match rows.next() {
+        Some(row) => Ok(Some(raw_to_entry(row?, conn, &mut OriginalCache::new())?)),
+        None => Ok(None),
+    }
 }
 
 #[cfg(test)]
