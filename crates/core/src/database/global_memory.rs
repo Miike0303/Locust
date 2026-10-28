@@ -30,6 +30,14 @@ impl GlobalMemoryDb {
         self.db.lookup_memory(source_hash, lang_pair)
     }
 
+    pub fn lookup_memory_entry(
+        &self,
+        source_hash: &str,
+        lang_pair: &str,
+    ) -> Result<Option<MemoryEntry>> {
+        self.db.lookup_memory_entry(source_hash, lang_pair)
+    }
+
     pub async fn save_memory(
         &self,
         hash: &str,

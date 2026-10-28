@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use chrono::Utc;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 
 use crate::error::Result;
 
@@ -44,6 +44,32 @@ impl Database {
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Read an exact suggestion through the (source_hash, lang_pair) primary key.
+    pub fn lookup_memory_entry(
+        &self,
+        source_hash: &str,
+        lang_pair: &str,
+    ) -> Result<Option<MemoryEntry>> {
+        let conn = lock_connection(&self.conn);
+        Ok(conn
+            .query_row(
+                "SELECT source_hash, lang_pair, source, translation, uses, last_used
+                 FROM translation_memory WHERE source_hash = ?1 AND lang_pair = ?2",
+                params![source_hash, lang_pair],
+                |row| {
+                    Ok(MemoryEntry {
+                        source_hash: row.get(0)?,
+                        lang_pair: row.get(1)?,
+                        source: row.get(2)?,
+                        translation: row.get(3)?,
+                        uses: row.get(4)?,
+                        last_used: row.get(5)?,
+                    })
+                },
+            )
+            .optional()?)
     }
 
     pub fn lookup_memory(&self, source_hash: &str, lang_pair: &str) -> Result<Option<String>> {

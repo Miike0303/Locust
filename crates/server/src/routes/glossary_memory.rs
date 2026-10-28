@@ -167,17 +167,20 @@ fn fuzzy_suggestions(
     let source_len = entry.source.chars().count();
     let source_hash = entry.source_hash();
     let mut unique: HashMap<(String, String), MemorySuggestion> = HashMap::new();
-    for (origin, candidates) in [
+    // Exact hits bypass the fuzzy cap and still share exclusion and deduplication.
+    for (origin, exact, candidates) in [
         (
             "project",
+            project_db.lookup_memory_entry(&source_hash, lang_pair)?,
             project_db.memory_candidates(lang_pair, source_len, 3000)?,
         ),
         (
             "global",
+            global_db.lookup_memory_entry(&source_hash, lang_pair)?,
             global_db.memory_candidates(lang_pair, source_len, 3000)?,
         ),
     ] {
-        for candidate in candidates {
+        for candidate in candidates.into_iter().chain(exact) {
             let exact = candidate.source_hash == source_hash;
             if exact && entry.translation.as_deref() == Some(candidate.translation.as_str()) {
                 continue;
