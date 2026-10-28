@@ -39,6 +39,7 @@ pub(crate) async fn cmd_translate(
     concurrency: Option<usize>,
     max_batch_tokens: Option<usize>,
     no_memory: bool,
+    allow_partial: bool,
     allow_lossy_binary_fit: bool,
     fallback: Vec<String>,
     cost_limit: Option<f64>,
@@ -213,7 +214,7 @@ pub(crate) async fn cmd_translate(
         println!(
             "\n{left} strings still pending. Re-run to continue, or add --fallback <provider>."
         );
-        if batch_failed {
+        if batch_failed && !allow_partial {
             anyhow::bail!(
                 "Translation incomplete: {left} strings still pending after provider errors"
             );

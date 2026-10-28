@@ -63,6 +63,9 @@ enum Commands {
         /// Bypass translation memory (useful for provider benchmarks)
         #[arg(long)]
         no_memory: bool,
+        /// Allow pending rows after provider batch errors (for staged pipelines).
+        #[arg(long)]
+        allow_partial: bool,
         /// Allow mechanical truncation/accent folding of oversized binary text
         #[arg(long)]
         allow_lossy_binary_fit: bool,
@@ -448,6 +451,7 @@ async fn run() -> anyhow::Result<()> {
             concurrency,
             max_batch_tokens,
             no_memory,
+            allow_partial,
             allow_lossy_binary_fit,
             fallback,
             cost_limit,
@@ -463,6 +467,7 @@ async fn run() -> anyhow::Result<()> {
                 concurrency,
                 max_batch_tokens,
                 no_memory,
+                allow_partial,
                 allow_lossy_binary_fit,
                 fallback,
                 cost_limit,

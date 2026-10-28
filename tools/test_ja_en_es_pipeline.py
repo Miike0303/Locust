@@ -703,6 +703,7 @@ class OrchestratorTests(PipelineCase):
             self.assertEqual(sum(args[0] == "extract" for args in mock_cli.calls), 1)
             self.assertEqual(sum(args[0] == "pivot" for args in mock_cli.calls), 1)
             self.assertTrue(all("--no-memory" in args for args in mock_cli.calls if args[0] == "translate"))
+            self.assertTrue(all("--allow-partial" in args for args in mock_cli.calls if args[0] == "translate"))
             with self.assertRaisesRegex(pipeline.PipelineError, "Resume refused"):
                 pipeline.Pipeline(self.options(resume=True)).run()
 

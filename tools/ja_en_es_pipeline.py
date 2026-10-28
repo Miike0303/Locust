@@ -1573,9 +1573,11 @@ class Pipeline:
         self.proven_rows(path, before)
         stage = source + "-" + target
         def dispatch(name):
+            # A completed partial pass may feed validated pending-only fallback
+            # or resume. Fatal child errors still fail; readiness is gated below.
             self.command(name, ["translate", path, "-p", stage_provider(self.settings, name),
                                 "-s", source, "-t", target, "--batch-size", self.options.batch_size,
-                                "--concurrency", self.options.concurrency, "--no-memory"])
+                                "--concurrency", self.options.concurrency, "--no-memory", "--allow-partial"])
         # Even an all-seeded project gets an orderly no-work primary result.
         dispatch(stage)
         after = self.accept_changes(path, before, stage, baseline)
