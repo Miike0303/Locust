@@ -168,14 +168,41 @@ pub async fn audit_project_fonts(
     }
 }
 
-#[derive(Deserialize)]
-pub(crate) struct LangQuery {
+struct ExportQuery {
     lang: String,
+    scope: export::ExportScope,
+}
+
+impl ExportQuery {
+    fn parse(params: Vec<(String, String)>) -> Result<Self, ApiError> {
+        let value = |key| {
+            params
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+        };
+        let lang =
+            value("lang").ok_or_else(|| err(StatusCode::BAD_REQUEST, "missing field `lang`"))?;
+        let mut statuses: Vec<_> = params
+            .iter()
+            .filter(|(key, _)| key == "status")
+            .map(|(_, value)| value.clone())
+            .collect();
+        let has_status = !statuses.is_empty();
+        // A present but empty list is distinct from an omitted scope.
+        if statuses.len() == 1 && statuses[0].is_empty() {
+            statuses.clear();
+        }
+        let scope =
+            export::ExportScope::parse(value("file"), has_status.then_some(statuses.as_slice()))
+                .map_err(|message| err(StatusCode::BAD_REQUEST, message))?;
+        Ok(Self { lang, scope })
+    }
 }
 
 pub(crate) async fn export_po(
     State(state): State<Arc<AppState>>,
-    Query(q): Query<LangQuery>,
+    Query(params): Query<Vec<(String, String)>>,
 ) -> Result<(StatusCode, [(String, String); 2], String), ApiError> {
     // Export combines rows with translation-run language metadata. Both must
     // belong to the same project, even across the config-lock await below.
@@ -183,10 +210,14 @@ pub(crate) async fn export_po(
     if state.current_project.read().await.is_none() {
         return Err(err(StatusCode::BAD_REQUEST, "no project open"));
     }
-    let entries = state
-        .db
-        .get_entries(&EntryFilter::default())
+    let q = ExportQuery::parse(params)?;
+    let entries = q
+        .scope
+        .entries(&state.db)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if entries.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "no entries to export"));
+    }
     let config = state.config.read().await;
     let source = state
         .db
@@ -243,16 +274,20 @@ async fn import_po_owned(
 
 pub(crate) async fn export_xliff(
     State(state): State<Arc<AppState>>,
-    Query(q): Query<LangQuery>,
+    Query(params): Query<Vec<(String, String)>>,
 ) -> Result<(StatusCode, [(String, String); 2], String), ApiError> {
     let _guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
     if state.current_project.read().await.is_none() {
         return Err(err(StatusCode::BAD_REQUEST, "no project open"));
     }
-    let entries = state
-        .db
-        .get_entries(&EntryFilter::default())
+    let q = ExportQuery::parse(params)?;
+    let entries = q
+        .scope
+        .entries(&state.db)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if entries.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "no entries to export"));
+    }
     let config = state.config.read().await;
     let source = state
         .db

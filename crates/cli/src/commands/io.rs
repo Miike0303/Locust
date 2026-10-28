@@ -91,8 +91,6 @@ pub(crate) fn cmd_export(
     status: Vec<String>,
     file: Option<String>,
 ) -> anyhow::Result<()> {
-    use locust_core::models::StringStatus;
-
     let db = open_existing_project(&project)?;
     export::check_export_destination(&output, &project)?;
     if output.try_exists()? && !overwrite {
@@ -101,39 +99,29 @@ pub(crate) fn cmd_export(
             output.display()
         );
     }
-    let statuses = status
-        .iter()
-        .map(|state| {
-            state.parse::<StringStatus>().map_err(|_| {
-                anyhow::anyhow!(
-                    "invalid export status '{state}'; valid values: pending, translated, reviewed, approved, error"
-                )
-            })
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    // Extraction stores paths verbatim; EntryFilter uses SQL equality, keeping
-    // separators, case and dot components exactly as stored in strings.file_path.
-    let mut entries = db.get_entries(&EntryFilter {
-        file_path: file.clone(),
-        ..EntryFilter::default()
-    })?;
+    let scope = export::ExportScope::parse(
+        file.clone(),
+        (!status.is_empty()).then_some(status.as_slice()),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let entries = scope.entries(&db)?;
     if entries.is_empty() {
         if let Some(file) = file {
-            let known_files = db
-                .get_string_facets()?
-                .file_paths
-                .into_iter()
-                .take(5)
-                .collect::<Vec<_>>()
-                .join(", ");
-            anyhow::bail!("no entries to export for file '{file}'; known files: {known_files}");
+            if db.count_entries(&EntryFilter {
+                file_path: Some(file.clone()),
+                ..EntryFilter::default()
+            })? == 0
+            {
+                let known_files = db
+                    .get_string_facets()?
+                    .file_paths
+                    .into_iter()
+                    .take(5)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::bail!("no entries to export for file '{file}'; known files: {known_files}");
+            }
         }
-    }
-    // Retain the database's ID order for any union of states, including repeats.
-    if !statuses.is_empty() {
-        entries.retain(|entry| statuses.contains(&entry.status));
-    }
-    if entries.is_empty() {
         anyhow::bail!("no entries to export");
     }
 

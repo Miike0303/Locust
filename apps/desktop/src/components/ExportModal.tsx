@@ -1,12 +1,16 @@
 import { IS_TAURI } from "../lib/runtime";
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect, useId } from "react";
+import { useQuery } from "@tanstack/react-query";
 import clsx from "clsx";
 import { X, Download, Upload, FolderOpen } from "lucide-react";
 import {
 	exportTranslations,
 	importTranslations,
+	getStringFacets,
+	getFileStats,
 	type ExportFormat,
 	type ImportResult,
+	type StringStatus,
 } from "../lib/api";
 import { LANGUAGES } from "../lib/languages";
 import { useProjectStore } from "../stores/projectStore";
@@ -15,12 +19,21 @@ import { addToast } from "../stores/toastStore";
 import {
 	useModalA11y,
 	MODAL_BACKDROP_CLASS,
+	MODAL_BODY_CLASS,
 	MODAL_FOOTER_CLASS,
 	modalPanelClass,
 } from "../lib/modalA11y";
 import { useT } from "../lib/i18n";
+import { draftProjectKey, projectScopedQueryFn, useProjectScopedQueryEnabled } from "../lib/projectScope";
 
 type Mode = "export" | "import";
+const STATUSES: StringStatus[] = ["pending", "translated", "reviewed", "approved", "error"];
+
+function relativeFilePath(file: string, projectPath: string): string {
+	const path = file.replace(/\\/g, "/");
+	const root = projectPath.replace(/\\/g, "/").replace(/\/+$/, "") + "/";
+	return path.startsWith(root) ? path.slice(root.length) : path;
+}
 
 interface ExportModalProps {
 	open: boolean;
@@ -39,6 +52,35 @@ export default function ExportModal({
 	const [format, setFormat] = useState<ExportFormat>("po");
 	const [lang, setLang] = useState("es");
 	const [loading, setLoading] = useState(false);
+	const [file, setFile] = useState("");
+	const [statuses, setStatuses] = useState<StringStatus[]>(STATUSES);
+	const scopeId = useId();
+	const projectKey = project ? draftProjectKey(project) : "";
+	const scopeEnabled = useProjectScopedQueryEnabled(projectKey, open && !!project && mode === "export");
+	const facetsQuery = useQuery({
+		queryKey: ["string-facets", projectKey],
+		queryFn: projectScopedQueryFn(projectKey, () => getStringFacets()),
+		enabled: scopeEnabled,
+		staleTime: 0,
+		retry: false,
+	});
+	// The existing aggregate API counts by exact stored file and status in SQL.
+	const filesQuery = useQuery({
+		queryKey: ["file-stats", projectKey],
+		queryFn: projectScopedQueryFn(projectKey, () => getFileStats()),
+		enabled: scopeEnabled,
+		staleTime: 0,
+		retry: false,
+	});
+	useEffect(() => {
+		setFile("");
+		setStatuses(STATUSES);
+	}, [open, projectKey]);
+	const count = filesQuery.data?.filter(row => !file || row.file_path === file)
+		.reduce((sum, row) => sum + statuses.reduce((total, status) => total + row[status], 0), 0);
+	const scopePending = facetsQuery.isPending || filesQuery.isPending || filesQuery.isFetching;
+	const scopeFailed = facetsQuery.isError || filesQuery.isError;
+	const exportDisabled = loading || !scopeEnabled() || scopePending || scopeFailed || count === undefined || count === 0;
 	const fileInputRef = useRef<HTMLInputElement>(null);
 	const { dialogRef, dialogProps, titleProps } = useModalA11y({
 		open,
@@ -50,6 +92,7 @@ export default function ExportModal({
 	const defaultName = `translation_${lang}.${format === "po" ? "po" : "xliff"}`;
 
 	const handleExport = async () => {
+		if (exportDisabled) return;
 		setLoading(true);
 		try {
 			let path: string | undefined;
@@ -71,7 +114,7 @@ export default function ExportModal({
 				path = selected;
 			}
 
-			const result = await exportTranslations(format, lang, path);
+			const result = await exportTranslations(format, lang, path, { file: file || undefined, status: statuses });
 			addToast("success", t("export.toast.exported", { format: format.toUpperCase(), path: result.path }));
 			addLog(
 				"info",
@@ -172,6 +215,7 @@ export default function ExportModal({
 					</h2>
 					<button
 						onClick={onClose}
+						aria-label={t("common.close")}
 						className="text-text-muted hover:text-text"
 					>
 						<X size={20} />
@@ -203,10 +247,11 @@ export default function ExportModal({
 					</button>
 				</div>
 
-				<div className="space-y-4">
+				<div className={clsx(MODAL_BODY_CLASS, "space-y-4")}>
 					<div>
-						<label className="text-body font-medium">{t("export.format")}</label>
+						<label htmlFor={`${scopeId}-format`} className="text-body font-medium">{t("export.format")}</label>
 						<select
+							id={`${scopeId}-format`}
 							value={format}
 							onChange={(e) => setFormat(e.target.value as ExportFormat)}
 							className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
@@ -217,9 +262,56 @@ export default function ExportModal({
 					</div>
 
 					{mode === "export" && (
+						<fieldset className="space-y-3" aria-describedby={`${scopeId}-count`} disabled={loading}>
+							<legend className="text-body font-medium">{t("export.scope.title")}</legend>
+							<div>
+								<label htmlFor={`${scopeId}-file`} className="text-body font-medium">{t("export.scope.file")}</label>
+								<select
+									id={`${scopeId}-file`}
+									value={file}
+									onChange={event => setFile(event.target.value)}
+									className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
+								>
+									<option value="">{t("export.scope.allFiles")}</option>
+									{facetsQuery.data?.file_paths.map(path => (
+										<option key={path} value={path}>{relativeFilePath(path, project.path)}</option>
+									))}
+								</select>
+							</div>
+							<fieldset>
+								<legend className="text-body font-medium mb-1">{t("export.scope.status")}</legend>
+								<div className="flex flex-wrap gap-x-4 gap-y-2">
+									{STATUSES.map(status => (
+										<label key={status} className="flex items-center gap-2 text-body">
+											<input
+												type="checkbox"
+												checked={statuses.includes(status)}
+												onChange={event => {
+													const checked = event.target.checked;
+													setStatuses(previous => STATUSES.filter(value => value === status ? checked : previous.includes(value)));
+												}}
+												className="focus:outline-none focus:ring-2 focus:ring-accent-fg"
+											/>
+											{t(`filter.${status}`)}
+										</label>
+									))}
+								</div>
+							</fieldset>
+							<p id={`${scopeId}-count`} role="status" className="text-caption text-text-muted">
+								{scopeFailed ? t("export.scope.loadFailed") : scopePending || count === undefined
+									? t("export.scope.loading") : t("export.scope.count", { count })}
+							</p>
+							{!scopeFailed && !scopePending && count === 0 && (
+								<p className="text-caption text-text-muted">{t("export.scope.empty")}</p>
+							)}
+						</fieldset>
+					)}
+
+					{mode === "export" && (
 						<div>
-							<label className="text-body font-medium">{t("export.targetLang")}</label>
+							<label htmlFor={`${scopeId}-lang`} className="text-body font-medium">{t("export.targetLang")}</label>
 							<select
+								id={`${scopeId}-lang`}
 								value={lang}
 								onChange={(e) => setLang(e.target.value)}
 								className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
@@ -253,40 +345,40 @@ export default function ExportModal({
 							e.target.value = "";
 						}}
 					/>
+				</div>
 
-					<div className={clsx(MODAL_FOOTER_CLASS, "-mx-6 -mb-6")}>
-						<button
-							onClick={onClose}
-							className="px-3 py-2 text-body rounded border border-border bg-surface text-text hover:bg-surface-muted"
-						>
-							{t("common.cancel")}
-						</button>
-						<button
-							onClick={() => {
-								void (mode === "export" ? handleExport() : handleImport());
-							}}
-							disabled={loading}
-							className="flex items-center gap-1.5 px-4 py-2 text-body font-medium rounded bg-accent hover:bg-accent-hover disabled:opacity-50 text-white"
-						>
-							{loading ? (
-								mode === "export" ? (
-									t("export.exporting")
-								) : (
-									t("export.importing")
-								)
-							) : mode === "export" ? (
-								<>
-									<FolderOpen size={16} />
-									{IS_TAURI ? t("common.saveAs") : t("export.download")}
-								</>
+				<div className={clsx(MODAL_FOOTER_CLASS, "mt-4 -mx-6 -mb-6")}>
+					<button
+						onClick={onClose}
+						className="px-3 py-2 text-body rounded border border-border bg-surface text-text hover:bg-surface-muted"
+					>
+						{t("common.cancel")}
+					</button>
+					<button
+						onClick={() => {
+							void (mode === "export" ? handleExport() : handleImport());
+						}}
+						disabled={mode === "export" ? exportDisabled : loading}
+						className="flex items-center gap-1.5 px-4 py-2 text-body font-medium rounded bg-accent hover:bg-accent-hover disabled:opacity-50 text-white"
+					>
+						{loading ? (
+							mode === "export" ? (
+								t("export.exporting")
 							) : (
-								<>
-									<Upload size={16} />
-									{IS_TAURI ? t("export.chooseFile") : t("export.uploadFile")}
-								</>
-							)}
-						</button>
-					</div>
+								t("export.importing")
+							)
+						) : mode === "export" ? (
+							<>
+								<FolderOpen size={16} />
+								{IS_TAURI ? t("common.saveAs") : t("export.download")}
+							</>
+						) : (
+							<>
+								<Upload size={16} />
+								{IS_TAURI ? t("export.chooseFile") : t("export.uploadFile")}
+							</>
+						)}
+					</button>
 				</div>
 			</div>
 		</div>

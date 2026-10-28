@@ -1,5 +1,6 @@
+use crate::database::{Database, EntryFilter};
 use crate::error::{LocustError, Result};
-use crate::models::{StringEntry, STALE_TRANSLATION_METADATA_KEY};
+use crate::models::{StringEntry, StringStatus, STALE_TRANSLATION_METADATA_KEY};
 
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -7,6 +8,48 @@ use std::path::Path;
 
 mod tmx;
 pub use tmx::{export_tmx, import_tmx, tmx_units_for_batch, TmxUnit};
+
+/// Exact stored file path intersected with a union of statuses. Omitted statuses
+/// select everything; an explicitly empty list selects nothing.
+#[derive(Default)]
+pub struct ExportScope {
+    file: Option<String>,
+    statuses: Option<Vec<StringStatus>>,
+}
+
+impl ExportScope {
+    pub fn parse(
+        file: Option<String>,
+        status: Option<&[String]>,
+    ) -> std::result::Result<Self, String> {
+        let statuses = status
+            .map(|values| {
+                values
+                    .iter()
+                    .map(|value| {
+                        value.parse::<StringStatus>().map_err(|_| {
+                            format!("invalid export status '{value}'; valid values: pending, translated, reviewed, approved, error")
+                        })
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()
+            })
+            .transpose()?;
+        Ok(Self { file, statuses })
+    }
+
+    pub fn entries(&self, db: &Database) -> Result<Vec<StringEntry>> {
+        // SQL equality preserves case, separators and dot components verbatim.
+        let mut entries = db.get_entries(&EntryFilter {
+            file_path: self.file.clone(),
+            ..EntryFilter::default()
+        })?;
+        // Retaining a union keeps the original database order and cannot repeat rows.
+        if let Some(statuses) = &self.statuses {
+            entries.retain(|entry| statuses.contains(&entry.status));
+        }
+        Ok(entries)
+    }
+}
 
 // Normalize physical file line endings before decoding XML references or PO escapes.
 // XML 1.0 §2.11 requires this for the entire document, including CDATA.

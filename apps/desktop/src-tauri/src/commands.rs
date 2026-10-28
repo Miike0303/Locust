@@ -535,9 +535,11 @@ pub async fn export_translations(
     format: String,
     lang: String,
     path: String,
+    file: Option<String>,
+    status: Option<Vec<String>>,
     state: State<'_, AppStateWrapper>,
 ) -> Result<serde_json::Value, String> {
-    apply_export_translations(&state.0, format, lang, path).await
+    apply_export_translations(&state.0, format, lang, path, file, status).await
 }
 
 async fn apply_export_translations(
@@ -545,18 +547,19 @@ async fn apply_export_translations(
     format: String,
     lang: String,
     path: String,
+    file: Option<String>,
+    status: Option<Vec<String>>,
 ) -> Result<serde_json::Value, String> {
-    let default_source = s.config.read().await.default_source_lang.clone();
     let _exclusive = try_project_operation(s)?;
     if s.current_project.read().await.is_none() {
         return Err("no project open".into());
     }
-    let entries =
-        s.db.get_entries(&EntryFilter::default())
-            .map_err(|e| e.to_string())?;
+    let scope = locust_core::export::ExportScope::parse(file, status.as_deref())?;
+    let entries = scope.entries(&s.db).map_err(|e| e.to_string())?;
     if entries.is_empty() {
-        return Err("no strings in project — open a game and extract first".into());
+        return Err("no entries to export".into());
     }
+    let default_source = s.config.read().await.default_source_lang.clone();
     let source =
         s.db.resolve_export_source_lang(&lang, &default_source)
             .map_err(|e| e.to_string())?;
@@ -1850,6 +1853,8 @@ mod tests {
                     format.into(),
                     "es".into(),
                     file.to_string_lossy().into_owned(),
+                    None,
+                    None,
                 )
                 .await
                 .unwrap_err(),
@@ -1890,6 +1895,8 @@ mod tests {
                     format.into(),
                     "es".into(),
                     output.to_string_lossy().into_owned(),
+                    None,
+                    None,
                 )
                 .await
                 .unwrap_err();
@@ -1934,6 +1941,8 @@ mod tests {
             "po".into(),
             "es".into(),
             output.to_string_lossy().into_owned(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1946,6 +1955,175 @@ mod tests {
         std::fs::remove_file(&output).unwrap();
         std::fs::remove_file(&project).unwrap();
         std::fs::remove_dir(&dir).unwrap();
+    }
+
+    async fn export_scope_state() -> (tempfile::TempDir, Arc<AppState>) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = locust_server::create_test_state_with_db(&dir.path().join("project.db"));
+        *state.current_project.write().await = Some(ProjectInfo::default());
+        state.config.write().await.default_source_lang = "ja".into();
+        let rows = [
+            ("z", "story/a.rpy", StringStatus::Translated),
+            ("b", "story/a.rpy", StringStatus::Reviewed),
+            ("a", "story/a.rpy", StringStatus::Pending),
+            ("c", "story/a.rpy", StringStatus::Approved),
+            ("d", "story/a.rpy", StringStatus::Error),
+            ("e", "story/b.rpy", StringStatus::Translated),
+        ]
+        .into_iter()
+        .map(|(id, file, status)| {
+            let mut row = translated_entry(id, &format!("Source {id}"), &format!("Destino {id}"));
+            row.file_path = file.into();
+            row.status = status;
+            row
+        })
+        .collect::<Vec<_>>();
+        state.db.save_entries(&rows).unwrap();
+        (dir, state)
+    }
+
+    // Exercise the real HTTP route alongside the native command without a
+    // second HTTP client dependency. Test queries contain only ASCII URL bytes.
+    async fn http_export(base: &str, format: &str, query: &str) -> (u16, Vec<u8>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let address = base.strip_prefix("http://").unwrap();
+        let mut connection = tokio::net::TcpStream::connect(address).await.unwrap();
+        connection.write_all(format!("GET /api/export/{format}?lang=es{query} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        connection.read_to_end(&mut response).await.unwrap();
+        let split = response
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .unwrap();
+        let headers = std::str::from_utf8(&response[..split]).unwrap();
+        let status = headers.split_whitespace().nth(1).unwrap().parse().unwrap();
+        (status, response[split + 4..].to_vec())
+    }
+
+    #[tokio::test]
+    async fn export_scopes_match_http_bytes_order_and_legacy_unfiltered_output() {
+        let (dir, state) = export_scope_state().await;
+        let all = state.db.get_entries(&EntryFilter::default()).unwrap();
+        let (base, server) = locust_server::start_test_server(state.clone()).await;
+        for (file, statuses, query, ids) in [
+            (None, None, "", vec!["a", "b", "c", "d", "e", "z"]),
+            (
+                Some("story/a.rpy"),
+                None,
+                "&file=story/a.rpy",
+                vec!["a", "b", "c", "d", "z"],
+            ),
+            (
+                None,
+                Some(vec!["translated", "reviewed", "translated"]),
+                "&status=translated&status=reviewed&status=translated",
+                vec!["b", "e", "z"],
+            ),
+            (
+                Some("story/a.rpy"),
+                Some(vec!["translated", "reviewed"]),
+                "&file=story/a.rpy&status=translated&status=reviewed",
+                vec!["b", "z"],
+            ),
+            (
+                None,
+                Some(vec![
+                    "pending",
+                    "translated",
+                    "reviewed",
+                    "approved",
+                    "error",
+                ]),
+                "&status=pending&status=translated&status=reviewed&status=approved&status=error",
+                vec!["a", "b", "c", "d", "e", "z"],
+            ),
+        ] {
+            let expected: Vec<_> = all
+                .iter()
+                .filter(|row| ids.contains(&row.id.as_str()))
+                .cloned()
+                .collect();
+            for format in ["po", "xliff"] {
+                let output = dir.path().join(format!("assignment.{format}"));
+                let result = apply_export_translations(
+                    &state,
+                    format.into(),
+                    "es".into(),
+                    output.to_string_lossy().into_owned(),
+                    file.map(str::to_owned),
+                    statuses
+                        .as_ref()
+                        .map(|values| values.iter().map(|value| (*value).into()).collect()),
+                )
+                .await
+                .unwrap();
+                assert_eq!(result["entries"], expected.len());
+                let bytes = std::fs::read(&output).unwrap();
+                let legacy = if format == "po" {
+                    locust_core::export::export_po(&expected, "ja", "es")
+                } else {
+                    locust_core::export::export_xliff(&expected, "ja", "es")
+                };
+                assert_eq!(bytes, legacy.as_bytes());
+                assert_eq!(result["bytes"], bytes.len());
+                let (status, http_bytes) = http_export(&base, format, query).await;
+                assert_eq!(status, 200);
+                assert_eq!(http_bytes, bytes, "{format}: {query}");
+            }
+        }
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn export_scope_errors_match_http_and_never_create_or_replace_a_file() {
+        let (dir, state) = export_scope_state().await;
+        let (base, server) = locust_server::start_test_server(state.clone()).await;
+        for (file, statuses, query, error) in [
+            (Some("missing.rpy"), None, "&file=missing.rpy", "no entries to export"),
+            (Some("story/A.rpy"), None, "&file=story/A.rpy", "no entries to export"),
+            (Some("story/b.rpy"), Some(vec!["reviewed"]), "&file=story/b.rpy&status=reviewed", "no entries to export"),
+            (None, Some(vec![]), "&status=", "no entries to export"),
+            (None, Some(vec!["bogus"]), "&status=bogus", "invalid export status 'bogus'; valid values: pending, translated, reviewed, approved, error"),
+        ] {
+            for format in ["po", "xliff"] {
+                for existing in [false, true] {
+                    let output = dir.path().join(if existing { "existing.po" } else { "absent/assignment.po" });
+                    if existing { std::fs::write(&output, b"keep this catalog").unwrap(); }
+                    let result = apply_export_translations(&state, format.into(), "es".into(), output.to_string_lossy().into_owned(), file.map(str::to_owned), statuses.as_ref().map(|values| values.iter().map(|value| (*value).into()).collect())).await;
+                    assert_eq!(result.unwrap_err(), error);
+                    if existing {
+                        assert_eq!(std::fs::read(&output).unwrap(), b"keep this catalog");
+                    } else {
+                        assert!(!output.parent().unwrap().exists());
+                    }
+                }
+                let (status, body) = http_export(&base, format, query).await;
+                assert_eq!(status, 400);
+                assert_eq!(body, error.as_bytes());
+            }
+        }
+        let held = try_project_operation(&state).unwrap();
+        let output = dir.path().join("blocked.po");
+        for format in ["po", "xliff"] {
+            assert_eq!(
+                apply_export_translations(
+                    &state,
+                    format.into(),
+                    "es".into(),
+                    output.to_string_lossy().into_owned(),
+                    Some("story/a.rpy".into()),
+                    Some(vec!["translated".into()])
+                )
+                .await
+                .unwrap_err(),
+                locust_server::PROJECT_BUSY_MESSAGE
+            );
+            assert!(!output.exists());
+        }
+        drop(held);
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]

@@ -710,8 +710,24 @@ export const addGlossaryEntry = (entry: GlossaryEntry): Promise<void> =>
 export const deleteGlossaryEntry = (term: string, langPair: string) =>
   request<void>(`/glossary/${encodeURIComponent(term)}?lang_pair=${encodeURIComponent(langPair)}`, { method: "DELETE" });
 
-export const exportPo = (lang: string) => requestText(`/export/po?lang=${encodeURIComponent(lang)}`);
-export const exportXliff = (lang: string) => requestText(`/export/xliff?lang=${encodeURIComponent(lang)}`);
+export interface ExportScope {
+  file?: string;
+  /** Omitted means all statuses; an empty list selects no strings. */
+  status?: StringStatus[];
+}
+
+function exportQuery(lang: string, scope: ExportScope): string {
+  const params = new URLSearchParams({ lang });
+  if (scope.file !== undefined) params.set("file", scope.file);
+  if (scope.status !== undefined) {
+    if (scope.status.length === 0) params.set("status", "");
+    else for (const status of scope.status) params.append("status", status);
+  }
+  return params.toString();
+}
+
+export const exportPo = (lang: string, scope: ExportScope = {}) => requestText(`/export/po?${exportQuery(lang, scope)}`);
+export const exportXliff = (lang: string, scope: ExportScope = {}) => requestText(`/export/xliff?${exportQuery(lang, scope)}`);
 export const importPo = (content: string) =>
   trackTranslationWrite(() => request<ImportCounts>(`/import/po`, {
     method: "POST",
@@ -755,13 +771,14 @@ export interface ImportResult extends ImportCounts {
 export async function exportTranslations(
   format: ExportFormat,
   lang: string,
-  path?: string
+  path?: string,
+  scope: ExportScope = {},
 ): Promise<ExportResult> {
   if (IS_TAURI) {
     if (!path) throw new Error("path required for Tauri export");
-    return tauriInvoke<ExportResult>("export_translations", { format, lang, path });
+    return tauriInvoke<ExportResult>("export_translations", { format, lang, path, ...scope });
   }
-  const text = format === "po" ? await exportPo(lang) : await exportXliff(lang);
+  const text = format === "po" ? await exportPo(lang, scope) : await exportXliff(lang, scope);
   const filename = path?.split(/[/\\]/).pop() || `translation_${lang}.${format === "po" ? "po" : "xliff"}`;
   const blob = new Blob([text], {
     type: format === "po" ? "text/plain;charset=utf-8" : "application/xml;charset=utf-8",
