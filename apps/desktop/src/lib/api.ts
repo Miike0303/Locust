@@ -331,6 +331,23 @@ export interface MultiLangReport {
   reports: Record<string, any>;
 }
 
+/** Mirrors core::models::InjectionProvenanceReason (externally tagged). */
+export type InjectionProvenanceReason =
+  | { MalformedMetadata: { field: string } }
+  | { MissingMetadata: { field: string } }
+  | { InvalidCapacity: { encoding: string; capacity: number } }
+  | { ConflictingEncodings: { slot_encoding: string; capacity_encoding: string } }
+  | { CapacitySourceMismatch: { encoding: string; capacity: number } }
+  | { UnencodableSource: { encoding: string } }
+  | { UnsupportedTextAssetLayout: { layout: string } }
+  | "ConflictingTextAssetMetadata"
+  | { TextAssetGroupTooLarge: { max_members: number; max_original_bytes: number } }
+  | "MissingTextAssetOriginal"
+  | "TextAssetOriginalMismatch"
+  | { TextAssetOriginalExceedsCapacity: { actual: number; capacity: number } }
+  | { InvalidTextAssetOverhead: { overhead: number; original_bytes: number } }
+  | { UnsupportedTextAssetReconstruction: { layout: string } };
+
 /** Mirrors serde for core::models::ValidationKind (externally tagged). */
 export type ValidationKind =
   | { MissingPlaceholder: { placeholder: string } }
@@ -339,6 +356,7 @@ export type ValidationKind =
   | { ExceedsBinarySlot: { encoding: string; limit: number; actual: number } }
   | { UnencodableTranslation: { encoding: string } }
   | { InconsistentTranslation: { variants: number; common?: string | null } }
+  | { InvalidInjectionProvenance: { reason?: InjectionProvenanceReason | null } }
   | "EmptyTranslation"
   | "InvalidInjectionProvenance"
   | "StaleTranslation"
@@ -464,6 +482,7 @@ export function validationKindLabel(kind: ValidationKind): string {
   if ("ExceedsBinarySlot" in kind) return "ExceedsBinarySlot";
   if ("UnencodableTranslation" in kind) return "UnencodableTranslation";
   if ("InconsistentTranslation" in kind) return "InconsistentTranslation";
+  if ("InvalidInjectionProvenance" in kind) return "InvalidInjectionProvenance";
   return "Unknown";
 }
 

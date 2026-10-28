@@ -18,12 +18,15 @@ const ISSUE_ROWS: &str = "SELECT id, entry_id, message, resolved, kind AS kind_d
          ELSE (SELECT key FROM json_each(kind) LIMIT 1) END AS kind
     FROM validation_issues";
 
-// The most common translation is display data, not part of the ignored issue's
-// identity. Keep ignored rows matching after an upgrade or a new common value.
+// Display details are not part of the ignored issue's identity. Keep ignored
+// rows matching after an upgrade or changes to common translations/reasons.
 fn ignored_kind_key(kind_json: String) -> String {
     match serde_json::from_str::<ValidationKind>(&kind_json) {
         Ok(ValidationKind::InconsistentTranslation { variants, .. }) => {
             format!("InconsistentTranslation:{variants}")
+        }
+        Ok(ValidationKind::InvalidInjectionProvenance { .. }) => {
+            "InvalidInjectionProvenance".into()
         }
         _ => kind_json,
     }
@@ -193,6 +196,102 @@ mod tests {
             message: "validation message".into(),
             source: None,
         }
+    }
+
+    #[test]
+    fn validation_legacy_and_future_provenance_stay_readable() {
+        for kind in [
+            serde_json::json!("InvalidInjectionProvenance"),
+            serde_json::json!({"InvalidInjectionProvenance": {}}),
+            serde_json::json!({"InvalidInjectionProvenance": {"reason": null}}),
+            serde_json::json!({"InvalidInjectionProvenance": {"reason": "FutureReason"}}),
+            serde_json::json!({"InvalidInjectionProvenance": {"reason": {"FutureReason": {"n": 2}}}}),
+            serde_json::json!({"InvalidInjectionProvenance": {"reason": {"InvalidCapacity": {"capacity": 2}}}}),
+        ] {
+            let db = Database::open_in_memory().unwrap();
+            lock_connection(&db.conn).execute(
+                "INSERT INTO validation_issues (entry_id, kind, message, resolved) VALUES ('a', ?1, ?2, 0)",
+                params![kind.to_string(), "original English diagnostic"],
+            ).unwrap();
+            let read = db.get_validation_issues(None).unwrap();
+            assert!(matches!(
+                read[0].kind,
+                ValidationKind::InvalidInjectionProvenance { reason: None }
+            ));
+            assert_eq!(read[0].message, "original English diagnostic");
+            // The legacy unit wire form is retained for unstructured issues.
+            assert_eq!(
+                serde_json::to_value(&read[0].kind).unwrap(),
+                "InvalidInjectionProvenance"
+            );
+            let page = db.list_validation_issues(&Default::default()).unwrap();
+            assert_eq!(page.issues[0].kind, "InvalidInjectionProvenance");
+            assert_eq!(page.issues[0].kind_data, kind);
+            assert_eq!(page.issues[0].message, read[0].message);
+        }
+    }
+
+    #[tokio::test]
+    async fn validation_ignored_provenance_identity_excludes_all_reason_data() {
+        let db = Database::open_in_memory().unwrap();
+        lock_connection(&db.conn).execute(
+            "INSERT INTO validation_issues (entry_id, kind, message, resolved) VALUES ('a', ?1, 'old message', 1)",
+            [r#""InvalidInjectionProvenance""#],
+        ).unwrap();
+        for reason in [
+            serde_json::json!({"MalformedMetadata": {"field": "old"}}),
+            serde_json::json!({"MalformedMetadata": {"field": "changed"}}),
+            serde_json::json!({"InvalidCapacity": {"encoding": "utf8", "capacity": 0}}),
+            serde_json::json!({"InvalidCapacity": {"encoding": "sjis", "capacity": 10}}),
+            serde_json::json!("MissingTextAssetOriginal"),
+            serde_json::Value::Null,
+        ] {
+            let kind: ValidationKind = serde_json::from_value(serde_json::json!({
+                "InvalidInjectionProvenance": {"reason": reason}
+            }))
+            .unwrap();
+            let mut issues = [
+                issue("a", kind.clone()),
+                issue("b", kind),
+                issue("a", ValidationKind::EmptyTranslation),
+            ];
+            issues[0].message = "new English diagnostic".into();
+            db.save_validation_issues(&issues).await.unwrap();
+            let page = db
+                .list_validation_issues(&ValidationIssueFilter {
+                    include_ignored: true,
+                    ..Default::default()
+                })
+                .unwrap();
+            assert!(page.issues[0].ignored);
+            assert_eq!(page.issues[0].message, "new English diagnostic");
+            assert!(!page.issues[1].ignored);
+            assert!(!page.issues[2].ignored);
+            assert_eq!(
+                db.validation_summary().unwrap()["InvalidInjectionProvenance"],
+                ValidationKindCounts {
+                    open: 1,
+                    ignored: 1
+                }
+            );
+        }
+        // Even a future reason on a stored ignored row must keep the old key.
+        lock_connection(&db.conn)
+            .execute(
+                "UPDATE validation_issues SET kind = ?1 WHERE entry_id = 'a' AND resolved = 1",
+                [r#"{"InvalidInjectionProvenance":{"reason":{"FutureReason":{"n":2}}}}"#],
+            )
+            .unwrap();
+        db.save_validation_issues(&[issue(
+            "a",
+            ValidationKind::InvalidInjectionProvenance { reason: None },
+        )])
+        .await
+        .unwrap();
+        assert_eq!(
+            db.validation_summary().unwrap()["InvalidInjectionProvenance"].ignored,
+            1
+        );
     }
 
     #[tokio::test]

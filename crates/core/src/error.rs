@@ -1,5 +1,25 @@
 use thiserror::Error;
 
+/// Structured QA detail travels with the original, readable diagnostic.
+#[derive(Error, Clone, Debug)]
+#[error("{message}")]
+pub struct InjectionProvenanceError {
+    pub reason: crate::models::InjectionProvenanceReason,
+    pub message: String,
+}
+
+impl InjectionProvenanceError {
+    pub(crate) fn new(
+        reason: crate::models::InjectionProvenanceReason,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            reason,
+            message: message.into(),
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum LocustError {
     #[error("unsupported format: {0}")]
@@ -10,6 +30,9 @@ pub enum LocustError {
 
     #[error("injection error: {0}")]
     InjectionError(String),
+
+    #[error(transparent)]
+    InjectionProvenance(#[from] InjectionProvenanceError),
 
     #[error("provider error: {0}")]
     ProviderError(String),

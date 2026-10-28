@@ -12,8 +12,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::error::{LocustError, Result};
-use crate::models::{StringEntry, TextAssetOriginal, ValidationIssue, ValidationKind};
+use crate::error::{InjectionProvenanceError, LocustError, Result};
+use crate::models::{
+    InjectionProvenanceReason, StringEntry, TextAssetOriginal, ValidationIssue, ValidationKind,
+};
 
 pub const GROUP_ID_KEY: &str = "textasset_group_id";
 pub const GROUP_KIND_KEY: &str = "textasset_group_kind";
@@ -108,22 +110,45 @@ pub fn original_textasset(entry: &StringEntry) -> Option<&str> {
 pub fn shared_original(
     entry: &StringEntry,
 ) -> std::result::Result<Option<Arc<TextAssetOriginal>>, String> {
+    shared_original_checked(entry).map_err(|error| error.to_string())
+}
+
+fn shared_original_checked(
+    entry: &StringEntry,
+) -> std::result::Result<Option<Arc<TextAssetOriginal>>, InjectionProvenanceError> {
+    let malformed = |field: &str, message: &str| {
+        InjectionProvenanceError::new(
+            InjectionProvenanceReason::MalformedMetadata {
+                field: field.into(),
+            },
+            message,
+        )
+    };
     let original = match &entry.textasset_original {
         Some(original) => Some(Arc::clone(original)),
         None => match entry.metadata.get(GROUP_ORIGINAL_KEY) {
-            Some(value) => Some(Arc::new(TextAssetOriginal::new(
-                value.as_str().ok_or("malformed TextAsset original")?,
-            )?)),
+            Some(value) => Some(Arc::new(
+                TextAssetOriginal::new(value.as_str().ok_or_else(|| {
+                    malformed(GROUP_ORIGINAL_KEY, "malformed TextAsset original")
+                })?)
+                .map_err(|message| malformed(GROUP_ORIGINAL_KEY, &message))?,
+            )),
             None => None,
         },
     };
     if let Some(value) = entry.metadata.get(GROUP_ORIGINAL_REF_KEY) {
-        let reference = value
-            .as_str()
-            .ok_or("malformed TextAsset original reference")?;
-        let original = original
-            .as_ref()
-            .ok_or("missing shared TextAsset original; reload from its project database")?;
+        let reference = value.as_str().ok_or_else(|| {
+            malformed(
+                GROUP_ORIGINAL_REF_KEY,
+                "malformed TextAsset original reference",
+            )
+        })?;
+        let original = original.as_ref().ok_or_else(|| {
+            InjectionProvenanceError::new(
+                InjectionProvenanceReason::MissingTextAssetOriginal,
+                "missing shared TextAsset original; reload from its project database",
+            )
+        })?;
         if reference != original.sha256()
             || entry
                 .metadata
@@ -131,16 +156,25 @@ pub fn shared_original(
                 .and_then(|value| value.as_u64())
                 != Some(original.text().len() as u64)
         {
-            return Err(
-                "shared TextAsset original digest or length does not match metadata".into(),
-            );
+            return Err(InjectionProvenanceError::new(
+                InjectionProvenanceReason::TextAssetOriginalMismatch,
+                "shared TextAsset original digest or length does not match metadata",
+            ));
         }
     } else if entry.metadata.contains_key(GROUP_ORIGINAL_BYTES_KEY) {
-        return Err("TextAsset original length has no digest reference".into());
+        return Err(InjectionProvenanceError::new(
+            InjectionProvenanceReason::MissingMetadata {
+                field: GROUP_ORIGINAL_REF_KEY.into(),
+            },
+            "TextAsset original length has no digest reference",
+        ));
     }
     if let (Some(original), Some(legacy)) = (&original, entry.metadata.get(GROUP_ORIGINAL_KEY)) {
         if legacy.as_str() != Some(original.text()) {
-            return Err("conflicting inline and shared TextAsset originals".into());
+            return Err(InjectionProvenanceError::new(
+                InjectionProvenanceReason::ConflictingTextAssetMetadata,
+                "conflicting inline and shared TextAsset originals",
+            ));
         }
     }
     Ok(original)
@@ -196,10 +230,16 @@ fn automatic_group_too_large_message() -> String {
     )
 }
 
-fn too_large_error(entry_id: &str) -> String {
-    format!(
-        "entry '{entry_id}': {}",
-        automatic_group_too_large_message()
+fn too_large_error(entry_id: &str) -> InjectionProvenanceError {
+    InjectionProvenanceError::new(
+        InjectionProvenanceReason::TextAssetGroupTooLarge {
+            max_members: MAX_GROUP_MEMBERS,
+            max_original_bytes: MAX_GROUP_ORIGINAL_BYTES,
+        },
+        format!(
+            "entry '{entry_id}': {}",
+            automatic_group_too_large_message()
+        ),
     )
 }
 
@@ -208,10 +248,23 @@ fn group_exceeds_automatic_bounds(original_len: usize, member_count: usize) -> b
 }
 
 pub fn parse_group_meta(entry: &StringEntry) -> std::result::Result<GroupMeta, String> {
+    parse_group_meta_checked(entry).map_err(|error| error.to_string())
+}
+
+fn parse_group_meta_checked(
+    entry: &StringEntry,
+) -> std::result::Result<GroupMeta, InjectionProvenanceError> {
     if !is_grouped_entry(entry) {
-        return Err(format!(
-            "entry '{}' is not a grouped Unity TextAsset row",
-            entry.id
+        return Err(InjectionProvenanceError::new(
+            InjectionProvenanceReason::UnsupportedTextAssetLayout {
+                layout: entry
+                    .metadata
+                    .get("extraction_method")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .into(),
+            },
+            format!("entry '{}' is not a grouped Unity TextAsset row", entry.id),
         ));
     }
     if entry.metadata.contains_key(GROUP_ERROR_KEY) {
@@ -223,29 +276,44 @@ pub fn parse_group_meta(entry: &StringEntry) -> std::result::Result<GroupMeta, S
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let Some(kind_from_method) = GroupKind::from_extraction_method(method) else {
-        return Err(format!(
-            "entry '{}' has unsupported grouped TextAsset layout '{method}'",
-            entry.id
+        return Err(InjectionProvenanceError::new(
+            InjectionProvenanceReason::UnsupportedTextAssetLayout {
+                layout: method.into(),
+            },
+            format!(
+                "entry '{}' has unsupported grouped TextAsset layout '{method}'",
+                entry.id
+            ),
         ));
     };
     let kind = match entry.metadata.get(GROUP_KIND_KEY).and_then(|v| v.as_str()) {
         Some(value) => GroupKind::from_meta(value).ok_or_else(|| {
-            format!(
-                "entry '{}' has unsupported {} '{value}'",
-                entry.id, GROUP_KIND_KEY
+            InjectionProvenanceError::new(
+                InjectionProvenanceReason::UnsupportedTextAssetLayout {
+                    layout: value.into(),
+                },
+                format!(
+                    "entry '{}' has unsupported {} '{value}'",
+                    entry.id, GROUP_KIND_KEY
+                ),
             )
         })?,
         None => {
-            return Err(format!(
+            return Err(InjectionProvenanceError::new(
+                InjectionProvenanceReason::MissingMetadata {
+                    field: GROUP_KIND_KEY.into(),
+                },
+                format!(
                 "entry '{}' is missing {GROUP_KIND_KEY}; cannot verify shared TextAsset capacity",
                 entry.id
+            ),
             ))
         }
     };
     if kind != kind_from_method {
-        return Err(format!(
-            "entry '{}' has conflicting TextAsset group kinds",
-            entry.id
+        return Err(InjectionProvenanceError::new(
+            InjectionProvenanceReason::ConflictingTextAssetMetadata,
+            format!("entry '{}' has conflicting TextAsset group kinds", entry.id),
         ));
     }
     let id = entry
@@ -254,37 +322,58 @@ pub fn parse_group_meta(entry: &StringEntry) -> std::result::Result<GroupMeta, S
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
-            format!(
-                "entry '{}' is missing {GROUP_ID_KEY}; cannot verify shared TextAsset capacity",
-                entry.id
+            InjectionProvenanceError::new(
+                InjectionProvenanceReason::MissingMetadata {
+                    field: GROUP_ID_KEY.into(),
+                },
+                format!(
+                    "entry '{}' is missing {GROUP_ID_KEY}; cannot verify shared TextAsset capacity",
+                    entry.id
+                ),
             )
         })?
         .to_string();
     let capacity = meta_usize(entry, GROUP_CAPACITY_KEY).ok_or_else(|| {
-        format!(
-            "entry '{}' is missing {GROUP_CAPACITY_KEY}; cannot verify shared TextAsset capacity",
-            entry.id
+        InjectionProvenanceError::new(
+            InjectionProvenanceReason::MissingMetadata { field: GROUP_CAPACITY_KEY.into() },
+            format!(
+                "entry '{}' is missing {GROUP_CAPACITY_KEY}; cannot verify shared TextAsset capacity",
+                entry.id
+            ),
         )
     })?;
     if capacity == 0 {
-        return Err(format!(
-            "entry '{}' has invalid shared TextAsset capacity",
-            entry.id
+        return Err(InjectionProvenanceError::new(
+            InjectionProvenanceReason::InvalidCapacity {
+                encoding: "utf8".into(),
+                capacity,
+            },
+            format!("entry '{}' has invalid shared TextAsset capacity", entry.id),
         ));
     }
     let member_count = meta_usize(entry, GROUP_MEMBER_COUNT_KEY)
         .filter(|count| *count > 0)
-        .ok_or_else(|| format!("entry '{}' has invalid {GROUP_MEMBER_COUNT_KEY}", entry.id))?;
+        .ok_or_else(|| {
+            InjectionProvenanceError::new(
+                InjectionProvenanceReason::MalformedMetadata {
+                    field: GROUP_MEMBER_COUNT_KEY.into(),
+                },
+                format!("entry '{}' has invalid {GROUP_MEMBER_COUNT_KEY}", entry.id),
+            )
+        })?;
     if member_count > MAX_GROUP_MEMBERS {
         return Err(too_large_error(&entry.id));
     }
     if original_textasset(entry).is_some_and(|text| text.len() > MAX_GROUP_ORIGINAL_BYTES) {
         return Err(too_large_error(&entry.id));
     }
-    let shared = shared_original(entry)?.ok_or_else(|| {
-        format!(
-            "entry '{}' is missing {GROUP_ORIGINAL_KEY}; cannot reconstruct the shared blob",
-            entry.id
+    let shared = shared_original_checked(entry)?.ok_or_else(|| {
+        InjectionProvenanceError::new(
+            InjectionProvenanceReason::MissingTextAssetOriginal,
+            format!(
+                "entry '{}' is missing {GROUP_ORIGINAL_KEY}; cannot reconstruct the shared blob",
+                entry.id
+            ),
         )
     })?;
     let original_ref = shared.text();
@@ -292,22 +381,37 @@ pub fn parse_group_meta(entry: &StringEntry) -> std::result::Result<GroupMeta, S
         return Err(too_large_error(&entry.id));
     }
     if original_ref.len() > capacity {
-        return Err(format!(
-            "entry '{}' shared TextAsset original length {} exceeds capacity {capacity}",
-            entry.id,
-            original_ref.len()
+        return Err(InjectionProvenanceError::new(
+            InjectionProvenanceReason::TextAssetOriginalExceedsCapacity {
+                actual: original_ref.len(),
+                capacity,
+            },
+            format!(
+                "entry '{}' shared TextAsset original length {} exceeds capacity {capacity}",
+                entry.id,
+                original_ref.len()
+            ),
         ));
     }
     let overhead = meta_usize(entry, GROUP_OVERHEAD_KEY).ok_or_else(|| {
-        format!(
-            "entry '{}' is missing {GROUP_OVERHEAD_KEY}; cannot compute reconstruction overhead",
-            entry.id
+        InjectionProvenanceError::new(
+            InjectionProvenanceReason::MissingMetadata { field: GROUP_OVERHEAD_KEY.into() },
+            format!(
+                "entry '{}' is missing {GROUP_OVERHEAD_KEY}; cannot compute reconstruction overhead",
+                entry.id
+            ),
         )
     })?;
     if overhead > original_ref.len() {
-        return Err(format!(
-            "entry '{}' has reconstruction overhead larger than the original blob",
-            entry.id
+        return Err(InjectionProvenanceError::new(
+            InjectionProvenanceReason::InvalidTextAssetOverhead {
+                overhead,
+                original_bytes: original_ref.len(),
+            },
+            format!(
+                "entry '{}' has reconstruction overhead larger than the original blob",
+                entry.id
+            ),
         ));
     }
     let original = shared.shared_text();
@@ -328,9 +432,9 @@ pub fn require_valid_metadata(entry: &StringEntry) -> Result<()> {
     if !is_grouped_entry(entry) {
         return Ok(());
     }
-    parse_group_meta(entry)
+    parse_group_meta_checked(entry)
         .map(|_| ())
-        .map_err(|message| LocustError::Other(anyhow::anyhow!(message)))
+        .map_err(LocustError::from)
 }
 
 pub fn attach_to_entries(
@@ -404,7 +508,14 @@ pub fn patch_from_entry<'a>(
     entry: &'a StringEntry,
     translation: &'a str,
 ) -> std::result::Result<CellPatch<'a>, String> {
-    let physical = entry.injection_source()?;
+    patch_from_entry_checked(entry, translation).map_err(|error| error.to_string())
+}
+
+fn patch_from_entry_checked<'a>(
+    entry: &'a StringEntry,
+    translation: &'a str,
+) -> std::result::Result<CellPatch<'a>, InjectionProvenanceError> {
+    let physical = entry.injection_source_checked()?;
     Ok(CellPatch {
         entry_id: &entry.id,
         physical_source: physical,
@@ -638,7 +749,9 @@ pub fn group_validation_issues(entries: &[StringEntry]) -> Vec<ValidationIssue> 
             for entry in members {
                 issues.push(ValidationIssue {
                     entry_id: entry.id.clone(),
-                    kind: ValidationKind::InvalidInjectionProvenance,
+                    kind: ValidationKind::InvalidInjectionProvenance {
+                        reason: Some(InjectionProvenanceReason::ConflictingTextAssetMetadata),
+                    },
                     message: format!(
                         "entry '{}' has conflicting shared TextAsset group metadata",
                         entry.id
@@ -656,12 +769,14 @@ pub fn group_validation_issues(entries: &[StringEntry]) -> Vec<ValidationIssue> 
             if translation.is_empty() || translation == entry.source {
                 continue;
             }
-            match patch_from_entry(entry, translation) {
+            match patch_from_entry_checked(entry, translation) {
                 Ok(patch) => patches.push(patch),
-                Err(message) => issues.push(ValidationIssue {
+                Err(error) => issues.push(ValidationIssue {
                     entry_id: entry.id.clone(),
-                    kind: ValidationKind::InvalidInjectionProvenance,
-                    message,
+                    message: error.to_string(),
+                    kind: ValidationKind::InvalidInjectionProvenance {
+                        reason: Some(error.reason),
+                    },
                     source: None,
                 }),
             }
@@ -675,7 +790,11 @@ pub fn group_validation_issues(entries: &[StringEntry]) -> Vec<ValidationIssue> 
                 if *reason == "error" {
                     issues.push(ValidationIssue {
                         entry_id: id.clone(),
-                        kind: ValidationKind::InvalidInjectionProvenance,
+                        kind: ValidationKind::InvalidInjectionProvenance {
+                            reason: Some(InjectionProvenanceReason::UnsupportedTextAssetReconstruction {
+                                layout: meta.kind.as_str().into(),
+                            }),
+                        },
                         message: format!(
                             "entry '{id}' cannot be reconstructed into the supported TextAsset layout"
                         ),
@@ -1303,7 +1422,11 @@ mod tests {
             assert_eq!(issues[0].entry_id, "a");
             assert!(matches!(
                 issues[0].kind,
-                ValidationKind::InvalidInjectionProvenance
+                ValidationKind::InvalidInjectionProvenance {
+                    reason: Some(
+                        InjectionProvenanceReason::UnsupportedTextAssetReconstruction { .. }
+                    ),
+                }
             ));
             assert_eq!(
                 issues[0].message,

@@ -3,8 +3,10 @@ use std::collections::{BTreeMap, HashMap};
 use serde::{Deserialize, Serialize};
 
 use crate::database::Database;
-use crate::error::Result;
-use crate::models::{StringEntry, StringStatus, ValidationIssue, ValidationKind};
+use crate::error::{InjectionProvenanceError, LocustError, Result};
+use crate::models::{
+    InjectionProvenanceReason, StringEntry, StringStatus, ValidationIssue, ValidationKind,
+};
 
 pub struct Validator;
 
@@ -121,58 +123,50 @@ pub fn unencodable_translation_issue(entry: &StringEntry) -> Option<ValidationIs
 /// because injection validates and pads their rebuilt blob as one unit.
 /// Whole-blob capacity lives in `textasset_group_*` metadata, never here.
 pub fn binary_slot_budget(entry: &StringEntry) -> Result<Option<(String, usize)>> {
-    let source = entry
-        .injection_source()
-        .map_err(|message| crate::error::LocustError::Other(anyhow::anyhow!(message)))?;
+    let source = entry.injection_source_checked()?;
     let grouped = crate::textasset_group::is_grouped_entry(entry);
-    let explicit_capacity = entry
-        .injection_capacity()
-        .map_err(|message| crate::error::LocustError::Other(anyhow::anyhow!(message)))?;
-    if grouped {
-        if let Some((encoding, bytes)) = explicit_capacity {
-            if bytes == 0 || encoded_byte_len(encoding, "").is_none() {
-                return Err(crate::error::LocustError::Other(anyhow::anyhow!(
-                    "entry '{}' has invalid immutable binary capacity",
-                    entry.id
-                )));
-            }
-            if entry
-                .metadata
-                .get("binary_slot")
-                .and_then(|v| v.as_str())
-                .is_some_and(|slot| slot != encoding)
-            {
-                return Err(crate::error::LocustError::Other(anyhow::anyhow!(
-                    "entry '{}' has conflicting binary slot encodings",
-                    entry.id
-                )));
-            }
-        }
-        return Ok(None);
-    }
+    let explicit_capacity = entry.injection_capacity_checked()?;
     if let Some((encoding, bytes)) = explicit_capacity {
         if bytes == 0 || encoded_byte_len(encoding, "").is_none() {
-            return Err(crate::error::LocustError::Other(anyhow::anyhow!(
-                "entry '{}' has invalid immutable binary capacity",
-                entry.id
-            )));
+            return Err(InjectionProvenanceError::new(
+                InjectionProvenanceReason::InvalidCapacity {
+                    encoding: encoding.into(),
+                    capacity: bytes,
+                },
+                format!("entry '{}' has invalid immutable binary capacity", entry.id),
+            )
+            .into());
         }
-        if entry
+        if let Some(slot) = entry
             .metadata
             .get("binary_slot")
             .and_then(|v| v.as_str())
-            .is_some_and(|slot| slot != encoding)
+            .filter(|slot| *slot != encoding)
         {
-            return Err(crate::error::LocustError::Other(anyhow::anyhow!(
-                "entry '{}' has conflicting binary slot encodings",
-                entry.id
-            )));
+            return Err(InjectionProvenanceError::new(
+                InjectionProvenanceReason::ConflictingEncodings {
+                    slot_encoding: slot.into(),
+                    capacity_encoding: encoding.into(),
+                },
+                format!("entry '{}' has conflicting binary slot encodings", entry.id),
+            )
+            .into());
+        }
+        if grouped {
+            return Ok(None);
         }
         if encoded_byte_len(encoding, source) != Some(bytes) {
-            return Err(crate::error::LocustError::Other(anyhow::anyhow!(
-                "entry '{}' has binary capacity inconsistent with its physical source",
-                entry.id
-            )));
+            return Err(InjectionProvenanceError::new(
+                InjectionProvenanceReason::CapacitySourceMismatch {
+                    encoding: encoding.into(),
+                    capacity: bytes,
+                },
+                format!(
+                    "entry '{}' has binary capacity inconsistent with its physical source",
+                    entry.id
+                ),
+            )
+            .into());
         }
         let capacity = if encoding == "utf8" {
             crate::textasset_group::structural_textasset_capacity(entry).unwrap_or(bytes)
@@ -181,6 +175,9 @@ pub fn binary_slot_budget(entry: &StringEntry) -> Result<Option<(String, usize)>
         };
         return Ok(Some((encoding.to_string(), capacity)));
     }
+    if grouped {
+        return Ok(None);
+    }
     if let Some(capacity) = crate::textasset_group::structural_textasset_capacity(entry) {
         return Ok(Some(("utf8".to_owned(), capacity)));
     }
@@ -188,10 +185,15 @@ pub fn binary_slot_budget(entry: &StringEntry) -> Result<Option<(String, usize)>
         return Ok(None);
     };
     let bytes = encoded_byte_len(encoding, source).ok_or_else(|| {
-        crate::error::LocustError::Other(anyhow::anyhow!(
-            "entry '{}' binary source cannot be encoded as {encoding}",
-            entry.id
-        ))
+        InjectionProvenanceError::new(
+            InjectionProvenanceReason::UnencodableSource {
+                encoding: encoding.into(),
+            },
+            format!(
+                "entry '{}' binary source cannot be encoded as {encoding}",
+                entry.id
+            ),
+        )
     })?;
     Ok(Some((encoding.to_string(), bytes)))
 }
@@ -473,6 +475,20 @@ fn truncate_to_encoded_budget(encoding: &str, budget: usize, text: &str) -> Opti
     }
 }
 
+fn invalid_provenance_issue(entry: &StringEntry, error: &LocustError) -> ValidationIssue {
+    ValidationIssue {
+        entry_id: entry.id.clone(),
+        kind: ValidationKind::InvalidInjectionProvenance {
+            reason: match error {
+                LocustError::InjectionProvenance(error) => Some(error.reason.clone()),
+                _ => None,
+            },
+        },
+        message: error.to_string(),
+        source: None,
+    }
+}
+
 impl Validator {
     pub fn validate_entry(entry: &StringEntry) -> Vec<ValidationIssue> {
         let mut issues = Vec::new();
@@ -487,20 +503,10 @@ impl Validator {
         let translation = entry.translation.as_deref().unwrap_or("");
         let slot_budget = binary_slot_budget(entry);
         if let Err(error) = &slot_budget {
-            issues.push(ValidationIssue {
-                entry_id: entry.id.clone(),
-                kind: ValidationKind::InvalidInjectionProvenance,
-                message: error.to_string(),
-                source: None,
-            });
+            issues.push(invalid_provenance_issue(entry, error));
         }
         if let Err(error) = crate::textasset_group::require_valid_metadata(entry) {
-            issues.push(ValidationIssue {
-                entry_id: entry.id.clone(),
-                kind: ValidationKind::InvalidInjectionProvenance,
-                message: error.to_string(),
-                source: None,
-            });
+            issues.push(invalid_provenance_issue(entry, &error));
         }
 
         // Check 1 — EmptyTranslation
@@ -542,7 +548,7 @@ impl Validator {
         }
 
         // Check 4 — Controls must agree with semantic AND physical sources.
-        match entry.translation_control_mismatches() {
+        match entry.translation_control_mismatches_checked() {
             Ok(mismatches) => {
                 for m in mismatches {
                     let kind = match m.kind {
@@ -574,12 +580,7 @@ impl Validator {
                     });
                 }
             }
-            Err(message) => issues.push(ValidationIssue {
-                entry_id: entry.id.clone(),
-                kind: ValidationKind::InvalidInjectionProvenance,
-                message,
-                source: None,
-            }),
+            Err(error) => issues.push(invalid_provenance_issue(entry, &error.into())),
         }
 
         // Representability is independent of binary-slot capacity and never
@@ -656,7 +657,7 @@ impl Validator {
                 ValidationKind::EmptyTranslation => "EmptyTranslation",
                 ValidationKind::IdenticalToSource => "IdenticalToSource",
                 ValidationKind::InconsistentTranslation { .. } => "InconsistentTranslation",
-                ValidationKind::InvalidInjectionProvenance => "InvalidInjectionProvenance",
+                ValidationKind::InvalidInjectionProvenance { .. } => "InvalidInjectionProvenance",
                 ValidationKind::StaleTranslation => "StaleTranslation",
             };
             *by_kind.entry(kind_name.to_string()).or_insert(0) += 1;
@@ -838,7 +839,8 @@ mod tests {
         assert_eq!(binary_slot_budget(&entry).unwrap(), None);
         assert!(!Validator::validate_entry(&entry).iter().any(|i| matches!(
             i.kind,
-            ValidationKind::ExceedsBinarySlot { .. } | ValidationKind::InvalidInjectionProvenance
+            ValidationKind::ExceedsBinarySlot { .. }
+                | ValidationKind::InvalidInjectionProvenance { .. }
         )));
     }
 
@@ -889,7 +891,7 @@ mod tests {
         assert!(binary_slot_budget(&entry).unwrap().is_none());
         assert!(Validator::validate_entry(&entry)
             .iter()
-            .any(|i| matches!(i.kind, ValidationKind::InvalidInjectionProvenance)));
+            .any(|i| matches!(i.kind, ValidationKind::InvalidInjectionProvenance { .. })));
     }
 
     #[test]
@@ -933,7 +935,10 @@ mod tests {
         assert!(binary_slot_budget(&entry).is_err());
         assert!(Validator::validate_entry(&entry)
             .iter()
-            .any(|issue| matches!(issue.kind, ValidationKind::InvalidInjectionProvenance)));
+            .any(|issue| matches!(
+                issue.kind,
+                ValidationKind::InvalidInjectionProvenance { .. }
+            )));
 
         entry.metadata.insert(
             crate::models::INJECTION_SOURCE_METADATA_KEY.into(),

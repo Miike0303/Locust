@@ -17,6 +17,7 @@ const cases = [
   [{ InconsistentTranslation: { variants: 2, common: "Guardar" } }, "InconsistentTranslation", "validate.kind.inconsistentLabel"],
   ["StaleTranslation", "StaleTranslation", "validate.kind.staleLabel"],
   ["InvalidInjectionProvenance", "InvalidInjectionProvenance", "validate.kind.provenanceLabel"],
+  [{ InvalidInjectionProvenance: { reason: "MissingTextAssetOriginal" } }, "InvalidInjectionProvenance", "validate.kind.provenanceLabel"],
 ] satisfies [ValidationKind, string, string][];
 
 (globalThis as any).window = {};
@@ -132,6 +133,48 @@ const messageCases: [ValidationKind, string, string][] = [
   ["StaleTranslation",
     "Translate this entry again or mark it reviewed/approved before injecting or pivoting it.",
     "Traduce esta entrada de nuevo o márcala como revisada/aprobada antes de insertarla o pivotarla."],
+  [{ InvalidInjectionProvenance: { reason: { MalformedMetadata: { field: "locust_injection_source" } } } },
+    "Injection metadata “locust_injection_source” is invalid. Extract this entry again before injection.",
+    "Los metadatos de inserción «locust_injection_source» no son válidos. Extrae esta entrada de nuevo antes de insertarla."],
+  [{ InvalidInjectionProvenance: { reason: { MissingMetadata: { field: "textasset_group_capacity" } } } },
+    "Injection metadata “textasset_group_capacity” is missing. Extract this entry again before injection.",
+    "Faltan los metadatos de inserción «textasset_group_capacity». Extrae esta entrada de nuevo antes de insertarla."],
+  [{ InvalidInjectionProvenance: { reason: { InvalidCapacity: { encoding: "utf8", capacity: 0 } } } },
+    "The recorded injection capacity (0 bytes, utf8) is invalid. Extract this entry again.",
+    "La capacidad de inserción registrada (0 bytes, utf8) no es válida. Extrae esta entrada de nuevo."],
+  [{ InvalidInjectionProvenance: { reason: { ConflictingEncodings: { slot_encoding: "utf8", capacity_encoding: "utf16le" } } } },
+    "The binary slot uses utf8, but its recorded capacity uses utf16le. Extract this entry again.",
+    "El hueco binario usa utf8, pero su capacidad registrada usa utf16le. Extrae esta entrada de nuevo."],
+  [{ InvalidInjectionProvenance: { reason: { CapacitySourceMismatch: { encoding: "utf8", capacity: 100 } } } },
+    "The recorded capacity (100 bytes, utf8) does not match the physical source. Extract this entry again.",
+    "La capacidad registrada (100 bytes, utf8) no coincide con el original físico. Extrae esta entrada de nuevo."],
+  [{ InvalidInjectionProvenance: { reason: { UnencodableSource: { encoding: "sjis" } } } },
+    "The physical source cannot be encoded as sjis. Check its encoding and extract this entry again.",
+    "El original físico no se puede codificar en sjis. Comprueba su codificación y extrae esta entrada de nuevo."],
+  [{ InvalidInjectionProvenance: { reason: { UnsupportedTextAssetLayout: { layout: "future_layout" } } } },
+    "The TextAsset layout “future_layout” is unsupported. Extract it with a supported layout before injection.",
+    "El formato de TextAsset «future_layout» no es compatible. Extráelo con un formato compatible antes de insertarlo."],
+  [{ InvalidInjectionProvenance: { reason: "ConflictingTextAssetMetadata" } },
+    "This TextAsset has conflicting metadata. Extract the TextAsset again.",
+    "Este TextAsset tiene metadatos contradictorios. Extrae el TextAsset de nuevo."],
+  [{ InvalidInjectionProvenance: { reason: { TextAssetGroupTooLarge: { max_members: 16384, max_original_bytes: 1048576 } } } },
+    "Automatic TextAsset reconstruction supports at most 16384 entries and 1048576 original bytes. Use a supported smaller group; this is a shared limit.",
+    "La reconstrucción automática de TextAsset admite como máximo 16384 entradas y 1048576 bytes originales. Usa un grupo más pequeño compatible; este límite es compartido."],
+  [{ InvalidInjectionProvenance: { reason: "MissingTextAssetOriginal" } },
+    "The original shared TextAsset is missing. Reload its project database or extract it again.",
+    "Falta el TextAsset original compartido. Vuelve a cargar la base de datos de su proyecto o extráelo de nuevo."],
+  [{ InvalidInjectionProvenance: { reason: "TextAssetOriginalMismatch" } },
+    "The original shared TextAsset does not match its recorded digest or length. Reload its project database or extract it again.",
+    "El TextAsset original compartido no coincide con su resumen criptográfico o longitud registrados. Vuelve a cargar la base de datos de su proyecto o extráelo de nuevo."],
+  [{ InvalidInjectionProvenance: { reason: { TextAssetOriginalExceedsCapacity: { actual: 25, capacity: 20 } } } },
+    "The original TextAsset uses 25 bytes, exceeding its recorded capacity of 20 bytes. Extract it again.",
+    "El TextAsset original ocupa 25 bytes y supera su capacidad registrada de 20 bytes. Extráelo de nuevo."],
+  [{ InvalidInjectionProvenance: { reason: { InvalidTextAssetOverhead: { overhead: 30, original_bytes: 25 } } } },
+    "The recorded TextAsset overhead (30 bytes) exceeds the original blob (25 bytes). Extract it again.",
+    "La sobrecarga registrada del TextAsset (30 bytes) supera el bloque original (25 bytes). Extráelo de nuevo."],
+  [{ InvalidInjectionProvenance: { reason: { UnsupportedTextAssetReconstruction: { layout: "loc_line" } } } },
+    "The translation cannot be reconstructed into the TextAsset layout “loc_line”. Remove unsupported separators or line breaks.",
+    "La traducción no se puede reconstruir en el formato de TextAsset «loc_line». Elimina los separadores o saltos de línea incompatibles."],
 ];
 
 for (const [locale, catalog, expectedIndex] of [["en", en, 1], ["es", es, 2]] as const) {
@@ -178,6 +221,19 @@ for (const [locale, catalog, expectedIndex] of [["en", en, 1], ["es", es, 2]] as
       { ExceedsCharLimit: { actual: 12 } }, { ExceedsCharLimit: { actual: -1, limit: 2 } },
       { ExceedsBinarySlot: { actual: 12, limit: 8 } }, { UnencodableTranslation: {} },
       "InvalidInjectionProvenance", "FutureKind", { FutureKind: { n: 2 } }, "toString", "__proto__",
+      { InvalidInjectionProvenance: {} }, { InvalidInjectionProvenance: { reason: null } },
+      ...[
+        "FutureReason", "toString", "__proto__", { FutureReason: { detail: "new" } },
+        "MalformedMetadata", { MalformedMetadata: {} }, { MalformedMetadata: { field: 42 } },
+        { InvalidCapacity: { encoding: "utf8", capacity: -1 } },
+        { InvalidCapacity: { encoding: "utf8", capacity: 1.5 } },
+        { InvalidCapacity: { encoding: "utf8", capacity: Number.MAX_SAFE_INTEGER + 1 } },
+        { ConflictingEncodings: { slot_encoding: "utf8" } },
+        { TextAssetGroupTooLarge: { max_members: 2 } },
+        { ConflictingTextAssetMetadata: {} },
+        { MalformedMetadata: { field: "a" }, MissingMetadata: { field: "b" } },
+        {}, [], 42, true, { UnencodableSource: null }, { UnencodableSource: [] },
+      ].map(reason => ({ InvalidInjectionProvenance: { reason } })),
       null, {}, [], { MissingPlaceholder: null },
       { MissingPlaceholder: { placeholder: "%s" }, ExtraPlaceholder: { placeholder: "%s" } },
     ];
@@ -188,9 +244,13 @@ for (const [locale, catalog, expectedIndex] of [["en", en, 1], ["es", es, 2]] as
       }
     }
     assert.equal(validationMessage({ kind: "FutureKind", kind_data: { MissingPlaceholder: { placeholder: "%s" } }, message }, t), message);
+    assert.equal(validationMessage({ kind: "FutureKind", kind_data: { InvalidInjectionProvenance: { reason: "MissingTextAssetOriginal" } }, message }, t), message);
     const common = '«Hola» "viajero"\n<player> {n} \\ ruta';
     assert.equal(validationMessage({ kind: { InconsistentTranslation: { variants: 3, common } }, message }, t),
       locale === "en" ? `The same source has 3 translation variants; most common translation: “${common}”`
         : `El mismo texto original tiene 3 traducciones distintas; la más común: «${common}»`);
+    assert.equal(validationMessage({ kind: { InvalidInjectionProvenance: { reason: { MalformedMetadata: { field: common } } } }, message }, t),
+      locale === "en" ? `Injection metadata “${common}” is invalid. Extract this entry again before injection.`
+        : `Los metadatos de inserción «${common}» no son válidos. Extrae esta entrada de nuevo antes de insertarla.`);
   });
 }

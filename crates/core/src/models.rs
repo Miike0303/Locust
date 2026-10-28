@@ -8,6 +8,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::error::InjectionProvenanceError;
+
 pub const INJECTION_SOURCE_METADATA_KEY: &str = "locust_injection_source";
 pub const INJECTION_CAPACITY_METADATA_KEY: &str = "locust_injection_capacity";
 pub const STALE_TRANSLATION_METADATA_KEY: &str = "locust_stale_translation";
@@ -237,10 +239,18 @@ impl StringEntry {
     pub fn translation_control_mismatches(
         &self,
     ) -> std::result::Result<Vec<crate::placeholder::PlaceholderMismatch>, String> {
+        self.translation_control_mismatches_checked()
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn translation_control_mismatches_checked(
+        &self,
+    ) -> std::result::Result<Vec<crate::placeholder::PlaceholderMismatch>, InjectionProvenanceError>
+    {
         let Some(translation) = self.translation.as_deref() else {
             return Ok(Vec::new());
         };
-        let physical = self.injection_source()?;
+        let physical = self.injection_source_checked()?;
         let profile = self.placeholder_profile();
         let mut mismatches = crate::placeholder::PlaceholderProcessor::validate_with_profile(
             &self.source,
@@ -280,31 +290,60 @@ impl StringEntry {
     /// Pivoted projects keep their translated `source` for translation/export,
     /// while this value remains anchored to the first extracted baseline.
     pub fn injection_source(&self) -> std::result::Result<&str, String> {
+        self.injection_source_checked()
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn injection_source_checked(
+        &self,
+    ) -> std::result::Result<&str, InjectionProvenanceError> {
         match self.metadata.get(INJECTION_SOURCE_METADATA_KEY) {
             None => Ok(&self.source),
             Some(serde_json::Value::String(source)) if !source.is_empty() => Ok(source),
-            Some(_) => Err(format!(
-                "entry '{}' has malformed {} metadata",
-                self.id, INJECTION_SOURCE_METADATA_KEY
+            Some(_) => Err(InjectionProvenanceError::new(
+                InjectionProvenanceReason::MalformedMetadata {
+                    field: INJECTION_SOURCE_METADATA_KEY.into(),
+                },
+                format!(
+                    "entry '{}' has malformed {} metadata",
+                    self.id, INJECTION_SOURCE_METADATA_KEY
+                ),
             )),
         }
     }
 
     /// Explicit immutable binary capacity recorded by the first pivot.
     pub fn injection_capacity(&self) -> std::result::Result<Option<(&str, usize)>, String> {
+        self.injection_capacity_checked()
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn injection_capacity_checked(
+        &self,
+    ) -> std::result::Result<Option<(&str, usize)>, InjectionProvenanceError> {
         let Some(value) = self.metadata.get(INJECTION_CAPACITY_METADATA_KEY) else {
             return Ok(None);
         };
         let Some(object) = value.as_object() else {
-            return Err(format!(
-                "entry '{}' has malformed {} metadata",
-                self.id, INJECTION_CAPACITY_METADATA_KEY
+            return Err(InjectionProvenanceError::new(
+                InjectionProvenanceReason::MalformedMetadata {
+                    field: INJECTION_CAPACITY_METADATA_KEY.into(),
+                },
+                format!(
+                    "entry '{}' has malformed {} metadata",
+                    self.id, INJECTION_CAPACITY_METADATA_KEY
+                ),
             ));
         };
         let Some(encoding) = object.get("encoding").and_then(|v| v.as_str()) else {
-            return Err(format!(
-                "entry '{}' has malformed {}.encoding metadata",
-                self.id, INJECTION_CAPACITY_METADATA_KEY
+            return Err(InjectionProvenanceError::new(
+                InjectionProvenanceReason::MalformedMetadata {
+                    field: format!("{INJECTION_CAPACITY_METADATA_KEY}.encoding"),
+                },
+                format!(
+                    "entry '{}' has malformed {}.encoding metadata",
+                    self.id, INJECTION_CAPACITY_METADATA_KEY
+                ),
             ));
         };
         let Some(bytes) = object
@@ -312,9 +351,14 @@ impl StringEntry {
             .and_then(|v| v.as_u64())
             .and_then(|n| usize::try_from(n).ok())
         else {
-            return Err(format!(
-                "entry '{}' has malformed {}.bytes metadata",
-                self.id, INJECTION_CAPACITY_METADATA_KEY
+            return Err(InjectionProvenanceError::new(
+                InjectionProvenanceReason::MalformedMetadata {
+                    field: format!("{INJECTION_CAPACITY_METADATA_KEY}.bytes"),
+                },
+                format!(
+                    "entry '{}' has malformed {}.bytes metadata",
+                    self.id, INJECTION_CAPACITY_METADATA_KEY
+                ),
             ));
         };
         Ok(Some((encoding, bytes)))
@@ -443,7 +487,55 @@ pub struct ValidationIssue {
     pub source: Option<String>,
 }
 
+/// Externally tagged, stable reason codes; no English-message parsing is needed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InjectionProvenanceReason {
+    MalformedMetadata {
+        field: String,
+    },
+    MissingMetadata {
+        field: String,
+    },
+    InvalidCapacity {
+        encoding: String,
+        capacity: usize,
+    },
+    ConflictingEncodings {
+        slot_encoding: String,
+        capacity_encoding: String,
+    },
+    CapacitySourceMismatch {
+        encoding: String,
+        capacity: usize,
+    },
+    UnencodableSource {
+        encoding: String,
+    },
+    UnsupportedTextAssetLayout {
+        layout: String,
+    },
+    ConflictingTextAssetMetadata,
+    TextAssetGroupTooLarge {
+        max_members: usize,
+        max_original_bytes: usize,
+    },
+    MissingTextAssetOriginal,
+    TextAssetOriginalMismatch,
+    TextAssetOriginalExceedsCapacity {
+        actual: usize,
+        capacity: usize,
+    },
+    InvalidTextAssetOverhead {
+        overhead: usize,
+        original_bytes: usize,
+    },
+    UnsupportedTextAssetReconstruction {
+        layout: String,
+    },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub enum ValidationKind {
     MissingPlaceholder {
         placeholder: String,
@@ -475,8 +567,47 @@ pub enum ValidationKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         common: Option<String>,
     },
-    InvalidInjectionProvenance,
+    InvalidInjectionProvenance {
+        /// Display detail only; excluded from the ignored-issue identity.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_provenance_reason"
+        )]
+        reason: Option<InjectionProvenanceReason>,
+    },
     StaleTranslation,
+}
+
+// Accept old unit-kind JSON as well as the additive, externally tagged payload.
+// Unstructured issues retain the original unit wire form when serialized again.
+impl Serialize for ValidationKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if matches!(self, Self::InvalidInjectionProvenance { reason: None }) {
+            serializer.serialize_str("InvalidInjectionProvenance")
+        } else {
+            Self::serialize(self, serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ValidationKind {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        if value.as_str() == Some("InvalidInjectionProvenance") {
+            value = serde_json::json!({"InvalidInjectionProvenance": {}});
+        }
+        Self::deserialize(value).map_err(serde::de::Error::custom)
+    }
+}
+
+// A future or incomplete reason must not turn an otherwise readable issue into
+// another kind. The raw diagnostic remains available to older clients.
+fn deserialize_provenance_reason<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<InjectionProvenanceReason>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -281,7 +281,11 @@ async fn stale_and_invalid_physical_provenance_remain_fatal_all_modes() {
         .insert("locust_injection_source".into(), json!(42));
     assert!(Validator::validate_entry(&invalid)
         .iter()
-        .any(|issue| serde_json::to_value(&issue.kind).unwrap() == "InvalidInjectionProvenance"));
+        .any(
+            |issue| serde_json::to_value(&issue.kind).unwrap()["InvalidInjectionProvenance"]
+                ["reason"]
+                == json!({"MalformedMetadata": {"field": "locust_injection_source"}})
+        ));
     exercise_all_modes(invalid, "locust_injection_source", true).await;
 }
 
