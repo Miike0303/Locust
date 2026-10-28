@@ -501,7 +501,12 @@ impl Validator {
         }
 
         // Check 1 — EmptyTranslation
-        if translation.trim().is_empty() && entry.status == StringStatus::Translated {
+        if translation.trim().is_empty()
+            && matches!(
+                entry.status,
+                StringStatus::Translated | StringStatus::Reviewed | StringStatus::Approved
+            )
+        {
             issues.push(ValidationIssue {
                 entry_id: entry.id.clone(),
                 kind: ValidationKind::EmptyTranslation,
