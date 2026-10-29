@@ -639,9 +639,18 @@ pub async fn apply_import_preview(
     path: String,
     keep_existing: bool,
     plan_token: String,
+    allow_undeclared_language: Option<bool>,
     state: State<'_, AppStateWrapper>,
 ) -> Result<serde_json::Value, String> {
-    apply_import_file_preview(&state.0, format, path, keep_existing, plan_token).await
+    apply_import_file_preview(
+        &state.0,
+        format,
+        path,
+        keep_existing,
+        plan_token,
+        allow_undeclared_language.unwrap_or(false),
+    )
+    .await
 }
 
 async fn apply_import_file_preview(
@@ -650,15 +659,23 @@ async fn apply_import_file_preview(
     path: String,
     keep_existing: bool,
     plan_token: String,
+    allow_undeclared_language: bool,
 ) -> Result<serde_json::Value, String> {
     let content = std::fs::read_to_string(&path).map_err(|error| {
         format!(
             "stale import plan; catalog could not be read. Preview again before applying. {error}"
         )
     })?;
-    locust_server::apply_catalog_preview(s.clone(), format, content, keep_existing, plan_token)
-        .await
-        .map_err(|(_, message)| message)
+    locust_server::apply_catalog_preview(
+        s.clone(),
+        format,
+        content,
+        keep_existing,
+        plan_token,
+        allow_undeclared_language,
+    )
+    .await
+    .map_err(|(_, message)| message)
 }
 
 /// Compatibility import; the desktop UI uses preview and token-checked apply.
@@ -666,46 +683,44 @@ async fn apply_import_file_preview(
 pub async fn import_translations(
     format: String,
     path: String,
+    allow_undeclared_language: Option<bool>,
     state: State<'_, AppStateWrapper>,
 ) -> Result<serde_json::Value, String> {
-    apply_import_translations(&state.0, format, path).await
+    apply_import_translations(
+        &state.0,
+        format,
+        path,
+        allow_undeclared_language.unwrap_or(false),
+    )
+    .await
 }
 
 async fn apply_import_translations(
     s: &Arc<AppState>,
     format: String,
     path: String,
+    allow_undeclared_language: bool,
 ) -> Result<serde_json::Value, String> {
-    let s = s.clone();
     let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
     if content.trim().is_empty() {
         return Err("import file is empty".into());
     }
-    let (updates, pre_skipped) =
-        locust_core::export::parse_import_catalog(&format, &content).map_err(|e| e.to_string())?;
-    let attempted = updates.len();
-    let exclusive = try_project_operation(&s)?;
-    run_owned_project_operation(exclusive, async move {
-        if s.current_project.read().await.is_none() {
-            return Err("no project open".into());
-        }
-        let report =
-            s.db.save_imported_translations_batch(updates)
-                .await
-                .map_err(|e| e.to_string())?;
-        let (imported, skipped) =
-            locust_core::export::import_counts_after_batch(pre_skipped, attempted, report.imported);
-        Ok(serde_json::json!({
-            "path": path,
-            "format": format,
-            "imported": imported,
-            "skipped": skipped,
-            "stale_sources": report.stale_sources,
-            "unknown_ids": report.unknown_ids,
-        }))
-    })
+    let preview = locust_server::preview_catalog(s.clone(), format.clone(), content.clone(), false)
+        .await
+        .map_err(|(_, message)| message)?;
+    let mut result = locust_server::apply_catalog_preview(
+        s.clone(),
+        format.clone(),
+        content,
+        false,
+        preview.plan_token,
+        allow_undeclared_language,
+    )
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|(_, message)| message)?;
+    result["path"] = path.into();
+    result["format"] = format.into();
+    Ok(result)
 }
 
 #[derive(Deserialize)]
@@ -2268,6 +2283,8 @@ mod tests {
         }
         let before =
             serde_json::to_value(state.db.get_entries(&EntryFilter::default()).unwrap()).unwrap();
+        state.config.write().await.default_source_lang = "en-US".into();
+        state.config.write().await.default_target_lang = "es-MX".into();
         let preview = preview_import_file(&state, "tmx".into(), path.clone(), true)
             .await
             .unwrap();
@@ -2283,6 +2300,7 @@ mod tests {
             path,
             true,
             preview["plan_token"].as_str().unwrap().into(),
+            false,
         )
         .await
         .unwrap();
@@ -2448,6 +2466,7 @@ mod tests {
                     &state,
                     format.into(),
                     input.to_string_lossy().into_owned(),
+                    false,
                 )
                 .await
                 .unwrap_err(),
@@ -2465,6 +2484,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let state = locust_server::create_test_state_with_db(&directory.path().join("project.db"));
         *state.current_project.write().await = Some(ProjectInfo::default());
+        state.config.write().await.default_source_lang = "en".into();
+        state.config.write().await.default_target_lang = "es".into();
         let mut reviewed = translated_entry("replace", "Replace", "Reviewed local text");
         reviewed.status = StringStatus::Reviewed;
         let mut identical = translated_entry("same", "Same", "Identical");
@@ -2612,6 +2633,7 @@ mod tests {
                     input.to_string_lossy().into_owned(),
                     keep_existing,
                     preview["plan_token"].as_str().unwrap().into(),
+                    false,
                 )
                 .await
                 .unwrap();
@@ -2669,6 +2691,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn import_language_refusals_warnings_and_confirmation_match_http() {
+        for format in ["po", "xliff", "tmx"] {
+            let (directory, native_state) = import_preview_fixture().await;
+            let (_http_directory, http_state) = import_preview_fixture().await;
+            let (base, server) = locust_server::start_test_server(http_state.clone()).await;
+            let path = directory
+                .path()
+                .join("languages.catalog")
+                .to_string_lossy()
+                .into_owned();
+            let before = import_preview_rows(&native_state);
+            let http_before = import_preview_rows(&http_state);
+            let wrong = import_preview_catalog(format)
+                .replace("Language: es", "Language: fr")
+                .replace("target-language=\"es\"", "target-language=\"fr\"")
+                .replace("xml:lang=\"es\"", "xml:lang=\"fr\"");
+            std::fs::write(&path, &wrong).unwrap();
+            let native = preview_import_file(&native_state, format.into(), path.clone(), true)
+                .await
+                .unwrap_err();
+            let (status, body) = http_import_preview(
+                &base,
+                format,
+                "preview",
+                &serde_json::json!({"content": wrong}),
+            )
+            .await;
+            assert_eq!(status, 400);
+            assert_eq!(body, native.as_bytes());
+            assert!(native.contains("does not match project"));
+            let error = apply_import_translations(&native_state, format.into(), path.clone(), true)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error, native,
+                "compatibility import cannot override a mismatch"
+            );
+            assert_eq!(import_preview_rows(&native_state), before);
+            assert_eq!(import_preview_rows(&http_state), http_before);
+
+            let content = import_preview_catalog(format)
+                .replace("\"Language: es\\n\"", "")
+                .replace("source-language=\"en\" target-language=\"es\"", "")
+                .replace("srclang=\"en\"", "");
+            std::fs::write(&path, &content).unwrap();
+            let native_plan = preview_import_file(&native_state, format.into(), path.clone(), true)
+                .await
+                .unwrap();
+            let (status, body) = http_import_preview(
+                &base,
+                format,
+                "preview",
+                &serde_json::json!({"content": content}),
+            )
+            .await;
+            assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+            let http_plan: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(native_plan["languages"], http_plan["languages"]);
+            assert_eq!(native_plan["languages"]["requires_confirmation"], true);
+            let native_error = apply_import_file_preview(
+                &native_state,
+                format.into(),
+                path.clone(),
+                true,
+                native_plan["plan_token"].as_str().unwrap().into(),
+                false,
+            )
+            .await
+            .unwrap_err();
+            let (status, body) = http_import_preview(
+                &base,
+                format,
+                "apply",
+                &serde_json::json!({
+                    "content": content, "plan_token": http_plan["plan_token"],
+                }),
+            )
+            .await;
+            assert_eq!(status, 400);
+            assert_eq!(body, native_error.as_bytes());
+            assert_eq!(import_preview_rows(&native_state), before);
+            assert_eq!(import_preview_rows(&http_state), http_before);
+            let native = apply_import_file_preview(
+                &native_state,
+                format.into(),
+                path,
+                true,
+                native_plan["plan_token"].as_str().unwrap().into(),
+                true,
+            )
+            .await
+            .unwrap();
+            let (status, body) = http_import_preview(&base, format, "apply", &serde_json::json!({
+                "content": content, "plan_token": http_plan["plan_token"], "allow_undeclared_language": true,
+            })).await;
+            assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+            let http: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(native, http);
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
+    #[tokio::test]
     async fn import_preview_native_refuses_changed_catalog_options_rows_or_project() {
         for change in [
             "catalog",
@@ -2719,6 +2845,7 @@ mod tests {
                 path,
                 change == "options",
                 preview["plan_token"].as_str().unwrap().into(),
+                false,
             )
             .await
             .unwrap_err();
@@ -2753,7 +2880,8 @@ mod tests {
                 "po".into(),
                 path.clone(),
                 true,
-                preview["plan_token"].as_str().unwrap().into()
+                preview["plan_token"].as_str().unwrap().into(),
+                false,
             )
             .await
             .unwrap_err(),

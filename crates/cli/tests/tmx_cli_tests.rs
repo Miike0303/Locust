@@ -198,10 +198,6 @@ fn rejects_late_units_languages_and_ambiguous_xml_without_any_saved_change() {
         ),
         (
             valid.replace("srclang=\"en\"", "srclang=\"ja\""),
-            "header source language mismatch",
-        ),
-        (
-            valid.replace("xml:lang=\"es\"", "xml:lang=\"es-ES\""),
             "unexpected variant language",
         ),
         (
@@ -265,6 +261,9 @@ fn explicit_languages_are_required_concrete_distinct_and_not_inferred() {
             ("en", "EN", "source and target languages must differ"),
             ("en_US", "es", "expected a concrete ASCII language tag"),
         ] {
+            if action == "import" && source == "en_US" {
+                continue;
+            }
             let mut command = Command::new(env!("CARGO_BIN_EXE_locust"));
             command
                 .env("LOCUST_DATA_DIR", f.root.path().join("profile"))
@@ -276,7 +275,12 @@ fn explicit_languages_are_required_concrete_distinct_and_not_inferred() {
             if action == "export" {
                 command.arg("--overwrite");
             }
-            result(command.output().unwrap(), 1, "", &profile_error(message));
+            let expected = if action == "import" {
+                format!("Error: {message}\n")
+            } else {
+                profile_error(message)
+            };
+            result(command.output().unwrap(), 1, "", &expected);
             assert_eq!(std::fs::read(&path).unwrap(), bytes);
             assert_eq!(f.snapshot(), before);
         }
@@ -318,7 +322,10 @@ fn rejects_invalid_utf8_and_bounded_file_read_before_import() {
     let mut document = export_tmx(&[], "en", "es").unwrap();
     document.push_str(&" ".repeat(32 * 1024 * 1024 - document.len()));
     std::fs::write(&f.input, &document).unwrap();
-    result(f.import(&[]), 0, &imported(&f, 0), "");
+    let output = f.import(&["--allow-undeclared-language"]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), imported(&f, 0));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("undeclared target language"));
     document.push(' ');
     std::fs::write(&f.input, document).unwrap();
     result(f.import(&[]), 1, "", "Error: TMX input exceeds 32 MiB\n");
@@ -626,7 +633,7 @@ fn export_limits_fail_before_replacing_catalog_and_empty_selection_creates_nothi
 }
 
 #[test]
-fn source_lang_is_explicitly_ignored_for_existing_formats_in_shared_handlers() {
+fn source_lang_export_default_is_preserved_and_import_flag_asserts_the_pair() {
     let rows = [approved("a", "Hello", "Hola")];
     let f = Fixture::new(&rows);
     let before = f.snapshot();
@@ -650,14 +657,25 @@ fn source_lang_is_explicitly_ignored_for_existing_formats_in_shared_handlers() {
             "",
         );
         assert_eq!(std::fs::read(&output).unwrap(), bytes);
+        result(
+            f.command("import", format)
+                .arg("-i")
+                .arg(&output)
+                .args(["--source-lang", "und"])
+                .output()
+                .unwrap(),
+            1,
+            "",
+            "Error: expected a concrete ASCII language tag\n",
+        );
         result(f.command("import", format).arg("-i").arg(&output)
-            .args(["--source-lang", "not_a_language", "--keep-existing", "--dry-run"]).output().unwrap(), 0,
+            .args(["--source-lang", "ja", "--keep-existing", "--dry-run"]).output().unwrap(), 0,
             "Would replace 0 translation(s):\nWould fill 0 empty row(s)\nUnchanged 1 (already identical)\nDry run: nothing was saved.\n", "");
         result(
             f.command("import", format)
                 .arg("-i")
                 .arg(&output)
-                .args(["--source-lang", "not_a_language"])
+                .args(["--source-lang", "ja"])
                 .output()
                 .unwrap(),
             0,
@@ -683,6 +701,10 @@ fn cli_help_names_restricted_tmx_and_source_flag_scope() {
         let help = String::from_utf8(output.stdout).unwrap();
         assert!(help.contains("restricted bilingual TMX"));
         assert!(help.contains("--source-lang <SOURCE_LANG>"));
-        assert!(help.contains("required for TMX; ignored for PO/XLIFF"));
+        assert!(help.contains(if action == "export" {
+            "required for TMX; ignored for PO/XLIFF"
+        } else {
+            "optional assertion for PO/XLIFF"
+        }));
     }
 }

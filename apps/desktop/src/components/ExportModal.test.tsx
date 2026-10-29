@@ -22,6 +22,7 @@ const importPreview = (keep: boolean): ImportPreview => ({
   stale_sources: 4, imported: keep ? 1 : 2, skipped: keep ? 10 : 9,
   replacements: keep ? [] : [{ id: "reviewed", file: FILE, previous_text: "Old reviewed text", previous_status: "reviewed", new_text: "Reviewer replacement" }],
   truncated: !keep, plan_token: keep ? "keep-plan" : "replace-plan",
+  languages: { project: { source: "en", target: "es" }, declared: { source: [], target: ["es"], source_required: false }, warnings: [], requires_confirmation: false },
 });
 const h = {
   t, a11y, project: project as ProjectInfo | null, scopeAllowed: true,
@@ -492,18 +493,88 @@ for (const locale of ["en", "es"] as const) {
           assert.deepEqual(h.calls.filter(call => call.command.includes("import")).map(call => [call.command, call.args]), [
             ["preview_import_translations", { format, path: "assignment.po", keepExisting: true }],
             ["preview_import_translations", { format, path: "assignment.po", keepExisting: false }],
-            ["apply_import_preview", { format, path: "assignment.po", keepExisting: false, planToken: "replace-plan" }],
+            ["apply_import_preview", { format, path: "assignment.po", keepExisting: false, planToken: "replace-plan", allowUndeclaredLanguage: false }],
           ]);
         } else {
           assert.deepEqual(h.bodies, [
             { path: `/api/import/${format}/preview`, body: { content: "reviewer catalog", keep_existing: true } },
             { path: `/api/import/${format}/preview`, body: { content: "reviewer catalog", keep_existing: false } },
-            { path: `/api/import/${format}/apply`, body: { content: "reviewer catalog", keep_existing: false, plan_token: "replace-plan" } },
+            { path: `/api/import/${format}/apply`, body: { content: "reviewer catalog", keep_existing: false, plan_token: "replace-plan", allow_undeclared_language: false } },
           ]);
         }
       });
     }
   }
+}
+
+for (const locale of ["en", "es"] as const) {
+  for (const native of [true, false]) {
+    for (const format of ["po", "xliff", "tmx"]) {
+      test(`${locale} ${native ? "Tauri" : "browser"} ${format}: undeclared language needs an explicit checkbox before apply`, async () => {
+        setLocale(locale);
+        h.previewHandler = async keep => ({ ...importPreview(keep), languages: {
+          project: { source: "en", target: "es" }, declared: { source: [], target: [], source_required: format !== "po" },
+          warnings: [{ code: "undeclared", side: "target", declared: [], expected: "es" }], requires_confirmation: true,
+        } });
+        await chooseImport(native, format);
+        await click("export.preview.action");
+        assert.equal(button("export.preview.apply").props.disabled, true);
+        const checkbox = () => nodes(render()).find(node => node.type === "input" && node.props.type === "checkbox");
+        assert.equal(checkbox().props.checked, false);
+        assert.ok(text(render()).includes(t("export.preview.confirmLanguage")));
+        assert.ok(text(render()).includes(t("export.preview.languageUndeclared", {
+          language: t("export.targetLang"), declared: t("export.preview.languageUnknown"), expected: "es",
+        })));
+        // The handler also enforces confirmation if called without a DOM click.
+        await button("export.preview.apply").props.onClick(); await flush();
+        assert.equal(h.calls.filter(call => call.command === "apply_import_preview").length, 0);
+        assert.equal(h.bodies.filter(body => body.path.endsWith("/apply")).length, 0);
+        checkbox().props.onChange({ target: { checked: true } });
+        assert.equal(button("export.preview.apply").props.disabled, false);
+        checkbox().props.onChange({ target: { checked: false } });
+        assert.equal(button("export.preview.apply").props.disabled, true);
+        checkbox().props.onChange({ target: { checked: true } });
+        await click("export.preview.apply");
+        assert.equal(h.imported, 1);
+        if (native) assert.equal(h.calls.find(call => call.command === "apply_import_preview")?.args.allowUndeclaredLanguage, true);
+        else assert.equal(h.bodies.find(body => body.path.endsWith("/apply"))?.body.allow_undeclared_language, true);
+      });
+    }
+
+    test(`${locale} ${native ? "Tauri" : "browser"}: region warning permits apply without confirmation`, async () => {
+      setLocale(locale);
+      h.previewHandler = async keep => ({ ...importPreview(keep), languages: {
+        project: { source: "en", target: "es-MX" }, declared: { source: [], target: ["es-ES"], source_required: false },
+        warnings: [{ code: "region", side: "target", declared: ["es-ES"], expected: "es-mx" }], requires_confirmation: false,
+      } });
+      await chooseImport(native);
+      await click("export.preview.action");
+      assert.ok(text(render()).includes(t("export.preview.languageRegion", { language: t("export.targetLang"), declared: "es-ES", expected: "es-mx" })));
+      assert.equal(nodes(render()).filter(node => node.type === "input" && node.props.type === "checkbox").length, 0);
+      assert.equal(button("export.preview.apply").props.disabled, false);
+      await click("export.preview.apply");
+      assert.equal(h.imported, 1);
+    });
+  }
+}
+
+for (const native of [true, false]) {
+  test(`${native ? "Tauri" : "browser"}: confirmation is cleared by every new preview and preservation change`, async () => {
+    h.previewHandler = async keep => ({ ...importPreview(keep), languages: {
+      ...importPreview(keep).languages, requires_confirmation: true,
+      warnings: [{ code: "undeclared", side: "target", declared: [], expected: "es" }],
+    } });
+    await chooseImport(native); await click("export.preview.action");
+    const checkbox = () => nodes(render()).find(node => node.type === "input" && node.props.type === "checkbox");
+    checkbox().props.onChange({ target: { checked: true } });
+    assert.equal(button("export.preview.apply").props.disabled, false);
+    await click("export.preview.action");
+    assert.equal(checkbox().props.checked, false);
+    checkbox().props.onChange({ target: { checked: true } });
+    radio(false).props.onChange(); await flush();
+    assert.equal(checkbox().props.checked, false);
+    assert.equal(button("export.preview.apply").props.disabled, true);
+  });
 }
 
 for (const native of [true, false]) {

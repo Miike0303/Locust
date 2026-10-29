@@ -8,7 +8,11 @@ use std::{fs, path::Path};
 
 fn command(root: &Path, database: &Path, input: &Path) -> Command {
     let config = root.join("offline.json");
-    fs::write(&config, r#"{"providers":{},"default_provider":null}"#).unwrap();
+    fs::write(
+        &config,
+        r#"{"providers":{},"default_provider":null,"default_source_lang":"en"}"#,
+    )
+    .unwrap();
     let mut command = Command::cargo_bin("locust").unwrap();
     command
         .env("LOCUST_DATA_DIR", root.join("profile"))
@@ -16,6 +20,7 @@ fn command(root: &Path, database: &Path, input: &Path) -> Command {
         .arg("--config")
         .arg(config)
         .arg("import")
+        .arg("--allow-undeclared-language")
         .arg(database)
         .args(["--format", "xliff", "--lang", "es", "--input"])
         .arg(input);

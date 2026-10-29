@@ -1,6 +1,9 @@
 use locust_core::models::{StringEntry, StringStatus};
 use serde_json::Value;
 
+// These identity/parser regressions deliberately keep their headerless catalogs;
+// explicitly confirm undeclared languages so the original assertions stay exact.
+
 #[tokio::test]
 async fn http_import_reports_stale_sources_and_keeps_current_reviewed_translation() {
     let state = locust_server::create_test_state();
@@ -25,6 +28,7 @@ async fn http_import_reports_stale_sources_and_keeps_current_reviewed_translatio
     for (format, content) in [("po", po), ("xliff", xliff)] {
         let response = client
             .post(format!("{url}/api/import/{format}"))
+            .query(&[("allow_undeclared_language", true)])
             .header("content-type", "text/plain")
             .body(content)
             .send()
@@ -78,6 +82,7 @@ async fn http_import_po_continued_context_updates_only_line10() {
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let response = client
         .post(format!("{url}/api/import/po"))
+        .query(&[("allow_undeclared_language", true)])
         .header("content-type", "text/plain")
         .body("msgctxt \"line1\"\n\"0\"\nmsgid \"Same source\"\nmsgstr \"Nueva traducción\"\n")
         .send()
@@ -130,6 +135,7 @@ async fn http_import_po_malformed_string_rejects_entire_catalog() {
     );
     let response = client
         .post(format!("{url}/api/import/po"))
+        .query(&[("allow_undeclared_language", true)])
         .header("content-type", "text/plain")
         .body(po)
         .send()

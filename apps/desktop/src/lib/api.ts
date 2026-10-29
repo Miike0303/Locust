@@ -784,15 +784,15 @@ export const exportTmx = (sourceLang: string, lang: string, scope: ExportScope =
   requestText(`/export/tmx?${exportQuery(lang, scope, sourceLang)}`);
 export const getExportSourceLanguage = (lang: string) =>
   request<{ source_lang: string }>(`/export/source-language?${new URLSearchParams({ lang })}`);
-export const importPo = (content: string) =>
-  trackTranslationWrite(() => request<ImportCounts>(`/import/po`, {
+export const importPo = (content: string, allowUndeclaredLanguage = false) =>
+  trackTranslationWrite(() => request<ImportCounts>(`/import/po${allowUndeclaredLanguage ? "?allow_undeclared_language=true" : ""}`, {
     method: "POST",
     body: content,
     headers: { "Content-Type": "text/plain" },
   }), result => result.imported > 0);
 
-export const importXliff = (content: string) =>
-  trackTranslationWrite(() => request<ImportCounts>(`/import/xliff`, {
+export const importXliff = (content: string, allowUndeclaredLanguage = false) =>
+  trackTranslationWrite(() => request<ImportCounts>(`/import/xliff${allowUndeclaredLanguage ? "?allow_undeclared_language=true" : ""}`, {
     method: "POST",
     body: content,
     headers: { "Content-Type": "text/plain" },
@@ -839,6 +839,17 @@ export interface ImportPreview extends ImportCounts {
   replacements: ImportReplacement[];
   truncated: boolean;
   plan_token: string;
+  languages: {
+    project: { source: string | null; target: string | null };
+    declared: { source: string[]; target: string[]; source_required: boolean };
+    warnings: {
+      code: "undeclared" | "project_undeclared" | "region";
+      side: "source" | "target";
+      declared: string[];
+      expected: string | null;
+    }[];
+    requires_confirmation: boolean;
+  };
 }
 
 /** Preview is read-only. Native callers pass a path; browser callers pass catalog text. */
@@ -860,16 +871,17 @@ export function applyImportPreview(
   pathOrContent: string,
   keepExisting: boolean,
   planToken: string,
+  allowUndeclaredLanguage = false,
 ): Promise<ImportCounts> {
   return trackTranslationWrite(() => {
     if (IS_TAURI) {
       return tauriInvoke<ImportCounts>("apply_import_preview", {
-        format, path: pathOrContent, keepExisting, planToken,
+        format, path: pathOrContent, keepExisting, planToken, allowUndeclaredLanguage,
       });
     }
     return request<ImportCounts>(`/import/${format}/apply`, {
       method: "POST",
-      body: JSON.stringify({ content: pathOrContent, keep_existing: keepExisting, plan_token: planToken }),
+      body: JSON.stringify({ content: pathOrContent, keep_existing: keepExisting, plan_token: planToken, allow_undeclared_language: allowUndeclaredLanguage }),
     });
   }, result => result.imported > 0);
 }
@@ -907,20 +919,26 @@ export async function exportTranslations(
   return { path: filename, format, lang, entries: 0, bytes: text.length };
 }
 
-/** Import translations from a PO/XLIFF file path (Tauri) or raw content (browser). */
+/** Compatibility import with the same language checks as preview/apply. */
 export async function importTranslations(
-  format: "po" | "xliff",
-  pathOrContent: string
+  format: ImportFormat,
+  pathOrContent: string,
+  allowUndeclaredLanguage = false,
 ): Promise<ImportResult> {
   if (IS_TAURI) {
     return trackTranslationWrite(() => tauriInvoke<ImportResult>("import_translations", {
       format,
       path: pathOrContent,
+      allowUndeclaredLanguage,
     }), result => result.imported > 0);
   }
   const content = pathOrContent;
   const res =
-    format === "po" ? await importPo(content) : await importXliff(content);
+    format === "po" ? await importPo(content, allowUndeclaredLanguage)
+      : format === "xliff" ? await importXliff(content, allowUndeclaredLanguage)
+        : await trackTranslationWrite(() => request<ImportCounts>(`/import/tmx${allowUndeclaredLanguage ? "?allow_undeclared_language=true" : ""}`, {
+          method: "POST", body: content, headers: { "Content-Type": "text/plain" },
+        }), result => result.imported > 0);
   return {
     path: "(browser upload)",
     format,

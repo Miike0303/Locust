@@ -330,7 +330,7 @@ enum Commands {
         lang: String,
         #[arg(short, long)]
         input: PathBuf,
-        /// Explicit source language (required for TMX; ignored for PO/XLIFF)
+        /// Expected source language (required for TMX; optional assertion for PO/XLIFF)
         #[arg(long)]
         source_lang: Option<String>,
         /// Preserve existing nonblank translations
@@ -339,6 +339,9 @@ enum Commands {
         /// Preview changes without saving translations
         #[arg(long)]
         dry_run: bool,
+        /// Confirm importing a catalog with missing or ambiguous language declarations
+        #[arg(long)]
+        allow_undeclared_language: bool,
     },
     /// Start the web server
     Server {
@@ -612,8 +615,10 @@ async fn run() -> anyhow::Result<()> {
             source_lang,
             keep_existing,
             dry_run,
+            allow_undeclared_language,
         } => {
             io::cmd_import(
+                &config,
                 project,
                 format,
                 lang,
@@ -621,6 +626,7 @@ async fn run() -> anyhow::Result<()> {
                 source_lang,
                 keep_existing,
                 dry_run,
+                allow_undeclared_language,
             )
             .await?
         }

@@ -154,8 +154,13 @@ pub fn export_po(entries: &[StringEntry], source_lang: &str, target_lang: &str) 
 }
 
 pub fn import_po(content: &str) -> Result<Vec<PoEntry>> {
+    Ok(import_po_catalog(content)?.0)
+}
+
+fn import_po_catalog(content: &str) -> Result<(Vec<PoEntry>, Vec<String>)> {
     let content = normalize_line_endings(content);
     let mut entries = Vec::new();
+    let mut headers = Vec::new();
     let mut current_id: Option<String> = None;
     let mut current_reference_id: Option<String> = None;
     let mut current_msgid: Option<String> = None;
@@ -177,7 +182,9 @@ pub fn import_po(content: &str) -> Result<Vec<PoEntry>> {
         if trimmed.is_empty() || (entry_complete && starts_entry) {
             // Flush current entry
             if let (Some(msgid), Some(msgstr)) = (current_msgid.take(), current_msgstr.take()) {
-                if !msgid.is_empty() {
+                if msgid.is_empty() && current_id.is_none() && current_reference_id.is_none() {
+                    headers.push(msgstr);
+                } else if !msgid.is_empty() {
                     entries.push(PoEntry {
                         id: current_id
                             .take()
@@ -282,7 +289,9 @@ pub fn import_po(content: &str) -> Result<Vec<PoEntry>> {
 
     // Flush last entry
     if let (Some(msgid), Some(msgstr)) = (current_msgid, current_msgstr) {
-        if !msgid.is_empty() {
+        if msgid.is_empty() && current_id.is_none() && current_reference_id.is_none() {
+            headers.push(msgstr);
+        } else if !msgid.is_empty() {
             entries.push(PoEntry {
                 id: current_id
                     .filter(|id| !id.is_empty())
@@ -294,7 +303,7 @@ pub fn import_po(content: &str) -> Result<Vec<PoEntry>> {
         }
     }
 
-    Ok(entries)
+    Ok((entries, headers))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -452,6 +461,10 @@ pub fn export_xliff(entries: &[StringEntry], source_lang: &str, target_lang: &st
 /// namespace prefixes and CDATA. Unsupported inline codes fail explicitly:
 /// silently flattening them would drop protected game controls.
 pub fn import_xliff(content: &str) -> Result<Vec<XliffUnit>> {
+    Ok(import_xliff_catalog(content)?.0)
+}
+
+fn import_xliff_catalog(content: &str) -> Result<(Vec<XliffUnit>, CatalogLanguages)> {
     use quick_xml::{events::Event, name::ResolveResult, NsReader};
     use std::collections::HashSet;
 
@@ -492,6 +505,7 @@ pub fn import_xliff(content: &str) -> Result<Vec<XliffUnit>> {
     let mut current: Option<Unit> = None;
     let mut ids = HashSet::new();
     let mut units = Vec::new();
+    let mut languages = CatalogLanguages::default();
     loop {
         let (namespace, event) = reader
             .read_resolved_event()
@@ -515,6 +529,8 @@ pub fn import_xliff(content: &str) -> Result<Vec<XliffUnit>> {
                 let mut id = None;
                 let mut version = None;
                 let mut state = None;
+                let mut source_lang = None;
+                let mut target_lang = None;
                 for attribute in element.attributes() {
                     let attribute = attribute.map_err(invalid)?;
                     // XLIFF historically preserves literal attribute whitespace;
@@ -527,6 +543,8 @@ pub fn import_xliff(content: &str) -> Result<Vec<XliffUnit>> {
                         b"id" => id = Some(value),
                         b"version" => version = Some(value),
                         b"state" => state = Some(value),
+                        b"source-language" => source_lang = Some(value),
+                        b"target-language" => target_lang = Some(value),
                         _ => {}
                     }
                 }
@@ -542,7 +560,11 @@ pub fn import_xliff(content: &str) -> Result<Vec<XliffUnit>> {
                     Element::Root
                 } else if is_xliff {
                     match (name.as_ref(), parent) {
-                        (b"file", Some(Element::Root)) => Element::File,
+                        (b"file", Some(Element::Root)) => {
+                            languages.source.push(source_lang.unwrap_or_default());
+                            languages.target.push(target_lang.unwrap_or_default());
+                            Element::File
+                        }
                         (b"body", Some(Element::File)) => Element::Body,
                         (b"group", Some(Element::Body | Element::Group)) => Element::Group,
                         (b"trans-unit", Some(Element::Body | Element::Group)) => {
@@ -647,7 +669,7 @@ pub fn import_xliff(content: &str) -> Result<Vec<XliffUnit>> {
             _ => {}
         }
     }
-    Ok(units)
+    Ok((units, languages))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -669,79 +691,372 @@ pub struct ImportedTranslation {
     pub translation: String,
 }
 
-/// Desktop/browser catalogs use the same parsers and skip rules for preview and
-/// apply. TMX declares its bilingual pair; the strict parser still validates the
-/// entire document, including every variant and the header.
+/// Concrete tags use ASCII case folding and hyphens. Matching uses the primary
+/// subtag; two explicitly different regions warn rather than rejecting a pair.
+pub fn normalize_import_language(value: &str) -> Option<String> {
+    let tag = value.trim().replace('_', "-").to_ascii_lowercase();
+    let mut parts = tag.split('-');
+    let primary = parts.next()?;
+    ((2..=8).contains(&primary.len())
+        && primary.bytes().all(|b| b.is_ascii_alphabetic())
+        && !["auto", "und", "mul", "zxx"].contains(&primary)
+        && parts
+            .all(|p| (1..=8).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_alphanumeric())))
+    .then_some(tag)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ImportLanguagePair {
+    pub source: Option<String>,
+    pub target: Option<String>,
+}
+
+/// The latest run records semantic languages, including EN->ES in a pivot
+/// whose immutable injection source is still Japanese. Before the first run,
+/// callers supply their configured/explicit pair. Pivot copies of project
+/// metadata and physical provenance are deliberately not language evidence.
+pub fn project_import_languages(
+    db: &Database,
+    fallback_source: &str,
+    fallback_target: &str,
+) -> Result<ImportLanguagePair> {
+    let runs = db.get_translation_runs()?;
+    let (source, target) = runs
+        .last()
+        .map(|run| (run.source_lang.as_str(), run.target_lang.as_str()))
+        .unwrap_or((fallback_source, fallback_target));
+    Ok(ImportLanguagePair {
+        source: normalize_import_language(source),
+        target: normalize_import_language(target),
+    })
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CatalogLanguages {
+    pub source: Vec<String>,
+    pub target: Vec<String>,
+    pub source_required: bool,
+}
+
+impl Default for CatalogLanguages {
+    fn default() -> Self {
+        Self {
+            source: Vec::new(),
+            target: Vec::new(),
+            source_required: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportLanguageWarning {
+    pub code: &'static str,
+    pub side: &'static str,
+    pub declared: Vec<String>,
+    pub expected: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportLanguageValidation {
+    pub project: ImportLanguagePair,
+    pub declared: CatalogLanguages,
+    pub warnings: Vec<ImportLanguageWarning>,
+    pub requires_confirmation: bool,
+}
+
+impl ImportLanguageValidation {
+    pub fn require_confirmation(&self, allow_undeclared_language: bool) -> Result<()> {
+        if self.requires_confirmation && !allow_undeclared_language {
+            return Err(LocustError::Other(anyhow::anyhow!(
+                "catalog language not declared or ambiguous (or project language unknown); review the preview and explicitly confirm language not declared — import anyway with allow_undeclared_language=true / --allow-undeclared-language"
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn language_region(tag: &str) -> Option<&str> {
+    tag.split('-').skip(1).find(|part| {
+        (part.len() == 2 && part.bytes().all(|b| b.is_ascii_alphabetic()))
+            || (part.len() == 3 && part.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
+pub fn validate_import_languages(
+    declared: &CatalogLanguages,
+    project: &ImportLanguagePair,
+) -> Result<ImportLanguageValidation> {
+    let mut validation = ImportLanguageValidation {
+        project: project.clone(),
+        declared: declared.clone(),
+        warnings: Vec::new(),
+        requires_confirmation: false,
+    };
+    for (side, values, expected, required) in [
+        (
+            "source",
+            &declared.source,
+            &project.source,
+            declared.source_required,
+        ),
+        ("target", &declared.target, &project.target, true),
+    ] {
+        let mut tags: Vec<_> = values
+            .iter()
+            .filter_map(|v| normalize_import_language(v))
+            .collect();
+        tags.sort();
+        tags.dedup();
+        if let Some(expected) = expected {
+            for tag in &tags {
+                if tag.split('-').next() != expected.split('-').next() {
+                    return Err(LocustError::Other(anyhow::anyhow!(
+                        "catalog {side} language '{tag}' does not match project {side} language '{expected}'; import refused"
+                    )));
+                }
+            }
+            if tags.iter().any(|tag| {
+                matches!((language_region(tag), language_region(expected)), (Some(a), Some(b)) if a != b)
+            }) {
+                validation.warnings.push(ImportLanguageWarning {
+                    code: "region", side, declared: values.clone(), expected: Some(expected.clone()),
+                });
+            }
+        } else if required {
+            validation.requires_confirmation = true;
+            validation.warnings.push(ImportLanguageWarning {
+                code: "project_undeclared",
+                side,
+                declared: values.clone(),
+                expected: None,
+            });
+        }
+        if required
+            && (tags.len() != 1
+                || values
+                    .iter()
+                    .any(|v| normalize_import_language(v).is_none()))
+        {
+            validation.requires_confirmation = true;
+            validation.warnings.push(ImportLanguageWarning {
+                code: "undeclared",
+                side,
+                declared: values.clone(),
+                expected: expected.clone(),
+            });
+        }
+    }
+    Ok(validation)
+}
+
+pub struct ParsedImportCatalog {
+    pub updates: Vec<ImportedTranslation>,
+    pub skipped: usize,
+    pub languages: CatalogLanguages,
+}
+
+/// All transports retain declarations and use the same skip rules. Language
+/// validation must precede row matching and any write, even for empty catalogs.
 pub fn parse_import_catalog(
     format: &str,
     content: &str,
-) -> Result<(Vec<ImportedTranslation>, usize)> {
-    match format {
-        "po" => Ok(po_entries_for_batch(&import_po(content)?)),
-        "xliff" => Ok(xliff_units_for_batch(&import_xliff(content)?)),
-        "tmx" => {
-            let invalid = |message: String| LocustError::ParseError {
-                file: "tmx".into(),
-                message: format!("TMX profile error: {message}"),
-            };
-            if content.len() > 32 * 1024 * 1024 {
-                return Err(invalid("document exceeds 32 MiB".into()));
-            }
-            let mut reader = quick_xml::Reader::from_str(content);
-            let mut source = None;
-            let mut target = None;
-            loop {
-                match reader.read_event().map_err(|e| invalid(e.to_string()))? {
+    project: &ImportLanguagePair,
+) -> Result<ParsedImportCatalog> {
+    let ((updates, skipped), languages) = match format {
+        "po" => {
+            let (entries, headers) = import_po_catalog(content)?;
+            let target = headers
+                .iter()
+                .flat_map(|header| header.lines())
+                .filter_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.trim()
+                        .eq_ignore_ascii_case("Language")
+                        .then(|| value.trim().to_owned())
+                })
+                .collect();
+            (
+                po_entries_for_batch(&entries),
+                CatalogLanguages {
+                    source: Vec::new(),
+                    target,
+                    source_required: false,
+                },
+            )
+        }
+        "xliff" => {
+            let (units, languages) = import_xliff_catalog(content)?;
+            (xliff_units_for_batch(&units), languages)
+        }
+        "tmx" => return parse_import_tmx(content, project),
+        other => return Err(LocustError::UnsupportedFormat(other.into())),
+    };
+    Ok(ParsedImportCatalog {
+        updates,
+        skipped,
+        languages,
+    })
+}
+
+fn parse_import_tmx(content: &str, project: &ImportLanguagePair) -> Result<ParsedImportCatalog> {
+    let invalid = |message: String| LocustError::ParseError {
+        file: "tmx".into(),
+        message: format!("TMX profile error: {message}"),
+    };
+    if content.len() > 32 * 1024 * 1024 {
+        return Err(invalid("document exceeds 32 MiB".into()));
+    }
+    let mut reader = quick_xml::Reader::from_str(content);
+    let mut sources = Vec::new();
+    let mut variants = Vec::new();
+    let mut edits = Vec::new();
+    let mut missing_source_at = None;
+    let mut source_range = None;
+    let mut header_seen = false;
+    loop {
+        match reader.read_event().map_err(|e| invalid(e.to_string()))? {
+            event @ (quick_xml::events::Event::Start(_) | quick_xml::events::Event::Empty(_)) => {
+                let empty = matches!(event, quick_xml::events::Event::Empty(_));
+                let element = match event {
                     quick_xml::events::Event::Start(element)
-                    | quick_xml::events::Event::Empty(element) => {
-                        let key = match element.name().as_ref() {
-                            b"header" => b"srclang".as_slice(),
-                            b"tuv" => b"xml:lang".as_slice(),
-                            _ => continue,
-                        };
-                        for attr in element.attributes() {
-                            let attr = attr.map_err(|e| invalid(e.to_string()))?;
-                            if attr.key.as_ref() != key {
-                                continue;
-                            }
-                            let raw = std::str::from_utf8(&attr.value)
-                                .map_err(|e| invalid(e.to_string()))?;
-                            let lang = quick_xml::escape::unescape(raw)
-                                .map_err(|e| invalid(e.to_string()))?
-                                .into_owned();
-                            if key == b"srclang" {
-                                source = Some(lang);
-                            } else if source
-                                .as_ref()
-                                .is_some_and(|s: &String| !s.eq_ignore_ascii_case(&lang))
-                            {
-                                target = Some(lang);
-                                break;
-                            }
+                    | quick_xml::events::Event::Empty(element) => element,
+                    _ => unreachable!(),
+                };
+                let key = match element.name().as_ref() {
+                    b"header" | b"tu" => b"srclang".as_slice(),
+                    b"tuv" => b"xml:lang".as_slice(),
+                    _ => continue,
+                };
+                let is_header = element.name().as_ref() == b"header";
+                if is_header {
+                    if header_seen {
+                        return Err(invalid("multiple headers".into()));
+                    }
+                    header_seen = true;
+                }
+                // Slice-backed Reader events and their attributes borrow
+                // the original tag. Replace only language value bytes;
+                // reserializing tags could repair malformed XML separators.
+                let tag_start = reader.buffer_position() as usize
+                    - element.as_ref().len()
+                    - if empty { 2 } else { 1 };
+                let mut found = false;
+                for attr in element.attributes() {
+                    let attr = attr.map_err(|e| invalid(e.to_string()))?;
+                    if attr.key.as_ref() != key {
+                        continue;
+                    }
+                    let raw =
+                        std::str::from_utf8(&attr.value).map_err(|e| invalid(e.to_string()))?;
+                    let lang = quick_xml::escape::unescape(raw)
+                        .map_err(|e| invalid(e.to_string()))?
+                        .into_owned();
+                    found = true;
+                    let start = tag_start + attr.value.as_ptr() as usize
+                        - element.as_ref().as_ptr() as usize;
+                    let range = start..start + attr.value.len();
+                    if key == b"srclang" {
+                        sources.push(lang.clone());
+                        if is_header {
+                            source_range = Some(range.clone());
                         }
-                        if target.is_some() {
-                            break;
+                    } else {
+                        variants.push(lang.clone());
+                    }
+                    if let Some(normalized) = normalize_import_language(&lang) {
+                        if raw != normalized {
+                            edits.push((range, normalized));
                         }
                     }
-                    quick_xml::events::Event::Eof => break,
-                    _ => {}
+                }
+                if is_header && !found {
+                    sources.push(String::new());
+                    let position = tag_start + element.name().as_ref().len();
+                    missing_source_at = Some(position);
                 }
             }
-            let source = source.ok_or_else(|| invalid("missing source language".into()))?;
-            // Empty catalogs have no variants. Either distinct concrete target
-            // validates the same empty document; incomplete units still fail.
-            let target = target.unwrap_or_else(|| {
-                if source.eq_ignore_ascii_case("en") {
-                    "es"
-                } else {
-                    "en"
-                }
-                .into()
-            });
-            Ok(tmx_units_for_batch(&import_tmx(content, &source, &target)?))
+            quick_xml::events::Event::Eof => break,
+            _ => {}
         }
-        other => Err(LocustError::UnsupportedFormat(other.into())),
     }
+    let declared_source = sources.first().and_then(|v| normalize_import_language(v));
+    let source = declared_source
+        .clone()
+        .or_else(|| {
+            project.source.as_ref().and_then(|expected| {
+                let tags: Vec<_> = variants
+                    .iter()
+                    .filter_map(|v| normalize_import_language(v))
+                    .collect();
+                tags.iter()
+                    .find(|tag| *tag == expected)
+                    .cloned()
+                    .or_else(|| {
+                        tags.into_iter()
+                            .find(|tag| tag.split('-').next() == expected.split('-').next())
+                    })
+            })
+        })
+        .or_else(|| variants.first().and_then(|v| normalize_import_language(v)))
+        .or_else(|| project.source.clone())
+        .unwrap_or_else(|| "en".into());
+    if declared_source.is_none() && !variants.is_empty() {
+        // Variant tags still constrain the inferred orientation; the
+        // absent/ambiguous header continues to require confirmation.
+        sources.push(source.clone());
+    }
+    let mut targets: Vec<_> = variants
+        .into_iter()
+        .filter(|v| normalize_import_language(v).as_ref() != Some(&source))
+        .collect();
+    targets.sort();
+    targets.dedup();
+    // Empty catalogs have no variants. Either distinct concrete target
+    // validates the same empty document; incomplete units still fail.
+    let target = targets
+        .first()
+        .and_then(|v| normalize_import_language(v))
+        .unwrap_or_else(|| {
+            if source.eq_ignore_ascii_case("en") {
+                "es"
+            } else {
+                "en"
+            }
+            .into()
+        });
+    if declared_source.is_none() {
+        if let Some(range) = source_range {
+            edits.push((range, source.clone()));
+        } else if let Some(at) = missing_source_at {
+            edits.push((at..at, format!(" srclang=\"{source}\"")));
+        }
+    }
+    edits.sort_by_key(|(range, _)| range.start);
+    let normalized = if edits.is_empty() {
+        Cow::Borrowed(content)
+    } else {
+        let mut output = String::with_capacity(content.len());
+        let mut cursor = 0;
+        for (range, value) in edits {
+            output.push_str(&content[cursor..range.start]);
+            output.push_str(&value);
+            cursor = range.end;
+        }
+        output.push_str(&content[cursor..]);
+        Cow::Owned(output)
+    };
+    let (updates, skipped) = tmx_units_for_batch(&import_tmx(&normalized, &source, &target)?);
+    sources.sort();
+    sources.dedup();
+    Ok(ParsedImportCatalog {
+        updates,
+        skipped,
+        languages: CatalogLanguages {
+            source: sources,
+            target: targets,
+            source_required: true,
+        },
+    })
 }
 
 /// Empty msgstr / missing id / fuzzy count toward `skipped`; the database checks source identity.
@@ -810,6 +1125,186 @@ fn escape_xml(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn import_pair(source: &str, target: &str) -> ImportLanguagePair {
+        ImportLanguagePair {
+            source: normalize_import_language(source),
+            target: normalize_import_language(target),
+        }
+    }
+
+    fn language_catalog(format: &str, source: &str, target: &str) -> String {
+        let mut row = StringEntry::new("id", "Source", "story.rpy".into());
+        row.translation = Some("Traducción".into());
+        match format {
+            "po" => export_po(&[row], source, target),
+            "xliff" => export_xliff(&[row], source, target),
+            "tmx" => export_tmx(&[row], source, target).unwrap(),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn imported_languages_match_primary_subtags_and_warn_for_conflicting_regions() {
+        let project = import_pair("en_US", "es-MX");
+        for format in ["po", "xliff", "tmx"] {
+            for target in ["es", "ES-mx", "es-ES"] {
+                let content = language_catalog(format, "en-US", target);
+                let parsed = parse_import_catalog(format, &content, &project).unwrap();
+                let check = validate_import_languages(&parsed.languages, &project).unwrap();
+                assert!(!check.requires_confirmation, "{format}: {target}");
+                assert_eq!(check.warnings.len(), usize::from(target == "es-ES"));
+                check.require_confirmation(false).unwrap();
+                assert_eq!(parsed.updates[0].translation, "Traducción");
+            }
+            let content = language_catalog(format, "en-US", "es-ES").replace("es-ES", "es_ES");
+            let parsed = parse_import_catalog(format, &content, &project).unwrap();
+            let check = validate_import_languages(&parsed.languages, &project).unwrap();
+            assert_eq!(check.warnings[0].code, "region");
+        }
+    }
+
+    #[test]
+    fn declared_wrong_pairs_are_refused_before_any_rows_are_considered() {
+        let project = import_pair("en", "fr");
+        for format in ["po", "xliff", "tmx"] {
+            let parsed =
+                parse_import_catalog(format, &language_catalog(format, "en", "es"), &project)
+                    .unwrap();
+            let message = validate_import_languages(&parsed.languages, &project)
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains("target language 'es'") && message.contains("'fr'"));
+        }
+        for format in ["xliff", "tmx"] {
+            let parsed =
+                parse_import_catalog(format, &language_catalog(format, "fr", "en"), &project)
+                    .unwrap();
+            assert!(validate_import_languages(&parsed.languages, &project).is_err());
+        }
+    }
+
+    #[test]
+    fn missing_declarations_require_confirmation_including_tmx_orientation() {
+        let project = import_pair("en", "es");
+        for format in ["po", "xliff", "tmx"] {
+            let content = language_catalog(format, "en", "es")
+                .replace("\"Language: es\\n\"", "")
+                .replace("source-language=\"en\" target-language=\"es\"", "")
+                .replace("srclang=\"en\"", "");
+            let parsed = parse_import_catalog(format, &content, &project).unwrap();
+            let check = validate_import_languages(&parsed.languages, &project).unwrap();
+            assert!(check.requires_confirmation, "{format}");
+            assert!(check.require_confirmation(false).is_err());
+            check.require_confirmation(true).unwrap();
+            assert_eq!(parsed.updates[0].source, "Source");
+            assert_eq!(parsed.updates[0].translation, "Traducción");
+        }
+        // Variant order never reverses a TMX with an undeclared header.
+        let content = language_catalog("tmx", "en", "es").replace("srclang=\"en\"", "srclang=\"*all*\"")
+            .replace("<tuv xml:lang=\"en\"><seg>Source</seg></tuv><tuv xml:lang=\"es\"><seg>Traducción</seg></tuv>",
+                "<tuv xml:lang=\"es\"><seg>Traducción</seg></tuv><tuv xml:lang=\"en\"><seg>Source</seg></tuv>");
+        let parsed = parse_import_catalog("tmx", &content, &project).unwrap();
+        assert_eq!(parsed.updates[0].source, "Source");
+        assert!(
+            validate_import_languages(&parsed.languages, &project)
+                .unwrap()
+                .requires_confirmation
+        );
+    }
+
+    #[test]
+    fn ambiguous_headers_warn_but_known_conflicts_cannot_be_overridden() {
+        let project = import_pair("en", "es-MX");
+        for language in ["", "und", "es_ES\\nLanguage: es-MX"] {
+            let content = language_catalog("po", "en", language);
+            let parsed = parse_import_catalog("po", &content, &project).unwrap();
+            assert!(
+                validate_import_languages(&parsed.languages, &project)
+                    .unwrap()
+                    .requires_confirmation
+            );
+        }
+        let content = language_catalog("po", "en", "es\\nLanguage: fr");
+        let parsed = parse_import_catalog("po", &content, &project).unwrap();
+        assert!(validate_import_languages(&parsed.languages, &project).is_err());
+        let content = language_catalog("xliff", "en", "es-MX").replace(
+            "</xliff>",
+            "<file source-language=\"en\" target-language=\"es-ES\"><body/></file></xliff>",
+        );
+        let parsed = parse_import_catalog("xliff", &content, &project).unwrap();
+        assert!(
+            validate_import_languages(&parsed.languages, &project)
+                .unwrap()
+                .requires_confirmation
+        );
+    }
+
+    #[test]
+    fn tmx_language_normalization_preserves_strict_xml_and_segment_bytes() {
+        let project = import_pair("en-US", "es-ES");
+        let content = language_catalog("tmx", "en-US", "es-ES")
+            .replace("en-US", "en_US")
+            .replace("es-ES", "es_ES");
+        let parsed = parse_import_catalog("tmx", &content, &project).unwrap();
+        assert_eq!(parsed.updates[0].source, "Source");
+        assert_eq!(parsed.updates[0].translation, "Traducción");
+        for broken in [
+            content.replace(" segtype=", "segtype="),
+            content.replace("</tmx>", "</tmx>late"),
+        ] {
+            assert!(parse_import_catalog("tmx", &broken, &project).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn project_import_pair_uses_semantic_runs_and_not_pivot_physical_metadata() {
+        use crate::database::TranslationRun;
+        let db = Database::open_in_memory().unwrap();
+        let mut row = StringEntry::new("id", "日本語", "story.rpy".into());
+        row.translation = Some("Source".into());
+        row.status = StringStatus::Translated;
+        db.save_entries(&[row]).unwrap();
+        db.set_project_metadata("source_lang", &serde_json::json!("ja"))
+            .unwrap();
+        db.record_translation_run(&TranslationRun {
+            source_lang: "ja".into(),
+            target_lang: "en".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pivot.db");
+        db.pivot_to(&path).unwrap();
+        let pivot = Database::open(&path).unwrap();
+        assert_eq!(
+            pivot
+                .get_entry("id")
+                .unwrap()
+                .unwrap()
+                .injection_source()
+                .unwrap(),
+            "日本語"
+        );
+        assert_eq!(
+            project_import_languages(&pivot, "en", "es").unwrap(),
+            import_pair("en", "es")
+        );
+        pivot
+            .record_translation_run(&TranslationRun {
+                source_lang: "en".into(),
+                target_lang: "es".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let pair = project_import_languages(&pivot, "ja", "fr").unwrap();
+        assert_eq!(pair, import_pair("en", "es"));
+        let wrong =
+            parse_import_catalog("xliff", &language_catalog("xliff", "ja", "es"), &pair).unwrap();
+        assert!(validate_import_languages(&wrong.languages, &pair).is_err());
+    }
     use std::path::PathBuf;
 
     #[test]

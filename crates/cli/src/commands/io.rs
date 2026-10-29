@@ -216,7 +216,9 @@ pub(crate) fn cmd_export(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn cmd_import(
+    config: &AppConfig,
     project: PathBuf,
     format: String,
     lang: String,
@@ -224,6 +226,7 @@ pub(crate) async fn cmd_import(
     source_lang: Option<String>,
     keep_existing: bool,
     dry_run: bool,
+    allow_undeclared_language: bool,
 ) -> anyhow::Result<()> {
     let db = open_existing_project(&project)?;
     let content = if format == "tmx" {
@@ -242,26 +245,57 @@ pub(crate) async fn cmd_import(
         std::fs::read_to_string(&input)?
     };
 
-    let (updates, pre_skipped) = match format.as_str() {
-        "po" => {
-            let entries = export::import_po(&content)?;
-            export::po_entries_for_batch(&entries)
-        }
-        "xliff" => {
-            let units = export::import_xliff(&content)?;
-            export::xliff_units_for_batch(&units)
-        }
-        "tmx" => {
-            let source_lang =
-                source_lang.ok_or_else(|| anyhow::anyhow!("--source-lang is required for TMX"))?;
-            let units = export::import_tmx(&content, &source_lang, &lang)?;
-            export::tmx_units_for_batch(&units)
-        }
-        _ => anyhow::bail!(
-            "unsupported import format: {}. Use 'po', 'xliff' or 'tmx'",
-            format
-        ),
-    };
+    anyhow::ensure!(
+        ["po", "xliff", "tmx"].contains(&format.as_str()),
+        "unsupported import format: {format}. Use 'po', 'xliff' or 'tmx'"
+    );
+    anyhow::ensure!(
+        format != "tmx" || source_lang.is_some(),
+        "--source-lang is required for TMX"
+    );
+    let requested_target = export::normalize_import_language(&lang);
+    let requested_source = source_lang
+        .as_deref()
+        .and_then(export::normalize_import_language);
+    anyhow::ensure!(
+        requested_target.is_some() && (source_lang.is_none() || requested_source.is_some()),
+        "expected a concrete ASCII language tag"
+    );
+    anyhow::ensure!(
+        source_lang.is_none() || requested_source != requested_target,
+        "source and target languages must differ"
+    );
+    let project_languages = export::project_import_languages(
+        &db,
+        source_lang
+            .as_deref()
+            .unwrap_or(&config.default_source_lang),
+        &lang,
+    )?;
+    // Explicit CLI languages are assertions, never a way to override the
+    // project's recorded pair or a conflicting catalog declaration.
+    export::validate_import_languages(
+        &export::CatalogLanguages {
+            source: source_lang.into_iter().collect(),
+            target: vec![lang],
+            source_required: false,
+        },
+        &project_languages,
+    )?;
+    let catalog = export::parse_import_catalog(&format, &content, &project_languages)?;
+    let languages = export::validate_import_languages(&catalog.languages, &project_languages)?;
+    for warning in &languages.warnings {
+        eprintln!(
+            "Warning: {} {} language: declared {:?}, project {:?}",
+            warning.code, warning.side, warning.declared, warning.expected
+        );
+    }
+    if !dry_run {
+        languages.require_confirmation(allow_undeclared_language)?;
+    } else if languages.requires_confirmation {
+        eprintln!("Warning: language not declared — import anyway requires --allow-undeclared-language when applying");
+    }
+    let (updates, pre_skipped) = (catalog.updates, catalog.skipped);
     let attempted = updates.len();
     let report = if dry_run {
         let preview = db.preview_imported_translations(&updates, keep_existing)?;

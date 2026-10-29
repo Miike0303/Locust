@@ -15,16 +15,68 @@ replacements, unchanged rows, unknown IDs, outdated sources and protected local
 translations. Replacement details include the file, previous text/status and new
 text; at most 200 rows are shown, with a truncation notice when needed.
 
+Declared languages are checked **before row matching or writes**, including for
+empty catalogs and compatibility imports. PO supplies the target through its
+decoded `Language:` header (PO does not declare a source). XLIFF supplies the
+pair on each `file` through `source-language` / `target-language`. TMX supplies
+`header srclang` and the variant `xml:lang` tags. Text and IDs are never used to
+guess the language.
+
+Locust's own exports include those declarations: PO writes `Language:`, XLIFF
+writes both language attributes, and TMX writes the header source and both
+variant languages. With a matching concrete project pair, importing any of these
+exports requires no undeclared-language confirmation. The CLI round-trip tests
+cover all three formats, including the JA→EN pipeline's XLIFF export followed by
+`import -f xliff -l en --keep-existing` without the confirmation flag.
+
+The project's latest translation-run ledger entry defines its semantic pair.
+Before the first run, HTTP/native use configured source/target defaults; CLI
+uses `--source-lang` (or the configured source) and `--lang` as the initial pair.
+Once a run exists, CLI language arguments assert that recorded pair and cannot
+override it. A pivot's `locust_injection_source` is the original physical text,
+not the semantic source. Pivot creation copies project metadata but not the run
+ledger: configure the new semantic pair before its first run/import. For example,
+a JA→EN pivot used for EN→ES must use EN→ES even though its physical provenance
+and copied `source_lang` metadata may still describe Japanese.
+
+| Declaration | Import policy |
+|---|---|
+| Matching primary source/target tags | Accept; preserve existing exact-ID/source and review checks. PO checks only the target. |
+| Wrong primary target, wrong primary source, or reversed pair | Refuse with a clear error and zero imported-row/history/counter writes. No confirmation flag overrides a known mismatch. |
+| `es`, `es-ES`, `es_ES`, or case differences | Trim language tags, fold ASCII case and map `_` to `-`; the same primary subtag matches. Catalog text/IDs are unchanged. |
+| Two explicit conflicting regions, such as `es-MX` / `es-ES` | Show a regional warning; allow import without extra confirmation. A bare `es` does not imply a conflicting region. |
+| Missing, invalid/nonconcrete (`und`, `auto`, `*all*`), or ambiguous required declaration | Read-only preview shows a warning. Apply requires explicit **Language not declared — import anyway** confirmation. Distinct declarations within a catalog are ambiguous; any known primary mismatch still refuses. |
+| Unknown project language | Warn and require the same explicit confirmation; known sides still constrain the catalog. |
+
+For an omitted/nonconcrete TMX `srclang`, the adapter orients the two declared
+variants using the project's source (matching primary subtags, preferring an
+exact tag). The missing-header warning and confirmation still apply. Empty TMX
+catalogs have no declared target and also warn. The strict bilingual parser still
+validates the entire document: extra variants, incomplete units, malformed XML,
+inline markup and exceeded limits remain errors. Language normalization rewrites
+only language attribute values before that validation; segment bytes stay exact.
+The standalone core `import_tmx` codec retains its exact-tag profile.
+
 HTTP clients can POST `{content, keep_existing}` to
 `/api/import/{format}/preview`, then POST the same fields plus the returned
-`plan_token` to `/api/import/{format}/apply`. Native commands
+`plan_token` to `/api/import/{format}/apply`. The response's `languages` contains
+the normalized project pair, declarations, structured warnings and
+`requires_confirmation`. When required, apply must also send
+`allow_undeclared_language: true` (omitted/false refuses with HTTP 400). Native commands
 `preview_import_translations` and `apply_import_preview` use the same parser,
-preview and guarded apply with a catalog `path`. TMX languages come from the
-catalog's declarations and still pass the strict bilingual codec validation.
-Changing the project, catalog bytes, preservation choice or affected rows makes
+preview and guarded apply with a catalog `path` and camel-case
+`allowUndeclaredLanguage` confirmation. Changing the semantic language pair,
+project, catalog bytes, preservation choice or affected rows makes
 the plan stale: apply returns HTTP 409 (or the same native error message), saves
-nothing and asks for a new preview. Legacy direct-import APIs and CLI behavior
-remain available.
+nothing and asks for a new preview. The accepted pair and declaration warnings
+are part of the preview token; checking a UI box cannot substitute another pair.
+Every new preview/file/format/project/preservation choice clears the checkbox.
+
+Compatibility HTTP raw imports accept the explicit query parameter
+`?allow_undeclared_language=true`; native `import_translations` accepts the same
+camel-case option. They enforce the same language policy. CLI `--dry-run` prints
+warnings without writing or requiring confirmation; actual `locust import`
+requires `--allow-undeclared-language` when declarations are missing/ambiguous.
 
 ## Desktop and HTTP export
 
@@ -86,9 +138,9 @@ locust import project.locust.db -f tmx --source-lang en -l es -i project-es.tmx 
 
 `--source-lang` and `-l`/`--lang` are explicit source and target tags for TMX.
 Neither project history nor config supplies a missing TMX source language.
-For PO/XLIFF, `--source-lang` is accepted but **ignored**, as the help states:
-export still resolves its source language from project run history/config, and
-import retains its existing language behavior. Omit that flag for PO/XLIFF.
+For PO/XLIFF **export**, `--source-lang` remains ignored: export resolves the
+source from project run history/config. For **import**, the optional flag asserts
+the expected semantic source, as documented above; `--lang` asserts the target.
 
 | Operation | Behavior |
 |---|---|

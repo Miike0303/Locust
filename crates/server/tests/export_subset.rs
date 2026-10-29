@@ -410,6 +410,11 @@ async fn tmx_scoped_export_round_trips_exact_identities_languages_and_review_mar
     // Submit this actual exported catalog through the existing preview/apply API.
     let destination = create_test_state();
     *destination.current_project.write().await = Some(ProjectInfo::default());
+    {
+        let mut config = destination.config.write().await;
+        config.default_source_lang = "en-US".into();
+        config.default_target_lang = "es-MX".into();
+    }
     let originals = rows.clone();
     for row in &mut rows[..2] {
         row.translation = None;
@@ -427,6 +432,8 @@ async fn tmx_scoped_export_round_trips_exact_identities_languages_and_review_mar
         .unwrap();
     assert_eq!(response.status(), 200);
     let preview: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(preview["languages"]["requires_confirmation"], false);
+    assert_eq!(preview["languages"]["warnings"], json!([]));
     assert_eq!(preview["fill"], 2);
     assert_eq!(preview["skipped"], 1);
     assert_eq!(

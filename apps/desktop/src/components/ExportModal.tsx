@@ -62,6 +62,7 @@ export default function ExportModal({
 	const [statuses, setStatuses] = useState<StringStatus[]>(STATUSES);
 	const [importSource, setImportSource] = useState<{ name: string; value: string } | null>(null);
 	const [keepExisting, setKeepExisting] = useState(true);
+	const [allowUndeclaredLanguage, setAllowUndeclaredLanguage] = useState(false);
 	const [preview, setPreview] = useState<ImportPreview | null>(null);
 	const [previewing, setPreviewing] = useState(false);
 	const [importError, setImportError] = useState("");
@@ -114,6 +115,7 @@ export default function ExportModal({
 		setPreviewing(false);
 		setImportError("");
 		setStalePlan(false);
+		setAllowUndeclaredLanguage(false);
 	}, [open, projectKey, mode, format]);
 	useEffect(() => () => { importGeneration.current++; }, []);
 	const count = filesQuery.data?.filter(row => !file || row.file_path === file)
@@ -199,6 +201,7 @@ export default function ExportModal({
 		setPreviewing(false);
 		setImportError("");
 		setStalePlan(false);
+		setAllowUndeclaredLanguage(false);
 	};
 	const isCurrentImport = (generation: number) =>
 		generation === importGeneration.current && currentImportContext.current === importContext;
@@ -262,13 +265,14 @@ export default function ExportModal({
 
 	const handleApplyImport = async () => {
 		if (!preview || !importSource || previewing || loading
+			|| (preview.languages.requires_confirmation && !allowUndeclaredLanguage)
 			|| previewGeneration.current !== importGeneration.current || currentImportContext.current !== importContext) return;
 		const generation = importGeneration.current;
 		previewGeneration.current = -1;
 		setLoading(true);
 		setImportError("");
 		try {
-			const result = await applyImportPreview(format, importSource.value, keepExisting, preview.plan_token);
+			const result = await applyImportPreview(format, importSource.value, keepExisting, preview.plan_token, allowUndeclaredLanguage);
 			if (isCurrentImport(generation)) {
 				setPreview(null);
 				reportImport(result, importSource.name);
@@ -459,8 +463,21 @@ export default function ExportModal({
 									<p>{t("export.preview.summary", { fill: preview.fill, replace: preview.replace, unchanged: preview.unchanged, unknown: preview.unknown_ids })}
 										{keepExisting && ` · ${t("export.preview.kept", { count: preview.kept_existing })}`}</p>
 									{preview.stale_sources > 0 && <p className="mt-1 text-caption">{t("export.preview.staleSources", { count: preview.stale_sources })}</p>}
+									{preview.languages.warnings.map(warning => <p key={`${warning.side}-${warning.code}`} className="mt-2 text-caption">
+										{t(warning.code === "region" ? "export.preview.languageRegion" : warning.code === "project_undeclared" ? "export.preview.projectLanguageUnknown" : "export.preview.languageUndeclared", {
+											language: t(warning.side === "source" ? "export.sourceLang" : "export.targetLang"),
+											declared: warning.declared.filter(Boolean).join(", ") || t("export.preview.languageUnknown"),
+											expected: warning.expected ?? t("export.preview.languageUnknown"),
+										})}
+									</p>)}
 								</div>}
 							</div>
+							{preview?.languages.requires_confirmation && <label className="flex items-center gap-2 text-body">
+								<input type="checkbox" checked={allowUndeclaredLanguage} disabled={loading || previewing}
+									onChange={event => setAllowUndeclaredLanguage(event.target.checked)}
+									className="focus:outline-none focus:ring-2 focus:ring-accent-fg" />
+								{t("export.preview.confirmLanguage")}
+							</label>}
 							{preview && preview.replacements.length > 0 && <div>
 								<div className="max-h-64 overflow-auto rounded border border-border" role="region" aria-label={t("export.preview.replacements")} tabIndex={0}>
 									<table className="w-full table-fixed text-left text-body">
@@ -516,7 +533,7 @@ export default function ExportModal({
 							preview ? "border border-border bg-surface text-text hover:bg-surface-muted" : "bg-accent hover:bg-accent-hover text-white")}>
 						{previewing ? t("export.preview.loading") : t("export.preview.action")}
 					</button>}
-					{mode === "import" && <button type="button" onClick={() => { void handleApplyImport(); }} disabled={!preview || previewing || loading}
+					{mode === "import" && <button type="button" onClick={() => { void handleApplyImport(); }} disabled={!preview || previewing || loading || (preview.languages.requires_confirmation && !allowUndeclaredLanguage)}
 						className="px-4 py-2 text-body font-medium rounded bg-accent hover:bg-accent-hover disabled:opacity-50 text-white focus:outline-none focus:ring-2 focus:ring-accent-fg">
 						{loading ? t("export.importing") : t("export.preview.apply")}
 					</button>}

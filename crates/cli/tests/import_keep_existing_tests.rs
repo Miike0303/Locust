@@ -36,7 +36,15 @@ fn import(
     command
         .arg("import")
         .arg(project)
-        .args(["--format", format, "--lang", "es", "--input"])
+        .args([
+            "--format",
+            format,
+            "--lang",
+            "es",
+            "--source-lang",
+            "en",
+            "--input",
+        ])
         .arg(input);
     if keep_existing {
         command.arg("--keep-existing");
@@ -190,6 +198,7 @@ fn cli_import_po_fuzzy_preserves_approved_and_imports_normal() {
     std::fs::write(
         &input,
         concat!(
+            "msgid \"\"\nmsgstr \"\"\n\"Language: es\\n\"\n\n",
             "#, fuzzy\nmsgctxt \"fuzzy\"\nmsgid \"Hello\"\nmsgstr \"Unreviewed guess\"\n\n",
             "msgctxt \"normal\"\nmsgid \"Goodbye\"\nmsgstr \"Adiós\"",
         ),

@@ -306,19 +306,17 @@ pub(crate) async fn export_po(
 
 pub(crate) async fn import_po(
     State(state): State<Arc<AppState>>,
+    Query(options): Query<ImportLanguageConfirmation>,
     body: String,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
-    run_owned_project_operation(guard, async move { import_po_owned(state, body).await })
-        .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
-}
-
-async fn import_po_owned(
-    state: Arc<AppState>,
-    body: String,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    import_catalog_owned(state, "po", body).await.map(Json)
+    run_owned_project_operation(guard, async move {
+        import_catalog_owned(state, "po", body, options.allow_undeclared_language)
+            .await
+            .map(Json)
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
 }
 
 pub(crate) async fn export_xliff(
@@ -361,28 +359,29 @@ pub(crate) async fn export_xliff(
 
 pub(crate) async fn import_xliff(
     State(state): State<Arc<AppState>>,
-    body: String,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
-    run_owned_project_operation(guard, async move { import_xliff_owned(state, body).await })
-        .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
-}
-
-async fn import_xliff_owned(
-    state: Arc<AppState>,
-    body: String,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    import_catalog_owned(state, "xliff", body).await.map(Json)
-}
-
-pub(crate) async fn import_tmx(
-    State(state): State<Arc<AppState>>,
+    Query(options): Query<ImportLanguageConfirmation>,
     body: String,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
     run_owned_project_operation(guard, async move {
-        import_catalog_owned(state, "tmx", body).await.map(Json)
+        import_catalog_owned(state, "xliff", body, options.allow_undeclared_language)
+            .await
+            .map(Json)
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+}
+
+pub(crate) async fn import_tmx(
+    State(state): State<Arc<AppState>>,
+    Query(options): Query<ImportLanguageConfirmation>,
+    body: String,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
+    run_owned_project_operation(guard, async move {
+        import_catalog_owned(state, "tmx", body, options.allow_undeclared_language)
+            .await
+            .map(Json)
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
@@ -392,12 +391,20 @@ async fn import_catalog_owned(
     state: Arc<AppState>,
     format: &str,
     body: String,
+    allow_undeclared_language: bool,
 ) -> Result<serde_json::Value, ApiError> {
     if state.current_project.read().await.is_none() {
         return Err(err(StatusCode::BAD_REQUEST, "no project open"));
     }
-    let (updates, pre_skipped) =
-        export::parse_import_catalog(format, &body).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    let project_languages = import_project_languages(&state).await?;
+    let catalog = export::parse_import_catalog(format, &body, &project_languages)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    let languages = export::validate_import_languages(&catalog.languages, &project_languages)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    languages
+        .require_confirmation(allow_undeclared_language)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    let (updates, pre_skipped) = (catalog.updates, catalog.skipped);
     let attempted = updates.len();
     // Also validate duplicate IDs with the same read-only validation as preview.
     state
@@ -409,13 +416,32 @@ async fn import_catalog_owned(
         .save_imported_translations_batch(updates)
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    Ok(import_result(&report, pre_skipped, attempted))
+    Ok(import_result(&report, pre_skipped, attempted, &languages))
+}
+
+async fn import_project_languages(
+    state: &AppState,
+) -> Result<export::ImportLanguagePair, ApiError> {
+    let config = state.config.read().await;
+    export::project_import_languages(
+        &state.db,
+        &config.default_source_lang,
+        &config.default_target_lang,
+    )
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+#[derive(Default, Deserialize)]
+pub(crate) struct ImportLanguageConfirmation {
+    #[serde(default)]
+    allow_undeclared_language: bool,
 }
 
 fn import_result(
     report: &locust_core::database::ImportApplyReport,
     pre_skipped: usize,
     attempted: usize,
+    languages: &export::ImportLanguageValidation,
 ) -> serde_json::Value {
     let (imported, skipped) =
         export::import_counts_after_batch(pre_skipped, attempted, report.imported);
@@ -423,6 +449,7 @@ fn import_result(
         "imported": imported, "skipped": skipped,
         "unchanged": report.unchanged, "kept_existing": report.kept_existing,
         "stale_sources": report.stale_sources, "unknown_ids": report.unknown_ids,
+        "languages": languages,
     })
 }
 
@@ -451,6 +478,7 @@ pub struct CatalogImportPreview {
     pub replacements: Vec<CatalogImportReplacement>,
     pub truncated: bool,
     pub plan_token: String,
+    pub languages: export::ImportLanguageValidation,
 }
 
 #[derive(Deserialize)]
@@ -470,6 +498,8 @@ pub(crate) struct ApplyImportRequest {
     #[serde(default = "protect_existing")]
     keep_existing: bool,
     plan_token: String,
+    #[serde(default)]
+    allow_undeclared_language: bool,
 }
 
 pub(crate) async fn preview_import(
@@ -493,11 +523,13 @@ pub(crate) async fn apply_import_preview(
         request.content,
         request.keep_existing,
         request.plan_token,
+        request.allow_undeclared_language,
     )
     .await
     .map(Json)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn import_plan_token(
     state: &AppState,
     project: &crate::ProjectInfo,
@@ -505,19 +537,21 @@ fn import_plan_token(
     content: &str,
     keep_existing: bool,
     updates: &[export::ImportedTranslation],
+    languages: &export::ImportLanguageValidation,
 ) -> Result<String, ApiError> {
     let fingerprint = state
         .db
         .import_rows_fingerprint(updates)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let bytes = serde_json::to_vec(&(
-        "locust-import-plan-v1",
+        "locust-import-plan-v2",
         project,
         state.db.path(),
         format,
         content,
         keep_existing,
         fingerprint,
+        languages,
     ))
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(locust_core::database::sha256_hex(&bytes))
@@ -538,8 +572,12 @@ pub async fn preview_catalog(
         .await
         .clone()
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "no project open"))?;
-    let (updates, pre_skipped) = export::parse_import_catalog(&format, &content)
+    let project_languages = import_project_languages(&state).await?;
+    let catalog = export::parse_import_catalog(&format, &content, &project_languages)
         .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    let languages = export::validate_import_languages(&catalog.languages, &project_languages)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    let (updates, pre_skipped) = (catalog.updates, catalog.skipped);
     let preview = state
         .db
         .preview_imported_translations(&updates, keep_existing)
@@ -585,7 +623,9 @@ pub async fn preview_catalog(
             &content,
             keep_existing,
             &updates,
+            &languages,
         )?,
+        languages,
     })
 }
 
@@ -598,6 +638,7 @@ pub async fn apply_catalog_preview(
     content: String,
     keep_existing: bool,
     plan_token: String,
+    allow_undeclared_language: bool,
 ) -> Result<serde_json::Value, ApiError> {
     let guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
     run_owned_project_operation(guard, async move {
@@ -613,24 +654,38 @@ pub async fn apply_catalog_preview(
         }
         // A valid preview cannot have an invalid catalog. Changed/malformed
         // bytes are stale too, with no partial writes during parsing.
-        let (updates, pre_skipped) =
-            export::parse_import_catalog(&format, &content).map_err(|_| stale())?;
+        let project_languages = import_project_languages(&state).await?;
+        let catalog = export::parse_import_catalog(&format, &content, &project_languages)
+            .map_err(|_| stale())?;
+        let languages = export::validate_import_languages(&catalog.languages, &project_languages)
+            .map_err(|_| stale())?;
+        let (updates, pre_skipped) = (catalog.updates, catalog.skipped);
         state
             .db
             .preview_imported_translations(&updates, keep_existing)
             .map_err(|_| stale())?;
-        if import_plan_token(&state, &project, &format, &content, keep_existing, &updates)?
-            != plan_token
+        if import_plan_token(
+            &state,
+            &project,
+            &format,
+            &content,
+            keep_existing,
+            &updates,
+            &languages,
+        )? != plan_token
         {
             return Err(stale());
         }
+        languages
+            .require_confirmation(allow_undeclared_language)
+            .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
         let attempted = updates.len();
         let report = state
             .db
             .save_imported_translations_batch_with(updates, keep_existing)
             .await
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-        Ok(import_result(&report, pre_skipped, attempted))
+        Ok(import_result(&report, pre_skipped, attempted, &languages))
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?

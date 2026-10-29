@@ -20,6 +20,11 @@ fn row(id: &str, source: &str, text: Option<&str>, status: StringStatus) -> Stri
 
 async fn seeded_state() -> Arc<AppState> {
     let state = create_test_state();
+    {
+        let mut config = state.config.write().await;
+        config.default_source_lang = "en".into();
+        config.default_target_lang = "es".into();
+    }
     *state.current_project.write().await = Some(ProjectInfo {
         path: "preview-project".into(),
         ..ProjectInfo::default()
@@ -89,6 +94,28 @@ fn catalog_rows(format: &str, rows: &[StringEntry]) -> String {
         "tmx" => export::export_tmx(rows, "en", "es").unwrap(),
         _ => unreachable!(),
     }
+}
+
+fn language_catalog(format: &str, source: &str, target: &str) -> String {
+    let entries = [row(
+        "fill",
+        "Empty",
+        Some("Imported"),
+        StringStatus::Translated,
+    )];
+    match format {
+        "po" => export::export_po(&entries, source, target),
+        "xliff" => export::export_xliff(&entries, source, target),
+        "tmx" => export::export_tmx(&entries, source, target).unwrap(),
+        _ => unreachable!(),
+    }
+}
+
+fn undeclared_catalog(format: &str) -> String {
+    language_catalog(format, "en", "es")
+        .replace("\"Language: es\\n\"", "")
+        .replace("source-language=\"en\" target-language=\"es\"", "")
+        .replace("srclang=\"en\"", "")
 }
 
 fn client() -> Client {
@@ -627,4 +654,271 @@ async fn legacy_raw_import_still_applies_without_preview_and_confirmations_keep_
         );
         server.abort();
     }
+}
+
+#[tokio::test]
+async fn language_mismatches_refuse_preview_direct_and_changed_apply_with_zero_writes() {
+    for format in FORMATS {
+        let state = seeded_state().await;
+        let (base, server) = start_test_server(state.clone()).await;
+        let client = client();
+        let accepted = language_catalog(format, "en", "es");
+        let plan = preview(&client, &base, format, &accepted, false).await;
+        let before = snapshot(&state);
+        let mut pairs = vec![("en", "fr")];
+        if format != "po" {
+            pairs.push(("es", "en"));
+        }
+        for (source, target) in pairs {
+            let content = language_catalog(format, source, target);
+            for allow in [false, true] {
+                let response = client
+                    .post(format!("{base}/api/import/{format}/preview"))
+                    .json(&json!({"content": content, "allow_undeclared_language": allow}))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), 400);
+                let message = response.text().await.unwrap();
+                assert!(
+                    message.contains("does not match project"),
+                    "{format}: {message}"
+                );
+                let response = client
+                    .post(format!(
+                        "{base}/api/import/{format}?allow_undeclared_language={allow}"
+                    ))
+                    .body(content.clone())
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), 400);
+                assert_eq!(response.text().await.unwrap(), message);
+                let response = client.post(format!("{base}/api/import/{format}/apply"))
+                    .json(&json!({"content": content, "keep_existing": false, "plan_token": plan["plan_token"], "allow_undeclared_language": allow})).send().await.unwrap();
+                assert_stale(response, &state, before.clone()).await;
+            }
+        }
+        assert_eq!(snapshot(&state), before);
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn undeclared_languages_warn_in_preview_and_require_explicit_apply_and_direct_confirmation() {
+    for format in FORMATS {
+        let state = seeded_state().await;
+        let (base, server) = start_test_server(state.clone()).await;
+        let client = client();
+        let content = undeclared_catalog(format);
+        let before = snapshot(&state);
+        let plan = preview(&client, &base, format, &content, true).await;
+        assert_eq!(plan["fill"], 1);
+        assert_eq!(plan["languages"]["requires_confirmation"], true);
+        assert!(!plan["languages"]["warnings"].as_array().unwrap().is_empty());
+        assert_eq!(snapshot(&state), before);
+        for allow in [None, Some(false)] {
+            let mut body = json!({"content": content, "keep_existing": true, "plan_token": plan["plan_token"]});
+            if let Some(allow) = allow {
+                body["allow_undeclared_language"] = json!(allow);
+            }
+            let response = client
+                .post(format!("{base}/api/import/{format}/apply"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 400, "{format}");
+            assert!(response
+                .text()
+                .await
+                .unwrap()
+                .contains("language not declared"));
+            let response = client
+                .post(format!("{base}/api/import/{format}"))
+                .body(content.clone())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 400);
+            assert_eq!(snapshot(&state), before);
+        }
+        let response = client.post(format!("{base}/api/import/{format}/apply"))
+            .json(&json!({"content": content, "keep_existing": true, "plan_token": plan["plan_token"], "allow_undeclared_language": true})).send().await.unwrap();
+        assert_eq!(
+            response.status(),
+            200,
+            "{format}: {}",
+            response.text().await.unwrap()
+        );
+        assert_eq!(
+            state
+                .db
+                .get_entry("fill")
+                .unwrap()
+                .unwrap()
+                .translation
+                .as_deref(),
+            Some("Imported")
+        );
+        let response = client
+            .post(format!(
+                "{base}/api/import/{format}?allow_undeclared_language=true"
+            ))
+            .body(content)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn regional_tags_match_and_conflicting_regions_only_warn() {
+    for format in FORMATS {
+        for target in ["es", "ES-mx", "es-ES", "es_ES"] {
+            let state = seeded_state().await;
+            state.config.write().await.default_target_lang = "es-MX".into();
+            let (base, server) = start_test_server(state.clone()).await;
+            let client = client();
+            let content = language_catalog(
+                format,
+                "en",
+                if target == "es_ES" { "es-ES" } else { target },
+            )
+            .replace("es-ES", target);
+            let plan = preview(&client, &base, format, &content, true).await;
+            assert_eq!(plan["languages"]["requires_confirmation"], false);
+            let warnings = plan["languages"]["warnings"].as_array().unwrap();
+            assert_eq!(
+                warnings.len(),
+                usize::from(["es-ES", "es_ES"].contains(&target))
+            );
+            let response = apply(
+                &client,
+                &base,
+                format,
+                &content,
+                true,
+                plan["plan_token"].as_str().unwrap(),
+            )
+            .await;
+            assert_eq!(response.status(), 200);
+            server.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn project_language_changes_in_config_or_ledger_stale_accepted_pairs() {
+    use locust_core::database::TranslationRun;
+    for format in FORMATS {
+        for change in ["source", "target", "run"] {
+            let state = seeded_state().await;
+            let (base, server) = start_test_server(state.clone()).await;
+            let client = client();
+            let content = language_catalog(format, "en", "es");
+            let plan = preview(&client, &base, format, &content, true).await;
+            match change {
+                "source" => state.config.write().await.default_source_lang = "en-GB".into(),
+                "target" => state.config.write().await.default_target_lang = "es-MX".into(),
+                "run" => state
+                    .db
+                    .record_translation_run(&TranslationRun {
+                        source_lang: "en".into(),
+                        target_lang: "fr".into(),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap(),
+                _ => unreachable!(),
+            }
+            let before = snapshot(&state);
+            let response = apply(
+                &client,
+                &base,
+                format,
+                &content,
+                true,
+                plan["plan_token"].as_str().unwrap(),
+            )
+            .await;
+            assert_stale(response, &state, before).await;
+            server.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn pivot_imports_use_semantic_pair_after_reopen_and_ignore_physical_source() {
+    use locust_core::database::{Database, TranslationRun};
+    let state = seeded_state().await;
+    let mut original = row("fill", "日本語", Some("Empty"), StringStatus::Translated);
+    original.metadata.insert("format_id".into(), json!("renpy"));
+    state.db.save_entries(&[original]).unwrap();
+    state
+        .db
+        .set_project_metadata("source_lang", &json!("ja"))
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let pivot = directory.path().join("pivot.db");
+    state.db.pivot_to(&pivot).unwrap();
+    let pivot_db = Database::open(&pivot).unwrap();
+    pivot_db
+        .record_translation_run(&TranslationRun {
+            source_lang: "en".into(),
+            target_lang: "es".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    drop(pivot_db);
+    state.config.write().await.default_source_lang = "ja".into();
+    state.config.write().await.default_target_lang = "fr".into();
+    let (base, server) = start_test_server(state.clone()).await;
+    let client = client();
+    let response = client
+        .post(format!("{base}/api/project/open-db"))
+        .json(&json!({
+            "database_path": pivot,
+            "game_path": directory.path().join("game"),
+            "format_id": "renpy"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    assert_eq!(state.db.path(), pivot);
+    let before = snapshot(&state);
+    for format in ["xliff", "tmx"] {
+        let response = client
+            .post(format!("{base}/api/import/{format}/preview"))
+            .json(&json!({"content": language_catalog(format, "ja", "es")}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        assert_eq!(snapshot(&state), before);
+    }
+    let content = language_catalog("tmx", "en", "es");
+    let plan = preview(&client, &base, "tmx", &content, true).await;
+    assert_eq!(
+        plan["languages"]["project"],
+        json!({"source": "en", "target": "es"})
+    );
+    let response = apply(
+        &client,
+        &base,
+        "tmx",
+        &content,
+        true,
+        plan["plan_token"].as_str().unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let saved = state.db.get_entry("fill").unwrap().unwrap();
+    assert_eq!(saved.translation.as_deref(), Some("Imported"));
+    assert_eq!(saved.injection_source().unwrap(), "日本語");
+    server.abort();
 }
