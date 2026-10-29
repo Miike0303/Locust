@@ -237,6 +237,88 @@ pub(super) fn protected_control_repair_request(
 /// Semantic repairs are logical calls; transport retries remain call_provider's policy.
 pub(super) const MAX_PROTECTED_CONTROL_REPAIRS: usize = 2;
 
+/// One source-changing MT attempt, then the pending-only configured fallback.
+/// Measured encodings and the bounded live probe: docs/MT-PROTECTION.md.
+pub(super) struct MtControlRepair {
+    pub(super) request: TranslationRequest,
+    // Alternate -> original opaque identity; never expand controls here. The
+    // original speaker trace and two-phase canonical restoration still apply.
+    tokens: Vec<(String, String)>,
+}
+
+impl MtControlRepair {
+    pub(super) fn new(original: &TranslationRequest, phs: &[Placeholder]) -> Option<Self> {
+        if phs.is_empty() {
+            return None;
+        }
+        let mut nonce = 0usize;
+        loop {
+            let prefix = format!("⟦L{nonce}X");
+            if !original.source.contains(&prefix)
+                && !phs.iter().any(|ph| ph.original.contains(&prefix))
+            {
+                break;
+            }
+            nonce += 1;
+        }
+        let mut spans: Vec<_> = phs
+            .iter()
+            .enumerate()
+            .map(|(index, ph)| {
+                original
+                    .source
+                    .find(&ph.token)
+                    .map(|start| (start, ph.token.as_str(), format!("⟦L{nonce}X{index}⟧")))
+            })
+            .collect::<Option<_>>()?;
+        spans.sort_by_key(|(start, _, _)| *start);
+        let mut request = original.clone();
+        request.source.clear();
+        let mut last = 0;
+        let mut tokens = Vec::with_capacity(spans.len());
+        for (start, base, alternate) in spans {
+            request.source.push_str(&original.source[last..start]);
+            request.source.push_str(&alternate);
+            last = start + base.len();
+            tokens.push((alternate, base.to_owned()));
+        }
+        request.source.push_str(&original.source[last..]);
+        Some(Self { request, tokens })
+    }
+
+    pub(super) fn decode(&self, translated: &str) -> Option<String> {
+        // Unknown/malformed identities and missing/duplicated tokens fail closed.
+        // Match the entire alternate family, not just this record's nonce.
+        if translated.match_indices("⟦L").any(|(start, _)| {
+            !self
+                .tokens
+                .iter()
+                .any(|(token, _)| translated[start..].starts_with(token))
+        }) || self
+            .tokens
+            .iter()
+            .any(|(token, _)| translated.matches(token).count() != 1)
+        {
+            return None;
+        }
+        let mut spans: Vec<_> = self
+            .tokens
+            .iter()
+            .map(|(token, base)| (translated.find(token).unwrap(), token, base))
+            .collect();
+        spans.sort_by_key(|(start, _, _)| *start);
+        let mut out = String::new();
+        let mut last = 0;
+        for (start, token, base) in spans {
+            out.push_str(&translated[last..start]);
+            out.push_str(base);
+            last = start + token.len();
+        }
+        out.push_str(&translated[last..]);
+        Some(out)
+    }
+}
+
 /// Tight UI slots (short source labels) need a harsher first-pass budget hint.
 /// Threshold is in **encoded bytes** of the source string.
 const TIGHT_BINARY_SLOT_BYTES: usize = 12;

@@ -271,6 +271,9 @@ impl SpeakerArgumentTrace {
 /// Reserved sentinel families, including common mangled spellings. They are
 /// opaque literals in source, but never additional provider-invented tokens.
 fn sentinel_lookalike(text: &str) -> bool {
+    if text.starts_with("⟦L") {
+        return true;
+    }
     let Some(inner) = text.strip_prefix('{') else {
         return false;
     };
@@ -307,6 +310,7 @@ impl PlaceholderProcessor {
         let mut matches = Vec::new();
 
         // Collect all pattern matches
+        Self::find_mt_sentinels(source, &mut matches);
         Self::find_rpgmaker(source, &mut matches);
         Self::find_html_tags(source, &mut matches);
         Self::find_python_format(source, &mut matches);
@@ -389,7 +393,7 @@ impl PlaceholderProcessor {
             .collect();
         // Validate before each insertion phase, including partial canonical
         // values that combine with other text into a reserved sentinel.
-        if translated.match_indices('{').any(|(offset, _)| {
+        if translated.match_indices(['{', '⟦']).any(|(offset, _)| {
             sentinel_lookalike(&translated[offset..])
                 && !expected
                     .iter()
@@ -446,6 +450,27 @@ impl PlaceholderProcessor {
         }
         out.push_str(&text[last..]);
         out
+    }
+
+    // Alternate MT sentinels in source are opaque literals too. Mask malformed
+    // spellings as a whole so they cannot be mistaken for minted identities.
+    fn find_mt_sentinels(source: &str, matches: &mut Vec<PatternMatch>) {
+        let mut offset = 0;
+        while let Some(start) = source[offset..].find("⟦L") {
+            let start = offset + start;
+            let tail = &source[start..];
+            let end = start
+                + tail.find(['⟧', '\r', '\n']).map_or(tail.len(), |end| {
+                    end + usize::from(tail[end..].starts_with('⟧')) * '⟧'.len_utf8()
+                });
+            matches.push(PatternMatch {
+                start,
+                end,
+                text: source[start..end].into(),
+                kind: PlaceholderKind::CustomBracket,
+            });
+            offset = end;
+        }
     }
 
     fn restore_checked(

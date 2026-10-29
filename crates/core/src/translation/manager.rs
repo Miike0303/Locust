@@ -22,7 +22,8 @@ use super::protection::{
     binary_slot_length_hint, binary_slot_retry_correction, collapse_runaway_letters,
     has_mv_mz_provenance, protected_control_inventory, protected_control_repair_request,
     restore_and_collapse_result, restore_placeholders_in_result, translation_fits_entry,
-    RecordProtection, MAX_BINARY_SLOT_LENGTH_RETRIES, MAX_PROTECTED_CONTROL_REPAIRS,
+    MtControlRepair, RecordProtection, MAX_BINARY_SLOT_LENGTH_RETRIES,
+    MAX_PROTECTED_CONTROL_REPAIRS,
 };
 use super::provider::{TranslationOptions, TranslationProvider};
 use super::retry::{call_provider, ProviderCall, RetryConfig};
@@ -547,6 +548,7 @@ impl TranslationManager {
                     }
                     Ok(false)
                         if attempts < MAX_BINARY_SLOT_LENGTH_RETRIES
+                            && self.provider.supports_instructions()
                             && !partial_repair_failed
                             && !cancel.is_cancelled() =>
                     {
@@ -1482,12 +1484,27 @@ impl TranslationManager {
                             .iter()
                             .find(|r| r.entry_id == result.entry_id)
                             .expect("batch IDs validated");
-                        let retry_req = protected_control_repair_request(
-                            original,
-                            &placeholders_by_id[&result.entry_id].placeholders,
-                        );
+                        let phs = &placeholders_by_id[&result.entry_id].placeholders;
+                        let instructions = self.provider.supports_instructions();
+                        let mt_repair = (!instructions)
+                            .then(|| MtControlRepair::new(original, phs))
+                            .flatten();
+                        let retry_req = if instructions {
+                            protected_control_repair_request(original, phs)
+                        } else if let Some(repair) = &mt_repair {
+                            repair.request.clone()
+                        } else {
+                            // No identities to re-encode: do not resend identical
+                            // source to a provider that cannot see corrections.
+                            continue;
+                        };
                         let entry = &entries_by_id[&result.entry_id];
-                        for _ in 0..MAX_PROTECTED_CONTROL_REPAIRS {
+                        let repair_attempts = if instructions {
+                            MAX_PROTECTED_CONTROL_REPAIRS
+                        } else {
+                            1
+                        };
+                        for _ in 0..repair_attempts {
                             if cancel.is_cancelled() || budget_error.is_some() {
                                 break;
                             }
@@ -1539,6 +1556,13 @@ impl TranslationManager {
                                         continue;
                                     }
                                     let mut repaired = call.results.into_iter().next().unwrap();
+                                    if let Some(repair) = &mt_repair {
+                                        let Some(decoded) = repair.decode(&repaired.translation)
+                                        else {
+                                            continue;
+                                        };
+                                        repaired.translation = decoded;
+                                    }
                                     if !restore_and_collapse_result(
                                         &mut repaired,
                                         &placeholders_by_id,
@@ -1593,6 +1617,11 @@ impl TranslationManager {
                             continue;
                         };
                         if best_len <= *budget {
+                            continue;
+                        }
+                        // Length-only corrections are also invisible to MT.
+                        // Keep the existing review and injection capacity policy.
+                        if !self.provider.supports_instructions() {
                             continue;
                         }
 

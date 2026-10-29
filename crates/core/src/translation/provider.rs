@@ -21,6 +21,12 @@ pub trait TranslationProvider: Send + Sync {
     fn name(&self) -> &str;
     fn is_free(&self) -> bool;
     fn requires_api_key(&self) -> bool;
+    /// Whether record context/instructions can affect the translated text.
+    /// Known source-only adapters default to MT repair, including wrappers that
+    /// retain their ID. New source-only adapters must override this capability.
+    fn supports_instructions(&self) -> bool {
+        !matches!(self.id(), "google" | "deepl" | "argos")
+    }
     /// Constructor-resolved model sent to the service, when applicable.
     fn effective_model(&self) -> Option<&str> {
         None

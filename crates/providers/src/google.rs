@@ -377,6 +377,10 @@ impl Default for GoogleTranslateProvider {
 
 #[async_trait]
 impl TranslationProvider for GoogleTranslateProvider {
+    fn supports_instructions(&self) -> bool {
+        false
+    }
+
     fn id(&self) -> &str {
         "google"
     }
@@ -435,6 +439,97 @@ mod tests {
     use httpmock::prelude::*;
     use locust_core::translation::is_retryable;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn mt_control_repair_changes_post_source_and_fallback_only_gets_failed_id() {
+        use locust_core::{
+            database::Database,
+            glossary::Glossary,
+            models::{StringEntry, StringStatus},
+            translation::{run_fallback_chain, TranslationManager, TranslationOptions},
+        };
+        for damaged_alternate in [false, true] {
+            let server = MockServer::start_async().await;
+            let initial = server
+                .mock_async(|when, then| {
+                    when.method(POST)
+                        .path("/translate_a/t")
+                        .body("q=Hello+%7BPL_0%7D&q=Goodbye+%7BPL_0%7D");
+                    then.status(200).json_body(json!(["Hola", "Adios {PL_0}"]));
+                })
+                .await;
+            let alternate = server
+                .mock_async(|when, then| {
+                    when.method(POST)
+                        .path("/translate_a/t")
+                        .body("q=Hello+%E2%9F%A6L0X0%E2%9F%A7");
+                    then.status(200).json_body(json!([if damaged_alternate {
+                        "Hola ⟦L0X0⟧ ⟦L0X0⟧"
+                    } else {
+                        "Hola ⟦L0X0⟧"
+                    }]));
+                })
+                .await;
+            let provider = Arc::new(GoogleTranslateProvider {
+                base_url: server.base_url(),
+                limiter: Arc::new(RateLimiter::unlimited()),
+                ..GoogleTranslateProvider::new()
+            });
+            assert!(!provider.supports_instructions());
+            let db = Arc::new(Database::open_in_memory().unwrap());
+            let glossary = Arc::new(Glossary::new(db.clone()));
+            let entries = vec![
+                StringEntry::new("bad", "Hello [player]", "script.rpy".into())
+                    .with_format_id("renpy"),
+                StringEntry::new("good", "Goodbye [player]", "script.rpy".into())
+                    .with_format_id("renpy"),
+            ];
+            db.save_entries(&entries).unwrap();
+            let opts = TranslationOptions {
+                source_lang: "en".into(),
+                target_lang: "es".into(),
+                use_memory: false,
+                ..Default::default()
+            };
+            let (tx, _rx) = tokio::sync::mpsc::channel(100);
+            TranslationManager::new(provider, db.clone(), glossary.clone())
+                .translate_entries(
+                    entries,
+                    opts.clone(),
+                    tx,
+                    "mt-post".into(),
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+            initial.assert_hits_async(1).await;
+            alternate.assert_hits_async(1).await;
+            let bad = db.get_entry("bad").unwrap().unwrap();
+            if damaged_alternate {
+                assert_eq!(bad.status, StringStatus::Pending);
+                let fallback = Arc::new(PartialFallback(Default::default()));
+                let (tx, _rx) = tokio::sync::mpsc::channel(100);
+                run_fallback_chain(
+                    &["partial-fallback".into()],
+                    &|_| Some(fallback.clone()),
+                    db.clone(),
+                    glossary,
+                    opts,
+                    tx,
+                    "mt-fallback".into(),
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(*fallback.0.lock().unwrap(), ["bad"]);
+            } else {
+                assert_eq!(bad.translation.as_deref(), Some("Hola [player]"));
+            }
+            let good = db.get_entry("good").unwrap().unwrap();
+            assert_eq!(good.translation.as_deref(), Some("Adios [player]"));
+            assert_eq!(good.provider_used.as_deref(), Some("google"));
+        }
+    }
 
     // Dynamic loopback server: logs every source, including malformed parents,
     // so retry regressions cannot hide behind a total HTTP request count.
@@ -548,7 +643,7 @@ mod tests {
                 .iter()
                 .map(|r| TranslationResult {
                     entry_id: r.entry_id.clone(),
-                    translation: "Fallback".into(),
+                    translation: format!("Fallback {}", r.source),
                     detected_source_lang: None,
                     provider: self.id().into(),
                     tokens_used: Some(3),

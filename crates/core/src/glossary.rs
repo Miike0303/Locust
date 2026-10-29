@@ -147,6 +147,7 @@ impl VisibleGlossary {
                     || target.contains('\\')
                     || target.contains("{PL_")
                     || target.contains("{G_")
+                    || target.contains("⟦L")
                     || !PlaceholderProcessor::extract_with_profile(target, profile)
                         .1
                         .is_empty()
