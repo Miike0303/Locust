@@ -77,6 +77,15 @@ enum Commands {
         cost_limit: Option<f64>,
         #[arg(long)]
         context: Option<String>,
+        /// Exact catalog file path to translate (repeat for multiple files)
+        #[arg(long = "file", num_args = 1.., action = clap::ArgAction::Append)]
+        files: Vec<PathBuf>,
+        /// UTF-8 file with one exact string ID per line; intersects --file
+        #[arg(long)]
+        ids_from: Option<PathBuf>,
+        /// Exact catalog files to dispatch first, in order (repeatable)
+        #[arg(long, num_args = 1.., action = clap::ArgAction::Append)]
+        priority: Vec<PathBuf>,
     },
     /// Inject translations back into the game
     Inject {
@@ -472,6 +481,9 @@ async fn run() -> anyhow::Result<()> {
             fallback,
             cost_limit,
             context,
+            files,
+            ids_from,
+            priority,
         } => {
             translate::cmd_translate(
                 config,
@@ -488,6 +500,9 @@ async fn run() -> anyhow::Result<()> {
                 fallback,
                 cost_limit,
                 context,
+                files,
+                ids_from,
+                priority,
             )
             .await?
         }

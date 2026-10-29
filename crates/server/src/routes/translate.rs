@@ -2,9 +2,9 @@ use axum::extract::{Path as AxumPath, State, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
-use locust_core::models::{ProgressEvent, StringStatus};
+use locust_core::models::ProgressEvent;
 use locust_core::translation::{
-    load_pending_entries, run_fallback_chain, unique_provider_chain, TranslationOptionsRequest,
+    run_fallback_chain, unique_provider_chain, TranslationOptionsRequest,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -72,13 +72,10 @@ pub(crate) async fn translate_estimate(
         Some(n) => Some(options.max_batch_tokens.unwrap_or(n).min(n)),
         None => options.max_batch_tokens,
     };
-    let entries =
-        load_pending_entries(&state.db).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let eligible = entries.iter().filter(|entry| {
-        entry.is_translatable()
-            && !(options.skip_approved && entry.status == StringStatus::Approved)
-    });
-    let (entry_count, source_bytes) = eligible.fold((0, 0), |(count, bytes), entry| {
+    let entries = options
+        .pending_entries(&state.db)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let (entry_count, source_bytes) = entries.iter().fold((0, 0), |(count, bytes), entry| {
         (count + 1, bytes + entry.source.len())
     });
     // Match the manager's existing len()-based estimator input (UTF-8 bytes).
@@ -119,7 +116,9 @@ pub async fn spawn_translation_job(
     }
     let options = options
         .into()
-        .resolve(&provider_id, state.config.read().await.default_batch_size);
+        .resolve(&provider_id, state.config.read().await.default_batch_size)
+        .capture_scope(&state.db)
+        .map_err(|e| e.to_string())?;
     let reg = state.provider_registry.read().await;
     if reg.get(&provider_id).is_none() {
         return Err("provider not found".into());
@@ -150,21 +149,43 @@ pub async fn spawn_translation_job(
     let replay_bridge = replay.clone();
 
     // Bridge mpsc → broadcast so WebSocket clients can subscribe.
-    // BatchFailed and ProviderSwitched are non-terminal; only Completed / Failed end the stream.
+    // BatchFailed and ProviderSwitched are non-terminal; Completed / Failed / Paused end the stream.
     let jobs = state.active_jobs.clone();
     let cleanup_job_id = job_id.clone();
+    let receipt_db = state.db.clone();
+    let receipt_scope = options.clone();
     tokio::spawn(async move {
+        // Keep the project bound until its terminal scope receipt is published.
         while let Some(event) = rx.recv().await {
             let is_terminal = matches!(
                 event,
-                ProgressEvent::Completed { .. } | ProgressEvent::Failed { .. }
+                ProgressEvent::Completed { .. }
+                    | ProgressEvent::Failed { .. }
+                    | ProgressEvent::Paused
             );
-            let json = serde_json::to_value(&event).unwrap_or_default();
+            let mut json = serde_json::to_value(&event).unwrap_or_default();
+            // Include shortcut/group failures and terminal errors. Resolve the
+            // retry receipt while the project is reserved; never include rows
+            // that appeared after admission. Cancellation has no retry receipt.
+            if matches!(
+                event,
+                ProgressEvent::Completed { .. } | ProgressEvent::Failed { .. }
+            ) {
+                if let Ok(pending) = receipt_scope.pending_entries(&receipt_db) {
+                    json["failed_ids"] =
+                        serde_json::json!(pending.into_iter().map(|e| e.id).collect::<Vec<_>>());
+                }
+            }
             publish_job_event(&broadcast_tx_clone, &replay_bridge, json);
             if is_terminal {
                 break;
             }
         }
+        // Replay retains event data only. Release live project resources before
+        // the retention delay so a finished/cancelled job cannot pin its files.
+        drop(receipt_db);
+        drop(receipt_scope);
+        drop(exclusive);
         // Delay cleanup so WebSocket clients have time to connect and receive final events
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         jobs.remove(&cleanup_job_id);
@@ -187,9 +208,7 @@ pub async fn spawn_translation_job(
     let glossary = state.glossary.clone();
     let resolve_map = Arc::new(resolve_map);
     let handle = tokio::spawn(async move {
-        // Abort only requests cancellation. Keep ownership until this future
-        // actually exits/drops, even while a provider is executing synchronously.
-        let _exclusive = exclusive;
+        // The event bridge retains project ownership through the terminal receipt.
         let map = resolve_map;
         let resolve = |id: &str| map.get(id).cloned();
         let result = run_fallback_chain(
@@ -282,6 +301,253 @@ mod tests {
     use locust_core::translation::TranslationOptions;
     use std::path::PathBuf;
 
+    struct ScopedProvider {
+        calls: std::sync::Mutex<Vec<String>>,
+        fail: std::sync::atomic::AtomicBool,
+        db: Arc<locust_core::database::Database>,
+    }
+
+    #[async_trait::async_trait]
+    impl locust_core::translation::TranslationProvider for ScopedProvider {
+        fn id(&self) -> &str {
+            "scoped-fixture"
+        }
+        fn name(&self) -> &str {
+            "Scoped fixture"
+        }
+        fn is_free(&self) -> bool {
+            true
+        }
+        fn requires_api_key(&self) -> bool {
+            false
+        }
+        async fn translate(
+            &self,
+            requests: &[locust_core::models::TranslationRequest],
+        ) -> locust_core::Result<Vec<locust_core::models::TranslationResult>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .extend(requests.iter().map(|r| r.entry_id.clone()));
+            // A row appearing after admission must not join either this pass
+            // or a later fallback/retry of the immutable selected set.
+            self.db.save_entries(&[StringEntry::new(
+                "late",
+                "New pending row",
+                "intro.json".into(),
+            )])?;
+            Ok(requests
+                .iter()
+                .map(|r| locust_core::models::TranslationResult {
+                    entry_id: r.entry_id.clone(),
+                    translation: if r.entry_id == "e2"
+                        && self.fail.load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        String::new()
+                    } else {
+                        format!("Translated {}", r.source)
+                    },
+                    detected_source_lang: None,
+                    provider: self.id().into(),
+                    tokens_used: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cost_usd: None,
+                })
+                .collect())
+        }
+        async fn estimate_cost(&self, _: usize, _: &str) -> Option<f64> {
+            Some(0.0)
+        }
+        async fn health_check(&self) -> locust_core::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn scoped_terminal(state: &AppState, id: &str) -> serde_json::Value {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let event = state.active_jobs.get(id).and_then(|job| {
+                    job.replay
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|event| event["type"] == "completed" || event["type"] == "failed")
+                        .cloned()
+                });
+                if let Some(event) = event {
+                    return event;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("translation job should finish")
+    }
+
+    async fn scoped_start(url: &str, options: &TranslationOptions) -> String {
+        let response = client()
+            .post(format!("{url}/api/translate/start"))
+            .json(&serde_json::json!({"provider_id":"scoped-fixture", "options":options}))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["job_id"].as_str().unwrap().to_owned()
+    }
+
+    #[tokio::test]
+    async fn scoped_http_priority_receipt_and_failed_retry_preserve_other_rows() {
+        let (url, _server, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        let entries: Vec<_> = ["other.json", "menus.json", "intro.json", "intro.json"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, file)| StringEntry::new(format!("e{i}"), format!("Source {i}"), file.into()))
+            .collect();
+        state.db.save_entries(&entries).unwrap();
+        let provider = Arc::new(ScopedProvider {
+            calls: Default::default(),
+            fail: true.into(),
+            db: state.db.clone(),
+        });
+        state
+            .provider_registry
+            .write()
+            .await
+            .register(provider.clone());
+        let options = TranslationOptions {
+            file_paths: Some(vec!["menus.json".into(), "intro.json".into()]),
+            entry_ids: Some(vec!["e0".into(), "e1".into(), "e2".into()]),
+            file_priority: vec!["intro.json".into(), "menus.json".into()],
+            batch_size: 1,
+            max_concurrent: 1,
+            use_memory: false,
+            use_glossary: false,
+            ..Default::default()
+        };
+        let job = scoped_start(&url, &options).await;
+        let receipt = scoped_terminal(&state, &job).await;
+        assert_eq!(receipt["type"], "completed");
+        assert_eq!(receipt["total_translated"], 1);
+        assert_eq!(receipt["remaining"], 1);
+        assert_eq!(receipt["failed_ids"], serde_json::json!(["e2"]));
+        assert_eq!(*provider.calls.lock().unwrap(), ["e2", "e1"]);
+        let success = serde_json::to_value(state.db.get_entry("e1").unwrap().unwrap()).unwrap();
+        for index in [0, 3] {
+            assert_eq!(
+                serde_json::to_value(state.db.get_entry(&entries[index].id).unwrap().unwrap())
+                    .unwrap(),
+                serde_json::to_value(&entries[index]).unwrap()
+            );
+        }
+        provider
+            .fail
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let retry = TranslationOptions {
+            file_paths: None,
+            entry_ids: Some(serde_json::from_value(receipt["failed_ids"].clone()).unwrap()),
+            ..options
+        };
+        let job = scoped_start(&url, &retry).await;
+        let receipt = scoped_terminal(&state, &job).await;
+        assert_eq!(receipt["failed_ids"], serde_json::json!([]));
+        assert_eq!(receipt["total_translated"], 1);
+        assert_eq!(*provider.calls.lock().unwrap(), ["e2", "e1", "e2"]);
+        assert_eq!(
+            serde_json::to_value(state.db.get_entry("e1").unwrap().unwrap()).unwrap(),
+            success
+        );
+        assert!(state
+            .db
+            .get_entry("late")
+            .unwrap()
+            .unwrap()
+            .translation
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn scoped_http_empty_selection_has_no_provider_calls_or_writes() {
+        let (url, _server, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        let entry = StringEntry::new("e0", "Source", "menus.json".into());
+        state.db.save_entries(std::slice::from_ref(&entry)).unwrap();
+        let provider = Arc::new(ScopedProvider {
+            calls: Default::default(),
+            fail: false.into(),
+            db: state.db.clone(),
+        });
+        state
+            .provider_registry
+            .write()
+            .await
+            .register(provider.clone());
+        for options in [
+            TranslationOptions {
+                entry_ids: Some(Vec::new()),
+                ..Default::default()
+            },
+            TranslationOptions {
+                file_paths: Some(Vec::new()),
+                ..Default::default()
+            },
+        ] {
+            let job = scoped_start(&url, &options).await;
+            let receipt = scoped_terminal(&state, &job).await;
+            assert_eq!(receipt["total_translated"], 0);
+            assert_eq!(receipt["remaining"], 0);
+            assert_eq!(receipt["failed_ids"], serde_json::json!([]));
+        }
+        assert!(provider.calls.lock().unwrap().is_empty());
+        assert_eq!(
+            serde_json::to_value(state.db.get_entry("e0").unwrap().unwrap()).unwrap(),
+            serde_json::to_value(entry).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_http_terminal_error_retains_only_selected_pending_ids_for_retry() {
+        let (url, _server, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        let entries = [
+            StringEntry::new("other", "Unselected", "menus.json".into()),
+            StringEntry::new("selected", "Selected", "intro.json".into()),
+        ];
+        state.db.save_entries(&entries).unwrap();
+        let provider = Arc::new(ScopedProvider {
+            calls: Default::default(),
+            fail: false.into(),
+            db: state.db.clone(),
+        });
+        state
+            .provider_registry
+            .write()
+            .await
+            .register(provider.clone());
+        let job = scoped_start(
+            &url,
+            &TranslationOptions {
+                entry_ids: Some(vec!["selected".into()]),
+                batch_size: 0,
+                ..Default::default()
+            },
+        )
+        .await;
+        let receipt = scoped_terminal(&state, &job).await;
+        assert_eq!(receipt["type"], "failed");
+        assert_eq!(receipt["failed_ids"], serde_json::json!(["selected"]));
+        assert!(provider.calls.lock().unwrap().is_empty());
+        for entry in &entries {
+            assert_eq!(
+                serde_json::to_value(state.db.get_entry(&entry.id).unwrap().unwrap()).unwrap(),
+                serde_json::to_value(entry).unwrap()
+            );
+        }
+    }
+
     struct EstimateProvider {
         model: Option<String>,
         policy: Option<locust_core::model_policy::ModelPolicy>,
@@ -341,6 +607,53 @@ mod tests {
             .send()
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn scoped_http_estimate_uses_the_same_file_and_id_intersection() {
+        let (url, _server, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        let entries = [
+            StringEntry::new("menu", "日本語", "menus.json".into()),
+            StringEntry::new("intro", "Opening", "intro.json".into()),
+            StringEntry::new("other", "Unselected", "menus.json".into()),
+        ];
+        state.db.save_entries(&entries).unwrap();
+        let provider = Arc::new(EstimateProvider {
+            model: None,
+            policy: None,
+            cost: Some(0.0),
+            calls: Default::default(),
+            gate: None,
+        });
+        state
+            .provider_registry
+            .write()
+            .await
+            .register(provider.clone());
+        let mut options = estimate_options();
+        options["file_paths"] = serde_json::json!(["menus.json"]);
+        options["entry_ids"] = serde_json::json!(["menu", "intro"]);
+        options["file_priority"] = serde_json::json!(["intro.json"]);
+        let response = estimate_post(&url, options.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["entry_count"], 1);
+        assert_eq!(body["source_bytes"], "日本語".len());
+        assert_eq!(
+            *provider.calls.lock().unwrap(),
+            [("日本語".len(), "es".into())]
+        );
+        options["entry_ids"] = serde_json::json!([]);
+        let body: serde_json::Value = estimate_post(&url, options).await.json().await.unwrap();
+        assert_eq!(body["entry_count"], 0);
+        assert!(state.active_jobs.is_empty());
+        for entry in &entries {
+            assert_eq!(
+                serde_json::to_value(state.db.get_entry(&entry.id).unwrap().unwrap()).unwrap(),
+                serde_json::to_value(entry).unwrap()
+            );
+        }
     }
 
     async fn estimate_snapshot(url: &str, state: &AppState) -> Vec<serde_json::Value> {

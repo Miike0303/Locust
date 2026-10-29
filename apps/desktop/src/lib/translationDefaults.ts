@@ -164,6 +164,9 @@ export type TranslationStartForm = {
   /** Raw; empty string → null cost limit. */
   costLimit: string;
   gameContext: string;
+  filePaths?: readonly string[];
+  entryIds?: readonly string[];
+  filePriority?: readonly string[];
 };
 
 export function buildTranslationStartParams(form: TranslationStartForm): {
@@ -179,6 +182,9 @@ export function buildTranslationStartParams(form: TranslationStartForm): {
     use_glossary: boolean;
     use_memory: boolean;
     skip_approved: boolean;
+    file_paths?: string[];
+    entry_ids?: string[];
+    file_priority?: string[];
   };
 } {
   const rawCost = form.costLimit.trim();
@@ -204,6 +210,9 @@ export function buildTranslationStartParams(form: TranslationStartForm): {
       use_glossary: true,
       use_memory: true,
       skip_approved: true,
+      ...(form.filePaths !== undefined ? { file_paths: [...new Set(form.filePaths)] } : {}),
+      ...(form.entryIds !== undefined ? { entry_ids: [...new Set(form.entryIds)] } : {}),
+      ...(form.filePriority?.length ? { file_priority: [...new Set(form.filePriority)] } : {}),
     },
   };
 }

@@ -271,6 +271,11 @@ export interface TranslationStartParams {
     max_concurrent?: number; max_batch_tokens?: number | null; cost_limit_usd: number | null;
     game_context: string | null; use_glossary: boolean;
     use_memory: boolean; skip_approved: boolean;
+    /** Exact catalog selectors intersect. Omitted = all; [] = none. */
+    file_paths?: string[];
+    entry_ids?: string[];
+    /** Ordered catalog paths; never expands scope. */
+    file_priority?: string[];
   };
 }
 
@@ -495,9 +500,9 @@ export { encodedByteLen } from "./binaryBudget";
 export interface ProgressEventStarted { type: "started"; total: number; job_id: string }
 export interface ProgressEventBatchCompleted { type: "batch_completed"; completed: number; total: number; cost_so_far: number; cost_is_complete?: boolean; language: string | null }
 export interface ProgressEventStringTranslated { type: "string_translated"; entry_id: string; translation: string }
-export interface ProgressEventCompleted { type: "completed"; total_translated: number; remaining?: number; total_cost: number; cost_is_complete?: boolean; duration_secs: number }
+export interface ProgressEventCompleted { type: "completed"; total_translated: number; remaining?: number; total_cost: number; cost_is_complete?: boolean; duration_secs: number; /** Immutable job scope still pending after all fallbacks. */ failed_ids?: string[] }
 export interface ProgressEventBatchFailed { type: "batch_failed"; entry_id: string | null; error: string }
-export interface ProgressEventFailed { type: "failed"; entry_id: string | null; error: string }
+export interface ProgressEventFailed { type: "failed"; entry_id: string | null; error: string; /** Frozen job scope still pending; omitted for cancellation. */ failed_ids?: string[] }
 export interface ProgressEventProviderSwitched {
   type: "provider_switched";
   provider_id: string;

@@ -80,6 +80,37 @@ impl Database {
         query_entries(&conn, &sql, &params_refs, &mut OriginalCache::new())
     }
 
+    /// Scope in SQL, before hydrating rows or their TextAsset originals. JSON
+    /// arrays avoid SQLite's bind-variable limit for large explicit ID sets.
+    /// Selectors intersect; Some([]) selects nothing. Paths are catalog paths,
+    /// never filesystem lookups, glob patterns, or directory prefixes.
+    pub fn get_pending_entries_scoped(
+        &self,
+        file_paths: Option<&[PathBuf]>,
+        entry_ids: Option<&[String]>,
+    ) -> Result<Vec<StringEntry>> {
+        if file_paths.is_some_and(<[PathBuf]>::is_empty)
+            || entry_ids.is_some_and(<[String]>::is_empty)
+        {
+            return Ok(Vec::new());
+        }
+        let conn = lock_connection(&self.conn);
+        let mut sql = format!("SELECT {ENTRY_COLUMNS} FROM strings WHERE status = 'pending'");
+        let mut values = Vec::<Value>::new();
+        if let Some(paths) = file_paths {
+            sql.push_str(" AND file_path IN (SELECT value FROM json_each(?))");
+            let paths: Vec<_> = paths.iter().map(|p| p.to_string_lossy()).collect();
+            values.push(serde_json::to_string(&paths)?.into());
+        }
+        if let Some(ids) = entry_ids {
+            sql.push_str(" AND id IN (SELECT value FROM json_each(?))");
+            values.push(serde_json::to_string(ids)?.into());
+        }
+        sql.push_str(" ORDER BY id");
+        let params: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v as _).collect();
+        query_entries(&conn, &sql, &params, &mut OriginalCache::new())
+    }
+
     /// Return a page and its unpaginated total. Unfiltered/status-only pages
     /// count a covering index and walk the id index in one read snapshot.
     /// Selective filters retain the window query and its empty-page count.
@@ -1722,3 +1753,130 @@ fn read_entry(conn: &Connection, id: &str) -> Result<Option<StringEntry>> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod scoped_write_tests {
+    use super::*;
+    use crate::glossary::Glossary;
+    use crate::translation::{run_fallback_chain, TranslationOptions, TranslationProvider};
+
+    #[derive(Default)]
+    struct AuditProvider(std::sync::Mutex<Vec<String>>);
+
+    #[async_trait::async_trait]
+    impl TranslationProvider for AuditProvider {
+        fn id(&self) -> &str {
+            "audit"
+        }
+        fn name(&self) -> &str {
+            "Audit"
+        }
+        fn is_free(&self) -> bool {
+            true
+        }
+        fn requires_api_key(&self) -> bool {
+            false
+        }
+        async fn translate(
+            &self,
+            requests: &[crate::models::TranslationRequest],
+        ) -> Result<Vec<TranslationResult>> {
+            self.0
+                .lock()
+                .unwrap()
+                .extend(requests.iter().map(|r| r.entry_id.clone()));
+            Ok(requests
+                .iter()
+                .map(|r| TranslationResult {
+                    entry_id: r.entry_id.clone(),
+                    translation: "Answer".into(),
+                    detected_source_lang: None,
+                    provider: self.id().into(),
+                    tokens_used: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cost_usd: None,
+                })
+                .collect())
+        }
+        async fn estimate_cost(&self, _: usize, _: &str) -> Option<f64> {
+            Some(0.0)
+        }
+        async fn health_check(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_job_sql_audit_has_zero_unselected_updates_and_one_per_success() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let glossary = Arc::new(Glossary::new(db.clone()));
+        let entries: Vec<_> = [
+            ("s-memory", "Cached source"),
+            ("s-glossary", "Canonical"),
+            ("s-provider", "Provider source"),
+            ("u-memory", "Cached source"),
+            ("u-glossary", "Canonical"),
+            ("u-provider", "Provider source"),
+        ]
+        .into_iter()
+        .map(|(id, source)| StringEntry::new(id, source, "menus.json".into()))
+        .collect();
+        db.save_entries(&entries).unwrap();
+        db.save_memory(
+            &entries[0].source_hash(),
+            &entries[0].source,
+            "Cached answer",
+            "ja-en",
+        )
+        .await
+        .unwrap();
+        glossary.add("Canonical", "Term", "ja-en", None).unwrap();
+        lock_connection(&db.conn)
+            .execute_batch(
+                "CREATE TABLE scope_write_audit (id TEXT NOT NULL);
+             CREATE TRIGGER audit_scoped_updates AFTER UPDATE ON strings
+             BEGIN INSERT INTO scope_write_audit VALUES (NEW.id); END;",
+            )
+            .unwrap();
+        let provider = Arc::new(AuditProvider::default());
+        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+        run_fallback_chain(
+            &["mock".into()],
+            &|_| Some(provider.clone()),
+            db.clone(),
+            glossary,
+            TranslationOptions {
+                entry_ids: Some(vec![
+                    "s-memory".into(),
+                    "s-glossary".into(),
+                    "s-provider".into(),
+                ]),
+                ..Default::default()
+            },
+            tx,
+            "sql-audit".into(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*provider.0.lock().unwrap(), ["s-provider"]);
+        let conn = lock_connection(&db.conn);
+        let mut statement = conn
+            .prepare("SELECT id, COUNT(*) FROM scope_write_audit GROUP BY id ORDER BY id")
+            .unwrap();
+        let writes: Vec<(String, usize)> = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            writes,
+            [
+                ("s-glossary".into(), 1),
+                ("s-memory".into(), 1),
+                ("s-provider".into(), 1)
+            ]
+        );
+    }
+}

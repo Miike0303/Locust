@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -65,6 +66,18 @@ pub struct TranslationOptions {
     pub use_glossary: bool,
     pub use_memory: bool,
     pub skip_approved: bool,
+    /// Exact catalog paths. Omitted means all files; an empty list selects none.
+    /// When both selectors are present, their intersection is selected.
+    #[serde(default)]
+    pub file_paths: Option<Vec<PathBuf>>,
+    /// Explicit IDs, intersected with pending rows at job admission. Unknown IDs
+    /// and non-pending rows are ignored. An empty list never means "all".
+    #[serde(default)]
+    pub entry_ids: Option<Vec<String>>,
+    /// First occurrence wins. Unlisted files follow, with stable ID ordering.
+    /// Priorities only order the dispatch queue; they never expand the scope.
+    #[serde(default)]
+    pub file_priority: Vec<PathBuf>,
     /// Approximate input budget: source/context bytes divided by 3, plus overhead.
     #[serde(default = "default_max_batch_tokens")]
     pub max_batch_tokens: Option<usize>,
@@ -87,6 +100,9 @@ impl Default for TranslationOptions {
             use_glossary: true,
             use_memory: true,
             skip_approved: true,
+            file_paths: None,
+            entry_ids: None,
+            file_priority: Vec::new(),
             max_batch_tokens: default_max_batch_tokens(),
             allow_lossy_binary_fit: false,
         }
@@ -94,6 +110,63 @@ impl Default for TranslationOptions {
 }
 
 impl TranslationOptions {
+    /// Materialize only eligible pending rows inside the requested scope.
+    pub fn pending_entries(
+        &self,
+        db: &crate::database::Database,
+    ) -> Result<Vec<crate::models::StringEntry>> {
+        let mut entries =
+            db.get_pending_entries_scoped(self.file_paths.as_deref(), self.entry_ids.as_deref())?;
+        entries.retain(crate::models::StringEntry::is_translatable);
+        self.order_entries(&mut entries);
+        Ok(entries)
+    }
+
+    /// Freeze membership before any asynchronous job work. All passes reload
+    /// only these IDs, so insertions and newly pending rows cannot join a job.
+    pub fn capture_scope(mut self, db: &crate::database::Database) -> Result<Self> {
+        self.entry_ids = Some(
+            self.pending_entries(db)?
+                .into_iter()
+                .map(|e| e.id)
+                .collect(),
+        );
+        self.file_paths = None;
+        Ok(self)
+    }
+
+    pub(super) fn select_entries(&self, entries: &mut Vec<crate::models::StringEntry>) {
+        let ids: Option<std::collections::HashSet<_>> =
+            self.entry_ids.as_ref().map(|ids| ids.iter().collect());
+        let files: Option<std::collections::HashSet<_>> = self
+            .file_paths
+            .as_ref()
+            .map(|files| files.iter().map(|path| path.as_os_str()).collect());
+        entries.retain(|entry| {
+            ids.as_ref().is_none_or(|ids| ids.contains(&entry.id))
+                && files
+                    .as_ref()
+                    .is_none_or(|files| files.contains(entry.file_path.as_os_str()))
+        });
+        self.order_entries(entries);
+    }
+
+    fn order_entries(&self, entries: &mut [crate::models::StringEntry]) {
+        if self.file_priority.is_empty() {
+            return;
+        }
+        let mut priorities = std::collections::HashMap::new();
+        for (index, path) in self.file_priority.iter().enumerate() {
+            priorities.entry(path.as_os_str()).or_insert(index);
+        }
+        entries.sort_by_key(|entry| {
+            priorities
+                .get(entry.file_path.as_os_str())
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
+    }
+
     /// Engine batch defaults, shared by CLI, HTTP and desktop jobs.
     pub fn defaults_for_provider(provider_id: &str) -> Self {
         let mut options = Self::default();
@@ -136,6 +209,12 @@ pub struct TranslationOptionsRequest {
     pub use_glossary: bool,
     pub use_memory: bool,
     pub skip_approved: bool,
+    #[serde(default)]
+    pub file_paths: Option<Vec<PathBuf>>,
+    #[serde(default)]
+    pub entry_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub file_priority: Vec<PathBuf>,
     /// Missing uses the provider budget; explicit null still disables the cap.
     #[serde(default, deserialize_with = "deserialize_batch_token_override")]
     pub max_batch_tokens: Option<Option<usize>>,
@@ -173,6 +252,9 @@ impl TranslationOptionsRequest {
             use_glossary: self.use_glossary,
             use_memory: self.use_memory,
             skip_approved: self.skip_approved,
+            file_paths: self.file_paths,
+            entry_ids: self.entry_ids,
+            file_priority: self.file_priority,
             allow_lossy_binary_fit: self.allow_lossy_binary_fit,
         }
     }
@@ -191,6 +273,9 @@ impl From<TranslationOptions> for TranslationOptionsRequest {
             use_glossary: options.use_glossary,
             use_memory: options.use_memory,
             skip_approved: options.skip_approved,
+            file_paths: options.file_paths,
+            entry_ids: options.entry_ids,
+            file_priority: options.file_priority,
             allow_lossy_binary_fit: options.allow_lossy_binary_fit,
         }
     }

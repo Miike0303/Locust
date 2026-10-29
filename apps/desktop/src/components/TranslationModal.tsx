@@ -7,11 +7,10 @@ import { useState, useEffect, useRef } from "react";
 import { X } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
-import {
-	getProviders,
-	getConfig,
-	checkProviderHealth,
-} from "../lib/api";
+import * as api from "../lib/api";
+import type { TranslationStartParams } from "../lib/api";
+import { subscribeToJob } from "../lib/ws";
+import { draftProjectKey } from "../lib/projectScope";
 import { translationModalStep } from "../lib/translationJob";
 import { startSingleTranslation } from "../lib/translationStart";
 import {
@@ -55,6 +54,8 @@ interface TranslationModalProps {
 	onReview?: () => void;
 	/** Source strings of the open project, used to guess its language. */
 	sampleSources?: readonly string[];
+	/** Optional multiple selection; otherwise use the editor's current row. */
+	selectedIds?: readonly string[];
 }
 
 export default function TranslationModal({
@@ -64,13 +65,14 @@ export default function TranslationModal({
 	onComplete,
 	onReview,
 	sampleSources,
+	selectedIds,
 }: TranslationModalProps) {
 	const t = useT();
 	const { locale } = useLocale();
 	const navigate = useNavigate();
 	const { data: providers } = useQuery({
 		queryKey: ["providers"],
-		queryFn: getProviders,
+		queryFn: api.getProviders,
 		enabled: open,
 	});
 	const {
@@ -79,10 +81,13 @@ export default function TranslationModal({
 		isError: configError,
 	} = useQuery({
 		queryKey: ["config"],
-		queryFn: getConfig,
+		queryFn: api.getConfig,
 		enabled: open,
 	});
-	const { isTranslating, jobSnapshot } = useEditorStore();
+	const { isTranslating, jobSnapshot, selectedEntryId } = useEditorStore();
+	const selectedRows = selectedIds ?? (selectedEntryId ? [selectedEntryId] : []);
+	const { project } = useProjectStore.getState();
+	const projectKey = project ? draftProjectKey(project) : "";
 	const { dialogRef, dialogProps, titleProps } = useModalA11y({
 		open,
 		ownEscape: false,
@@ -97,6 +102,28 @@ export default function TranslationModal({
 	const [gameContext, setGameContext] = useState("");
 	const [useGlossary, setUseGlossary] = useState(true);
 	const [useMemory, setUseMemory] = useState(true);
+	const [scope, setScope] = useState<"all" | "selected" | "files">("all");
+	const [scopeFiles, setScopeFiles] = useState<string[]>([]);
+	const [priorityFiles, setPriorityFiles] = useState("");
+	const { data: files } = useQuery({
+		queryKey: ["file-stats", projectKey],
+		queryFn: () => api.getFileStats(),
+		enabled: open && !!project && scope === "files",
+	});
+	const [failedIds, setFailedIds] = useState<string[]>([]);
+	const lastStart = useRef<{ params: TranslationStartParams; projectKey: string } | null>(null);
+	const receiptSubscription = useRef<(() => void) | null>(null);
+	const receiptGeneration = useRef(0);
+	useEffect(() => {
+		setScope("all");
+		setScopeFiles([]);
+		setPriorityFiles("");
+		setFailedIds([]);
+		lastStart.current = null;
+		receiptGeneration.current++;
+		receiptSubscription.current?.();
+	}, [projectKey]);
+	useEffect(() => () => receiptSubscription.current?.(), []);
 
 	// Progress state
 	const [testingHealth, setTestingHealth] = useState(false);
@@ -164,14 +191,21 @@ export default function TranslationModal({
 		const base = buildTranslationStartParams({
 			providerId, fallbackIds, sourceLang, targetLang, batchSize,
 			maxConcurrent, costLimit, gameContext,
+			filePaths: scope === "files" ? scopeFiles : undefined,
+			entryIds: scope === "selected" ? selectedRows : undefined,
+			filePriority: priorityFiles.split(/\r?\n/).filter(path => path.length > 0),
 		});
 		return { ...base, options: { ...base.options, use_glossary: useGlossary, use_memory: useMemory } };
 	};
 	const step = translationModalStep({ isTranslating, snapshot: jobSnapshot });
 	const estimate = useTranslationEstimate({ enabled: open && step === "configure", config, buildParams });
 
-	const handleStart = async () => {
+	const scopeEmpty = (scope === "selected" && selectedRows.length === 0) || (scope === "files" && scopeFiles.length === 0);
+	const handleStart = async (retryParams?: TranslationStartParams) => {
 		if (estimate.pending) return;
+		if (!retryParams && scopeEmpty) return;
+		const currentProject = useProjectStore.getState().project;
+		if (!currentProject || draftProjectKey(currentProject) !== projectKey) return;
 		// Persist last-used selection for next time
 		saveLastUsedTranslationPrefs({
 			provider: providerId,
@@ -192,13 +226,32 @@ export default function TranslationModal({
 			"translation",
 		);
 		try {
-			const params = buildParams();
+			const params = retryParams ?? buildParams();
 			const projectName =
 				useProjectStore.getState().project?.name ?? "Project";
 			const providerLabel =
 				providers?.find((p) => p.id === providerId)?.name ?? providerId;
 			const result = await startSingleTranslation(params, { projectName, providerLabel });
 			if (!result) return;
+			const ownerProject = useProjectStore.getState().project;
+			if (!ownerProject || draftProjectKey(ownerProject) !== projectKey) return;
+			lastStart.current = { params, projectKey };
+			setFailedIds([]);
+			receiptSubscription.current?.();
+			const generation = ++receiptGeneration.current;
+			const finishReceipt = (ids: readonly string[] = []) => {
+				if (receiptGeneration.current !== generation) return;
+				setFailedIds([...ids]);
+				receiptSubscription.current?.();
+				receiptSubscription.current = null;
+			};
+			// This observer survives closing the modal. The job session
+			// continues to own progress and cancellation.
+			receiptSubscription.current = subscribeToJob(result.job_id, {
+				onCompleted: event => finishReceipt(event.failed_ids),
+				onFailed: event => finishReceipt(event.error === "cancelled" ? [] : event.failed_ids),
+				onPaused: () => finishReceipt(),
+			}, "translate", projectKey);
 			addLog(
 				"info",
 				t("activity.translation.started", { chain: chainLabel }),
@@ -215,6 +268,14 @@ export default function TranslationModal({
 			addToast("error", t("translate.toast.startFailed", { error: localizeApiError(err.message ?? String(err)) }));
 			setStartError(localizeApiError(err.message ?? String(err)));
 		}
+	};
+	const handleRetryFailed = () => {
+		const previous = lastStart.current;
+		if (!previous || previous.projectKey !== projectKey || failedIds.length === 0) return;
+		void handleStart({
+			...previous.params,
+			options: { ...previous.params.options, file_paths: undefined, entry_ids: [...failedIds] },
+		});
 	};
 
 	const handleCancel = async () => {
@@ -238,7 +299,7 @@ export default function TranslationModal({
 		setTestingHealth(true);
 		setHealthResult(null);
 		try {
-			const result = await checkProviderHealth(providerId);
+			const result = await api.checkProviderHealth(providerId);
 			setHealthResult(result);
 		} catch (err: unknown) {
 			const message = err instanceof Error ? err.message : String(err);
@@ -295,6 +356,39 @@ export default function TranslationModal({
 				<div className="flex-1 min-h-0 overflow-y-auto p-6">
 					{step === "configure" && (
 						<div className="space-y-4">
+							<fieldset className="space-y-2">
+								<legend className="text-body font-medium">{t("translate.scope")}</legend>
+								<label className="flex items-center gap-2 text-body">
+									<input type="radio" name="translation-scope" checked={scope === "all"} onChange={() => setScope("all")} />
+									{t("translate.scope.all")}
+								</label>
+								{selectedRows.length > 0 && (
+									<label className="flex items-center gap-2 text-body">
+										<input type="radio" name="translation-scope" checked={scope === "selected"} onChange={() => setScope("selected")} />
+										{t("translate.scope.selected")}
+									</label>
+								)}
+								<label className="flex items-center gap-2 text-body">
+									<input type="radio" name="translation-scope" checked={scope === "files"} onChange={() => setScope("files")} />
+									{t("translate.scope.files")}
+								</label>
+								{scope === "files" && (
+									<>
+										<label htmlFor="translation-scope-files" className="text-caption">{t("translate.scope.files")}</label>
+										<select
+											id="translation-scope-files" multiple size={4} value={scopeFiles}
+											onChange={e => setScopeFiles(Array.from(e.target.selectedOptions, option => option.value))}
+											className="w-full p-2 border border-border rounded bg-surface text-body"
+										>
+											{files?.map(file => <option key={file.file_path} value={file.file_path}>{file.file_path}</option>)}
+										</select>
+									</>
+								)}
+								<p className="text-caption text-text-muted">{t("translate.scope.hint")}</p>
+								<label htmlFor="translation-priority" className="block text-body font-medium">{t("translate.priority")}</label>
+								<textarea id="translation-priority" value={priorityFiles} onChange={e => setPriorityFiles(e.target.value)} rows={2} className="w-full p-2 border border-border rounded bg-surface text-body" />
+								<p className="text-caption text-text-muted">{t("translate.priorityHint")}</p>
+							</fieldset>
 							<div>
 								<div className="flex items-end justify-between gap-2">
 									<label htmlFor="translation-provider" className="text-body font-medium">{t("translate.provider")}</label>
@@ -598,10 +692,15 @@ export default function TranslationModal({
 				</div>
 
 				<footer className="shrink-0 border-t border-border bg-surface p-6 rounded-b-lg">
+					{!isTranslating && failedIds.length > 0 && lastStart.current?.projectKey === projectKey && (
+						<button type="button" onClick={handleRetryFailed} className="w-full mb-2 py-2 bg-accent hover:bg-accent-hover text-white rounded font-medium">
+							{t("translate.retryFailed", { count: failedIds.length })}
+						</button>
+					)}
 					{step === "configure" && (
 						<button
-							onClick={handleStart}
-							disabled={estimate.pending}
+							onClick={() => void handleStart()}
+							disabled={estimate.pending || scopeEmpty}
 							className="w-full py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed text-white rounded font-medium transition-colors"
 						>
 							{t("translate.start")}

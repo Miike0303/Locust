@@ -21,6 +21,484 @@ use super::manager::RepeatedSources;
 use super::protection::MAX_BINARY_SLOT_LENGTH_RETRIES;
 use super::*;
 
+fn scoped_options() -> TranslationOptions {
+    TranslationOptions {
+        use_memory: false,
+        use_glossary: false,
+        batch_size: 1,
+        max_concurrent: 1,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn scoped_partial_cancellation_preserves_receipts_without_expanding_or_completing() {
+    let (db, glossary) = setup();
+    db.save_entries(&make_entries(4)).unwrap();
+    let provider = Arc::new(PartialReceiptProvider {
+        calls: Mutex::new(Vec::new()),
+        invalid: Some("interrupt"),
+    });
+    let cancel = CancellationToken::new();
+    let (tx, mut rx) = mpsc::channel(100);
+    let task = tokio::spawn({
+        let db = db.clone();
+        let provider = provider.clone();
+        let cancel = cancel.clone();
+        async move {
+            run_fallback_chain(
+                &["p".into()],
+                &|_| Some(provider.clone()),
+                db,
+                glossary,
+                TranslationOptions {
+                    entry_ids: Some(vec!["e0".into(), "e2".into()]),
+                    batch_size: 10,
+                    ..scoped_options()
+                },
+                tx,
+                "scoped-cancel".into(),
+                cancel,
+            )
+            .await
+            .unwrap();
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while provider.calls.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(*provider.calls.lock().unwrap(), [vec!["e0", "e2"]]);
+    assert!(db.get_entry("e0").unwrap().unwrap().translation.is_some());
+    for id in ["e1", "e2", "e3"] {
+        assert!(db.get_entry(id).unwrap().unwrap().translation.is_none());
+    }
+    let mut paused = false;
+    while let Some(event) = rx.recv().await {
+        paused |= matches!(event, ProgressEvent::Paused);
+        assert!(!matches!(event, ProgressEvent::Completed { .. }));
+    }
+    assert!(paused);
+}
+
+#[test]
+fn scoped_selection_intersects_exact_paths_and_ids_and_preserves_empty() {
+    let (db, _) = setup();
+    let mut entries = make_entries(5);
+    entries[0].file_path = " menu_日本語.json ".into();
+    entries[1].file_path = "menu_日本語.json".into();
+    entries[2].file_path = entries[0].file_path.clone();
+    entries[2].status = StringStatus::Translated;
+    entries[3].source = "  ".into();
+    db.save_entries(&entries).unwrap();
+    let opts = TranslationOptions {
+        file_paths: Some(vec![entries[0].file_path.clone()]),
+        entry_ids: Some(vec![
+            "e0".into(),
+            "e1".into(),
+            "e2".into(),
+            "unknown".into(),
+            "e0".into(),
+        ]),
+        file_priority: vec![entries[1].file_path.clone()],
+        ..scoped_options()
+    };
+    assert_eq!(
+        opts.pending_entries(&db)
+            .unwrap()
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect::<Vec<_>>(),
+        ["e0"]
+    );
+    for opts in [
+        TranslationOptions {
+            entry_ids: Some(Vec::new()),
+            ..scoped_options()
+        },
+        TranslationOptions {
+            file_paths: Some(Vec::new()),
+            ..scoped_options()
+        },
+        TranslationOptions {
+            entry_ids: Some(vec!["missing".into()]),
+            ..scoped_options()
+        },
+    ] {
+        assert!(opts.pending_entries(&db).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn scoped_selection_large_id_sets_hydrate_only_selected_rows() {
+    let (db, _) = setup();
+    db.save_entries(&make_entries(12)).unwrap();
+    let mut ids: Vec<_> = (0..40_000).map(|i| format!("absent-{i}")).collect();
+    ids.extend(["e2".into(), "e7".into(), "e2".into()]);
+    crate::database::ENTRY_ROWS_MATERIALIZED.with(|count| count.set(Some(0)));
+    let entries = TranslationOptions {
+        entry_ids: Some(ids),
+        ..scoped_options()
+    }
+    .pending_entries(&db)
+    .unwrap();
+    let count = crate::database::ENTRY_ROWS_MATERIALIZED.with(|count| count.replace(None));
+    assert_eq!(count, Some(2));
+    assert_eq!(
+        entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+        ["e2", "e7"]
+    );
+}
+
+#[tokio::test]
+async fn scoped_shortcuts_and_dedup_never_write_or_call_unselected_rows() {
+    let (db, glossary) = setup();
+    let mut entries = make_entries(6);
+    for (index, source) in [
+        "Remember me",
+        "Canonical",
+        "Provider only",
+        "Remember me",
+        "Canonical",
+        "Provider only",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        entries[index].source = source.into();
+    }
+    db.save_entries(&entries).unwrap();
+    db.save_memory(
+        &entries[0].source_hash(),
+        &entries[0].source,
+        "Cached",
+        "ja-en",
+    )
+    .await
+    .unwrap();
+    glossary.add("Canonical", "Term", "ja-en", None).unwrap();
+    let provider = Arc::new(RepeatedProvider::new(RepeatedReply::Success));
+    let (tx, mut rx) = mpsc::channel(100);
+    run_fallback_chain(
+        &["p".into()],
+        &|_| Some(provider.clone()),
+        db.clone(),
+        glossary,
+        TranslationOptions {
+            entry_ids: Some(vec!["e0".into(), "e1".into(), "e2".into()]),
+            use_memory: true,
+            use_glossary: true,
+            ..scoped_options()
+        },
+        tx,
+        "scoped-shortcuts".into(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        provider
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .map(|r| r.entry_id.as_str())
+            .collect::<Vec<_>>(),
+        ["e2"]
+    );
+    assert_eq!(
+        db.get_entry("e0")
+            .unwrap()
+            .unwrap()
+            .provider_used
+            .as_deref(),
+        Some("memory")
+    );
+    assert_eq!(
+        db.get_entry("e1")
+            .unwrap()
+            .unwrap()
+            .provider_used
+            .as_deref(),
+        Some("glossary")
+    );
+    for entry in &entries[3..] {
+        assert_eq!(
+            serde_json::to_value(db.get_entry(&entry.id).unwrap().unwrap()).unwrap(),
+            serde_json::to_value(entry).unwrap()
+        );
+    }
+    let mut saved = Vec::new();
+    while let Some(event) = rx.recv().await {
+        if let ProgressEvent::StringTranslated { entry_id, .. } = event {
+            saved.push(entry_id);
+        }
+    }
+    assert_eq!(saved, ["e0", "e1", "e2"]);
+}
+
+#[tokio::test]
+async fn scoped_priority_orders_dispatch_and_fallback_without_expanding_scope() {
+    let (db, glossary) = setup();
+    let mut entries = make_entries(5);
+    for (entry, file) in entries
+        .iter_mut()
+        .zip(["later", "menus", "intro", "menus", "unselected"])
+    {
+        entry.file_path = file.into();
+    }
+    db.save_entries(&entries).unwrap();
+    let primary = Arc::new(RepeatedProvider::new(RepeatedReply::Empty));
+    let fallback = Arc::new(RepeatedProvider::new(RepeatedReply::Success));
+    let (tx, mut rx) = mpsc::channel(100);
+    run_fallback_chain(
+        &["p".into(), "f".into()],
+        &|id| {
+            Some(if id == "p" {
+                primary.clone()
+            } else {
+                fallback.clone()
+            })
+        },
+        db.clone(),
+        glossary,
+        TranslationOptions {
+            file_paths: Some(vec!["menus".into(), "intro".into(), "later".into()]),
+            file_priority: vec![
+                "intro".into(),
+                "menus".into(),
+                "intro".into(),
+                "unselected".into(),
+            ],
+            ..scoped_options()
+        },
+        tx,
+        "scoped-priority".into(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    for provider in [primary, fallback] {
+        assert_eq!(
+            provider
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .flatten()
+                .map(|r| r.entry_id.as_str())
+                .collect::<Vec<_>>(),
+            ["e2", "e1", "e3", "e0"]
+        );
+    }
+    assert!(db.get_entry("e4").unwrap().unwrap().translation.is_none());
+    let mut totals = Vec::new();
+    while let Some(event) = rx.recv().await {
+        match event {
+            ProgressEvent::Started { total, .. } => totals.push(total),
+            ProgressEvent::Completed {
+                total_translated,
+                remaining,
+                ..
+            } => {
+                assert_eq!((total_translated, remaining), (4, 0));
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(totals, [4]);
+}
+
+#[tokio::test]
+async fn scoped_membership_is_frozen_before_new_pending_rows() {
+    let (db, glossary) = setup();
+    let mut entries = make_entries(2);
+    entries[1].status = StringStatus::Translated;
+    entries[1].translation = Some("Old".into());
+    db.save_entries(&entries).unwrap();
+    let opts = scoped_options().capture_scope(&db).unwrap();
+    entries[1].status = StringStatus::Pending;
+    entries.push(StringEntry::new("new", "New source", "new.json".into()));
+    db.save_entries(&entries[1..]).unwrap();
+    let provider = Arc::new(RepeatedProvider::new(RepeatedReply::Success));
+    let (tx, _rx) = mpsc::channel(100);
+    run_fallback_chain(
+        &["p".into()],
+        &|_| Some(provider.clone()),
+        db.clone(),
+        glossary,
+        opts,
+        tx,
+        "frozen".into(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(provider.calls.lock().unwrap()[0][0].entry_id, "e0");
+    assert_eq!(provider.sent(), 1);
+    assert_eq!(load_pending_entries(&db).unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn scoped_partial_retries_and_explicit_failed_retry_preserve_successes() {
+    let (db, glossary) = setup();
+    let entries = make_entries(4);
+    db.save_entries(&entries).unwrap();
+    let provider = Arc::new(PartialReceiptProvider {
+        calls: Mutex::new(Vec::new()),
+        invalid: None,
+    });
+    let (tx, _rx) = mpsc::channel(100);
+    TranslationManager::new(provider.clone(), db.clone(), glossary.clone())
+        .with_retry_config(RetryConfig {
+            initial_delay_ms: 1,
+            max_delay_ms: 1,
+            ..Default::default()
+        })
+        .translate_entries(
+            entries,
+            TranslationOptions {
+                entry_ids: Some(vec!["e1".into(), "e2".into()]),
+                batch_size: 10,
+                ..scoped_options()
+            },
+            tx,
+            "scoped-partial".into(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        *provider.calls.lock().unwrap(),
+        vec![vec!["e1", "e2"], vec!["e2"], vec!["e2"]]
+    );
+    let success = db.get_entry("e1").unwrap().unwrap();
+    let retry = Arc::new(RepeatedProvider::new(RepeatedReply::Success));
+    let (tx, _rx) = mpsc::channel(100);
+    run_fallback_chain(
+        &["retry".into()],
+        &|_| Some(retry.clone()),
+        db.clone(),
+        glossary,
+        TranslationOptions {
+            entry_ids: Some(vec!["e1".into(), "e2".into()]),
+            ..scoped_options()
+        },
+        tx,
+        "retry-failed".into(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(retry.sent(), 1);
+    assert_eq!(retry.calls.lock().unwrap()[0][0].entry_id, "e2");
+    assert_eq!(
+        serde_json::to_value(db.get_entry("e1").unwrap().unwrap()).unwrap(),
+        serde_json::to_value(success).unwrap()
+    );
+    for id in ["e0", "e3"] {
+        assert!(db.get_entry(id).unwrap().unwrap().translation.is_none());
+    }
+}
+
+#[tokio::test]
+async fn scoped_precancelled_jobs_skip_memory_glossary_and_provider() {
+    let (db, glossary) = setup();
+    let entries = make_entries(2);
+    db.save_entries(&entries).unwrap();
+    db.save_memory(
+        &entries[0].source_hash(),
+        &entries[0].source,
+        "Cached",
+        "ja-en",
+    )
+    .await
+    .unwrap();
+    glossary
+        .add(&entries[1].source, "Term", "ja-en", None)
+        .unwrap();
+    let provider = Arc::new(RepeatedProvider::new(RepeatedReply::Success));
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let (tx, mut rx) = mpsc::channel(100);
+    TranslationManager::new(provider.clone(), db.clone(), glossary)
+        .translate_entries(
+            entries,
+            TranslationOptions {
+                entry_ids: Some(vec!["e0".into(), "e1".into()]),
+                use_memory: true,
+                use_glossary: true,
+                ..scoped_options()
+            },
+            tx,
+            "cancel".into(),
+            cancel,
+        )
+        .await
+        .unwrap();
+    assert_eq!(provider.sent(), 0);
+    assert_eq!(load_pending_entries(&db).unwrap().len(), 2);
+    assert!(matches!(rx.recv().await, Some(ProgressEvent::Paused)));
+}
+
+#[tokio::test]
+async fn scoped_shared_textasset_reads_siblings_but_never_dispatches_or_writes_them() {
+    for fits in [true, false] {
+        let (db, glossary) = setup();
+        let original = "Menu.A: Hi\nMenu.B: Go\n      ";
+        let entries =
+            grouped_loc_entries(original, &[("a", "Menu.A", "Hi"), ("b", "Menu.B", "Go")]);
+        db.save_entries(&entries).unwrap();
+        let provider = Arc::new(GroupMapProvider::new(vec![group_script(&[(
+            "a",
+            if fits {
+                "Hola"
+            } else {
+                "This translation exceeds the shared physical cell capacity"
+            },
+        )])]));
+        let (tx, _rx) = mpsc::channel(100);
+        run_fallback_chain(
+            &["p".into()],
+            &|_| Some(provider.clone()),
+            db.clone(),
+            glossary,
+            TranslationOptions {
+                entry_ids: Some(vec!["a".into()]),
+                ..scoped_options()
+            },
+            tx,
+            "scoped-group".into(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(provider
+            .contexts
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(id, _)| id == "a"));
+        assert_eq!(
+            serde_json::to_value(db.get_entry("b").unwrap().unwrap()).unwrap(),
+            serde_json::to_value(&entries[1]).unwrap()
+        );
+        assert_eq!(
+            db.get_entry("a").unwrap().unwrap().translation.is_some(),
+            fits
+        );
+    }
+}
+
 struct PartialReceiptProvider {
     calls: Mutex<Vec<Vec<String>>>,
     invalid: Option<&'static str>,
@@ -5230,7 +5708,7 @@ async fn translation_completed_reports_database_pending_count() {
 }
 
 #[tokio::test]
-async fn translation_completed_counts_pending_outside_selected_entries() {
+async fn translation_completed_counts_only_pending_inside_selected_entries() {
     let (db, glossary) = setup();
     let selected = StringEntry::new("selected", "Hello", PathBuf::from("f.json"));
     let other = StringEntry::new("other", "World", PathBuf::from("f.json"));
@@ -5254,9 +5732,19 @@ async fn translation_completed_counts_pending_outside_selected_entries() {
     let mut completed = false;
     while let Some(event) = rx.recv().await {
         if matches!(event, ProgressEvent::Completed { .. }) {
-            assert_eq!(serde_json::to_value(event).unwrap()["remaining"], 1);
+            assert_eq!(serde_json::to_value(event).unwrap()["remaining"], 0);
             completed = true;
         }
     }
     assert!(completed);
+    assert_eq!(
+        db.get_entry("other").unwrap().unwrap().status,
+        StringStatus::Pending
+    );
+    assert!(db
+        .get_entry("other")
+        .unwrap()
+        .unwrap()
+        .translation
+        .is_none());
 }

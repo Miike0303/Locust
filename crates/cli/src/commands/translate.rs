@@ -6,7 +6,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use locust_core::config::AppConfig;
 use locust_core::glossary::Glossary;
 use locust_core::models::ProgressEvent;
-use locust_core::translation::{load_pending_entries, run_fallback_chain, TranslationOptions};
+use locust_core::translation::{run_fallback_chain, TranslationOptions};
 
 use crate::util::{format_duration, format_observed_cost, open_existing_project};
 
@@ -44,10 +44,14 @@ pub(crate) async fn cmd_translate(
     fallback: Vec<String>,
     cost_limit: Option<f64>,
     context: Option<String>,
+    files: Vec<PathBuf>,
+    ids_from: Option<PathBuf>,
+    priority: Vec<PathBuf>,
 ) -> anyhow::Result<()> {
     let db = Arc::new(open_existing_project(&project)?);
     let provider_reg = locust_providers::default_registry(&config);
     let glossary = Arc::new(Glossary::new(db.clone()));
+    let scoped = !files.is_empty() || ids_from.is_some();
 
     let opts = TranslationOptions {
         source_lang: source,
@@ -56,6 +60,9 @@ pub(crate) async fn cmd_translate(
         allow_lossy_binary_fit,
         cost_limit_usd: cost_limit,
         game_context: context,
+        file_paths: (!files.is_empty()).then_some(files),
+        entry_ids: ids_from.as_deref().map(read_scope_ids).transpose()?,
+        file_priority: priority,
         ..cli_translation_options(
             &provider_id,
             config.default_batch_size,
@@ -63,7 +70,8 @@ pub(crate) async fn cmd_translate(
             concurrency,
             max_batch_tokens,
         )
-    };
+    }
+    .capture_scope(&db)?;
 
     // Primary then fallbacks — shared chain in locust_core (same as HTTP server).
     let chain: Vec<String> = std::iter::once(provider_id).chain(fallback).collect();
@@ -81,9 +89,13 @@ pub(crate) async fn cmd_translate(
     }
     let resolve_map = Arc::new(resolve_map);
 
-    let initial_pending = load_pending_entries(&db)?.len();
+    let initial_pending = opts.pending_entries(&db)?.len();
     if initial_pending == 0 {
-        println!("No pending strings.");
+        if scoped {
+            println!("No pending strings in the selected scope.");
+        } else {
+            println!("No pending strings.");
+        }
         return Ok(());
     }
     println!(
@@ -209,7 +221,7 @@ pub(crate) async fn cmd_translate(
     }
     result??;
 
-    let left = load_pending_entries(&db)?.len();
+    let left = opts.pending_entries(&db)?.len();
     if left > 0 {
         println!(
             "\n{left} strings still pending. Re-run to continue, or add --fallback <provider>."
@@ -219,10 +231,25 @@ pub(crate) async fn cmd_translate(
                 "Translation incomplete: {left} strings still pending after provider errors"
             );
         }
+    } else if scoped {
+        println!("\nAll selected strings translated.");
     } else {
         println!("\nAll strings translated.");
     }
     Ok(())
+}
+
+fn read_scope_ids(path: &std::path::Path) -> anyhow::Result<Vec<String>> {
+    use anyhow::Context;
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading translation IDs from {}", path.display()))?;
+    // Preserve significant whitespace in IDs; skip only truly empty lines.
+    Ok(text
+        .trim_start_matches('\u{feff}')
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect())
 }
 
 fn translation_error_summary(errors: &std::collections::HashMap<String, u64>) -> Vec<String> {
@@ -249,6 +276,65 @@ mod tests {
     use super::*;
     use crate::{Cli, Commands};
     use clap::Parser;
+
+    #[test]
+    fn scoped_translation_cli_repeatable_exact_paths_and_id_file() {
+        let cli = Cli::try_parse_from([
+            "locust",
+            "translate",
+            "project.db",
+            "--provider",
+            "google",
+            "--file",
+            "  menu_日本語.json  ",
+            "--file",
+            "chapter/one.json",
+            "--ids-from",
+            "ids.txt",
+            "--priority",
+            "chapter/one.json",
+            "--priority",
+            "  menu_日本語.json  ",
+        ])
+        .unwrap();
+        let Commands::Translate {
+            files,
+            ids_from,
+            priority,
+            ..
+        } = cli.command
+        else {
+            panic!("translate expected")
+        };
+        assert_eq!(
+            files,
+            [
+                PathBuf::from("  menu_日本語.json  "),
+                "chapter/one.json".into()
+            ]
+        );
+        assert_eq!(ids_from, Some("ids.txt".into()));
+        assert_eq!(
+            priority,
+            [
+                PathBuf::from("chapter/one.json"),
+                "  menu_日本語.json  ".into()
+            ]
+        );
+    }
+
+    #[test]
+    fn scoped_translation_ids_file_preserves_whitespace_and_empty_means_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ids.txt");
+        std::fs::write(&path, "\u{feff}a\r\n\n b 日本語 \r\na\n").unwrap();
+        assert_eq!(read_scope_ids(&path).unwrap(), ["a", " b 日本語 ", "a"]);
+        std::fs::write(&path, "\n\r\n").unwrap();
+        assert!(read_scope_ids(&path).unwrap().is_empty());
+        assert!(read_scope_ids(&dir.path().join("missing")).is_err());
+        std::fs::write(&path, [0xff]).unwrap();
+        assert!(read_scope_ids(&path).is_err());
+    }
 
     #[test]
     fn provider_translation_defaults_cli_settings_and_partial_flags() {

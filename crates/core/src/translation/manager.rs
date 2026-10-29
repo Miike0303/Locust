@@ -807,13 +807,18 @@ impl TranslationManager {
     /// Used by multi-provider chains so only the outer job emits terminal events.
     pub async fn translate_entries_inner(
         &self,
-        entries: Vec<StringEntry>,
-        opts: TranslationOptions,
+        mut entries: Vec<StringEntry>,
+        mut opts: TranslationOptions,
         tx: mpsc::Sender<ProgressEvent>,
         job_id: String,
         cancel: CancellationToken,
         emit_lifecycle: bool,
     ) -> Result<()> {
+        // The caller's row snapshot is also a scope. Never let explicit options
+        // expand it; all shortcut, dedup, repair and group work starts here.
+        opts.select_entries(&mut entries);
+        opts.entry_ids = Some(entries.iter().map(|entry| entry.id.clone()).collect());
+        opts.file_paths = None;
         let notes = CharacterNotes::load(&self.db)?;
         let glossary = OnceLock::new();
         self.translate_entries_accounted(
@@ -844,6 +849,13 @@ impl TranslationManager {
         job_glossary: &OnceLock<JobGlossary>,
     ) -> Result<()> {
         let start = Instant::now();
+
+        if cancel.is_cancelled() {
+            if emit_lifecycle {
+                let _ = tx.send(ProgressEvent::Paused).await;
+            }
+            return Ok(());
+        }
 
         if opts.batch_size == 0 || opts.max_batch_tokens == Some(0) {
             return Err(LocustError::ProviderError(
@@ -2098,10 +2110,7 @@ impl TranslationManager {
             } else {
                 ProgressEvent::Completed {
                     total_translated: completed,
-                    remaining: self.db.count_entries(&crate::database::EntryFilter {
-                        status: Some(StringStatus::Pending),
-                        ..Default::default()
-                    })?,
+                    remaining: opts.pending_entries(&self.db)?.len(),
                     total_cost: cumulative_cost.amount,
                     cost_is_complete: cumulative_cost.complete,
                     duration_secs: duration,
@@ -2169,7 +2178,8 @@ pub async fn run_fallback_chain(
         ));
     }
     let start = Instant::now();
-    let initial = load_pending_entries(&db)?;
+    let opts = opts.capture_scope(&db)?;
+    let initial = opts.pending_entries(&db)?;
     let initial_total = initial.len();
 
     let _ = tx
@@ -2203,7 +2213,7 @@ pub async fn run_fallback_chain(
             return Ok(());
         }
 
-        let pending = load_pending_entries(&db)?;
+        let pending = opts.pending_entries(&db)?;
         if pending.is_empty() {
             break;
         }
@@ -2266,7 +2276,11 @@ pub async fn run_fallback_chain(
             tracing::warn!(provider = %id, error = %e, "provider pass failed; trying next in chain");
         }
 
-        let after = load_pending_entries(&db)?.len();
+        if cancel.is_cancelled() {
+            let _ = tx.send(ProgressEvent::Paused).await;
+            return Ok(());
+        }
+        let after = opts.pending_entries(&db)?.len();
         cumulative_completed += before.saturating_sub(after);
 
         if after == 0 {
@@ -2281,7 +2295,7 @@ pub async fn run_fallback_chain(
         }
     }
 
-    let remaining = load_pending_entries(&db)?.len();
+    let remaining = opts.pending_entries(&db)?.len();
     let total_translated = initial_total
         .saturating_sub(remaining)
         .max(cumulative_completed);

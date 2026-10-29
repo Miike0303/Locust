@@ -957,6 +957,14 @@ export const en = {
 
   // ── translate ───────────────────────────────────────────────────────────
   "translate.title": "Start Translation",
+  "translate.scope": "Scope",
+  "translate.scope.all": "All pending",
+  "translate.scope.selected": "Selected rows",
+  "translate.scope.files": "These files",
+  "translate.scope.hint": "Only pending rows in this scope will be translated.",
+  "translate.priority": "File priority",
+  "translate.priorityHint": "Exact file paths, one per line, first to last. Other selected files follow.",
+  "translate.retryFailed": "Retry failed only ({count})",
   "translate.progressTitle": "Translation Progress",
   "translate.closeAria": "Close translation dialog",
   "translate.provider": "Provider",
