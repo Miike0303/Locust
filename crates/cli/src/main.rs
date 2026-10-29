@@ -349,6 +349,16 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum GlossaryCommands {
+    /// Merge a validated JSON array of glossary entries in one transaction.
+    Import {
+        project: PathBuf,
+        /// JSON entries: term, translation, lang_pair, context, case_sensitive.
+        #[arg(short, long)]
+        input: PathBuf,
+        /// Replace conflicting destination terms with the imported entries.
+        #[arg(long)]
+        overwrite: bool,
+    },
     Add {
         project: PathBuf,
         #[arg(short, long)]
@@ -629,6 +639,37 @@ mod tests {
         // Verify the CLI struct parses without panicking
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn glossary_import_parses_bulk_input_and_conflict_policy() {
+        for overwrite in [false, true] {
+            let mut args = vec![
+                "locust",
+                "glossary",
+                "import",
+                "project.db",
+                "--input",
+                "glossary.json",
+            ];
+            if overwrite {
+                args.push("--overwrite");
+            }
+            let Commands::Glossary {
+                action:
+                    GlossaryCommands::Import {
+                        project,
+                        input,
+                        overwrite: actual,
+                    },
+            } = Cli::try_parse_from(args).unwrap().command
+            else {
+                panic!("expected glossary import command");
+            };
+            assert_eq!(project, PathBuf::from("project.db"));
+            assert_eq!(input, PathBuf::from("glossary.json"));
+            assert_eq!(actual, overwrite);
+        }
     }
 
     #[test]

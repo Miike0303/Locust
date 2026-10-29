@@ -7,6 +7,7 @@ See ja_en_es_pipeline.md for the bounded engine and resume contracts.
 """
 import argparse
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 import hashlib
 import ipaddress
@@ -60,6 +61,27 @@ class ManifestPublicationError(PipelineError):
 def require(condition, message):
     if not condition:
         raise PipelineError(message)
+
+
+@contextmanager
+def timing(stage):
+    """Opt-in, nonsecret wall timings, including checks outside child commands."""
+    started = previous = time.perf_counter()
+    seconds = {}
+
+    def mark(component):
+        nonlocal previous
+        now = time.perf_counter()
+        seconds[component] = round(now - previous, 6)
+        previous = now
+
+    try:
+        yield mark
+    finally:
+        if os.environ.get("LOCUST_PIPELINE_TIMINGS") == "1":
+            seconds["total"] = round(time.perf_counter() - started, 6)
+            print(json.dumps({"event": "pipeline-timing", "stage": stage, "seconds": seconds},
+                             sort_keys=True), file=sys.stderr)
 
 
 def integer(value):
@@ -215,7 +237,7 @@ def publication_state(manifest):
             "last_stage": last.get("stage"), "last_exit_code": last.get("exit_code")}
 
 
-def scan(root, source=False):
+def scan(root, source=False, hash_files=True):
     """Full tree: never blanket-ignore a .locust* prefix or an unknown file."""
     root = plain(root)
     require(root.is_dir(), "Game must be a plain directory")
@@ -240,7 +262,7 @@ def scan(root, source=False):
                 stack.append(path)
             else:
                 require(info.st_nlink == 1, "Hard-linked tree member refused")
-                files[rel] = file_hash(path)
+                files[rel] = file_hash(path) if hash_files else None
     return {"files": dict(sorted(files.items())), "directories": sorted(directories)}
 
 
@@ -542,10 +564,14 @@ def validate_resume_manifest(value, seed_legacy=False):
         if entries:
             following = successors[start]
             names = ["glossary-" + phase_name + "-" + str(i) for i in range(len(entries))]
-            successors[start] = {names[0]}
+            # Keep complete histories produced by the per-term installer valid.
+            # A new run installs the same phase policy with one atomic import.
+            bulk = "glossary-" + phase_name + "-bulk"
+            successors[start] = {names[0], bulk}
+            successors[bulk] = following
             for i, name in enumerate(names):
                 successors[name] = {names[i + 1]} if i + 1 < len(names) else following
-            glossary_stages.update(names)
+            glossary_stages.update([*names, bulk])
     stages = value["stages"]
     require(isinstance(stages, list) and len(stages) >= 2, "Malformed resume stage history")
     previous, checkpoint, pivot_seen = None, "copying", False
@@ -1391,26 +1417,35 @@ class Pipeline:
             raise failure from original_error
 
     def invariants(self, before_injection=False):
-        require(scan(self.game, source=True) == self.original, "Original source changed")
-        require(file_hash(self.cli) == self.binary, "CLI binary changed")
-        if "glossary" in self.settings and (self.root / "profile/config.json").exists():
-            require(plain(self.root / "profile/config.json").read_bytes() == encoded(permitted_config(self.options)),
-                    "Glossary-bound config drift")
-        require(scan(self.pristine) == self.original, "Pristine copy changed")
-        if before_injection:
-            require(scan(self.work) == self.original and scan(self.install) == self.original, "Pre-injection copy drift")
-        if self.glossary_input is not None:
-            require(file_hash(self.glossary_input[0]) == self.glossary_input[1], "External glossary input changed")
-        if self.seed_input is not None:
-            path, identity, owner_path, owner_identity, _ = self.seed_input
-            publication_file(path, identity)
-            publication_file(owner_path, owner_identity)
-            for suffix in ("-wal", "-shm", "-journal"):
-                require(not plain(str(path) + suffix, missing=True).exists(), "Seed sidecar appeared")
-            for name in ("pipeline.lock", "pipeline-manifest.next", PUBLICATION_FAILURE):
-                require(not plain(path.parent / name, missing=True).exists(), "Seed owner became active/uncertain")
-        # Refuse any new linked/special member anywhere in the owned run.
-        scan(self.root)
+        with timing("invariants") as mark:
+            require(scan(self.game, source=True) == self.original, "Original source changed")
+            mark("source_tree")
+            require(file_hash(self.cli) == self.binary, "CLI binary changed")
+            mark("cli_hash")
+            if "glossary" in self.settings and (self.root / "profile/config.json").exists():
+                require(plain(self.root / "profile/config.json").read_bytes() == encoded(permitted_config(self.options)),
+                        "Glossary-bound config drift")
+            require(scan(self.pristine) == self.original, "Pristine copy changed")
+            mark("pristine_tree")
+            if before_injection:
+                require(scan(self.work) == self.original and scan(self.install) == self.original, "Pre-injection copy drift")
+            mark("pre_injection_trees")
+            if self.glossary_input is not None:
+                require(file_hash(self.glossary_input[0]) == self.glossary_input[1], "External glossary input changed")
+            if self.seed_input is not None:
+                path, identity, owner_path, owner_identity, _ = self.seed_input
+                publication_file(path, identity)
+                publication_file(owner_path, owner_identity)
+                for suffix in ("-wal", "-shm", "-journal"):
+                    require(not plain(str(path) + suffix, missing=True).exists(), "Seed sidecar appeared")
+                for name in ("pipeline.lock", "pipeline-manifest.next", PUBLICATION_FAILURE):
+                    require(not plain(path.parent / name, missing=True).exists(), "Seed owner became active/uncertain")
+            mark("bound_inputs")
+            # Refuse every linked/special/sensitive member anywhere in the run.
+            # These digests were never compared; source/copy bytes are checked
+            # above, and each database/publication has its own content proofs.
+            scan(self.root, hash_files=False)
+            mark("owned_tree_structure")
 
     def db_rows(self, path, root=None):
         rows, metadata = read_database(path)
@@ -1440,16 +1475,30 @@ class Pipeline:
     def install_glossary(self, path):
         if "glossary" not in self.settings:
             return
-        self.verify_glossary(path, [])
-        before = read_database(path)
-        entries = glossary_entries(self.settings, path.name)
         language, pair = ("english", "ja-en") if path == self.en else ("spanish", "en-es")
-        for i, entry in enumerate(entries):
-            self.command("glossary-" + language + "-" + str(i), ["glossary", "add", path,
-                         "--term=" + entry["term"], "--translation=" + entry["translation"], "--lang-pair", pair])
-            self.verify_glossary(path, entries[:i + 1])
-            require(read_database(path) == before, "Glossary CLI changed resource rows/metadata")
-        self.verify_glossary(path)
+        with timing("glossary-install:" + language) as mark:
+            self.verify_glossary(path, [])
+            mark("empty_glossary_check")
+            entries = glossary_entries(self.settings, path.name)
+            if entries:
+                before = read_database(path)
+                mark("resource_snapshot_before")
+                payload = [{**entry, "lang_pair": pair, "context": None, "case_sensitive": False} for entry in entries]
+                catalog = plain(self.root / "profile" / ("glossary-" + language + ".json"), missing=True)
+                data = encoded(payload)
+                with catalog.open("xb") as stream:
+                    stream.write(data)
+                proof = publication_file(catalog)
+                require(proof["sha256"] == hashlib.sha256(data).hexdigest() and proof["size"] == len(data),
+                        "Glossary import payload drift")
+                mark("payload_proof")
+                self.command("glossary-" + language + "-bulk",
+                             ["glossary", "import", path, "--input", catalog, "--overwrite"], bound_input=(catalog, proof))
+                mark("import_inclusive")
+                require(read_database(path) == before, "Glossary CLI changed resource rows/metadata")
+                mark("resource_snapshot_after")
+            self.verify_glossary(path)
+            mark("exact_glossary_check")
 
     def snapshot(self, path):
         rows, metadata = read_database(path)
@@ -1466,39 +1515,48 @@ class Pipeline:
     def checkpoints(self):
         return {path.name: self.snapshot(path) for path in (self.en, self.es) if path.exists()}
 
-    def command(self, stage, args, structured=False, accepted_codes=(0,)):
-        self.invariants(before_injection=not self.manifest["injection_started"])
-        if not stage.startswith("glossary-"):
-            for path in (self.en, self.es):
-                if path.exists():
-                    self.verify_glossary(path)
-        self.manifest["active_command"] = stage
-        self.save()
-        start = time.monotonic()
-        try:
-            result = subprocess.run([str(self.cli), "--config", str(self.root / "profile/config.json"), *map(str, args)],
-                                    cwd=self.root, env=self.env if args[0] == "translate" and not stage.endswith("-fallback-google") else
-                                    child_environment(self.root, self.options, subscription_login=False), stdin=subprocess.DEVNULL,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    timeout=self.options.timeout, check=False)
-        except subprocess.TimeoutExpired as error:
-            # subprocess.run kills its immediate process, NOT guaranteed agy or
-            # other descendants. Preserve active marker; never retry this run.
-            self.manifest["uncertain_child"] = True
+    def command(self, stage, args, structured=False, accepted_codes=(0,), bound_input=None):
+        with timing("command:" + stage) as mark:
+            self.invariants(before_injection=not self.manifest["injection_started"])
+            mark("invariants")
+            if not stage.startswith("glossary-"):
+                for path in (self.en, self.es):
+                    if path.exists():
+                        self.verify_glossary(path)
+            mark("glossary_checks")
+            self.manifest["active_command"] = stage
             self.save()
-            raise PipelineError("Child timeout; descendant cleanup is NOT guaranteed. " + RECOVERY) from error
-        except OSError as error:
-            raise PipelineError("CLI spawn failed; " + RECOVERY) from error
-        self.manifest["active_command"] = None
-        self.manifest["stages"].append({"stage": stage, "exit_code": result.returncode,
-                                       "seconds": round(time.monotonic() - start, 3),
-                                       "stdout_sha256": hashlib.sha256(result.stdout).hexdigest(),
-                                       "stderr_sha256": hashlib.sha256(result.stderr).hexdigest()})
-        if "glossary" in self.settings:
-            self.manifest["stages"][-1]["policy_sha256"] = policy_fingerprint(self.settings, permitted_config(self.options))
-        self.save()
-        require(result.returncode in accepted_codes, "Child command failed: " + stage)
-        return strict_json(result.stdout) if structured else None
+            mark("publish_active")
+            if bound_input is not None:
+                publication_file(*bound_input)
+            mark("bound_input")
+            start = time.monotonic()
+            try:
+                result = subprocess.run([str(self.cli), "--config", str(self.root / "profile/config.json"), *map(str, args)],
+                                        cwd=self.root, env=self.env if args[0] == "translate" and not stage.endswith("-fallback-google") else
+                                        child_environment(self.root, self.options, subscription_login=False), stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        timeout=self.options.timeout, check=False)
+            except subprocess.TimeoutExpired as error:
+                # subprocess.run kills its immediate process, NOT guaranteed agy or
+                # other descendants. Preserve active marker; never retry this run.
+                self.manifest["uncertain_child"] = True
+                self.save()
+                raise PipelineError("Child timeout; descendant cleanup is NOT guaranteed. " + RECOVERY) from error
+            except OSError as error:
+                raise PipelineError("CLI spawn failed; " + RECOVERY) from error
+            mark("child")
+            self.manifest["active_command"] = None
+            self.manifest["stages"].append({"stage": stage, "exit_code": result.returncode,
+                                           "seconds": round(time.monotonic() - start, 3),
+                                           "stdout_sha256": hashlib.sha256(result.stdout).hexdigest(),
+                                           "stderr_sha256": hashlib.sha256(result.stderr).hexdigest()})
+            if "glossary" in self.settings:
+                self.manifest["stages"][-1]["policy_sha256"] = policy_fingerprint(self.settings, permitted_config(self.options))
+            self.save()
+            mark("publish_result")
+            require(result.returncode in accepted_codes, "Child command failed: " + stage)
+            return strict_json(result.stdout) if structured else None
 
     def validate(self, path, stage):
         report = self.command(stage, ["validate", path, "--json"], structured=True, accepted_codes=(0, 1))

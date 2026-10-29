@@ -1,5 +1,6 @@
 use crate::database::{Database, GlossaryEntry};
 use crate::error::Result;
+use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -183,6 +184,194 @@ impl VisibleGlossary {
     }
 }
 
+#[derive(Default)]
+struct HintNode {
+    next: HashMap<u8, usize>,
+    failure: usize,
+    output: usize,
+    entries: Vec<usize>,
+}
+
+/// Byte-oriented Aho–Corasick matcher. All patterns and haystacks are valid UTF-8,
+/// so a successful byte match has the same boundaries as `str::contains`.
+struct HintIndex {
+    nodes: Vec<HintNode>,
+}
+
+impl HintIndex {
+    fn compile(patterns: impl Iterator<Item = (usize, String)>) -> Self {
+        let mut nodes = vec![HintNode::default()];
+        for (index, pattern) in patterns {
+            let mut node = 0;
+            for byte in pattern.bytes() {
+                let next = if let Some(next) = nodes[node].next.get(&byte) {
+                    *next
+                } else {
+                    let next = nodes.len();
+                    nodes.push(HintNode::default());
+                    nodes[node].next.insert(byte, next);
+                    next
+                };
+                node = next;
+            }
+            nodes[node].entries.push(index);
+        }
+        let mut queue: VecDeque<_> = nodes[0].next.values().copied().collect();
+        while let Some(node) = queue.pop_front() {
+            let edges: Vec<_> = nodes[node].next.iter().map(|(b, n)| (*b, *n)).collect();
+            for (byte, child) in edges {
+                let mut failure = nodes[node].failure;
+                while failure != 0 && !nodes[failure].next.contains_key(&byte) {
+                    failure = nodes[failure].failure;
+                }
+                let failure = nodes[failure].next.get(&byte).copied().unwrap_or(0);
+                nodes[child].failure = failure;
+                nodes[child].output = if nodes[failure].entries.is_empty() {
+                    nodes[failure].output
+                } else {
+                    failure
+                };
+                queue.push_back(child);
+            }
+        }
+        Self { nodes }
+    }
+
+    fn collect_matches(&self, text: &str, matched: &mut Vec<usize>) {
+        if self.nodes.len() == 1 {
+            return;
+        }
+        let mut node = 0;
+        let mut seen_outputs = HashSet::new();
+        for byte in text.bytes() {
+            while node != 0 && !self.nodes[node].next.contains_key(&byte) {
+                node = self.nodes[node].failure;
+            }
+            node = self.nodes[node].next.get(&byte).copied().unwrap_or(0);
+            let mut output = if self.nodes[node].entries.is_empty() {
+                self.nodes[node].output
+            } else {
+                node
+            };
+            while output != 0 {
+                // Revisiting a terminal also revisits its already-collected
+                // suffix chain. Repeated occurrences cannot duplicate hints or
+                // grow an intermediate vector with the length of the text.
+                if !seen_outputs.insert(output) {
+                    break;
+                }
+                matched.extend_from_slice(&self.nodes[output].entries);
+                output = self.nodes[output].output;
+            }
+        }
+    }
+}
+
+/// Reusable job-local exact and substring indexes. Input order remains the tie
+/// breaker for conflicting exact entries and equal-length hint terms.
+pub(crate) struct PreparedGlossary {
+    entries: Vec<GlossaryEntry>,
+    exact_sensitive: HashMap<String, usize>,
+    exact_ascii: HashMap<String, usize>,
+    exact_unicode: HashMap<String, usize>,
+    hint_sensitive: HintIndex,
+    hint_insensitive: HintIndex,
+}
+
+impl PreparedGlossary {
+    pub(crate) fn compile(entries: &[GlossaryEntry]) -> Self {
+        let mut exact_sensitive = HashMap::new();
+        let mut exact_ascii = HashMap::new();
+        let mut exact_unicode = HashMap::new();
+        let mut sensitive_patterns = Vec::new();
+        let mut insensitive_patterns = Vec::new();
+        for (index, entry) in entries.iter().enumerate() {
+            if entry.case_sensitive {
+                exact_sensitive.entry(entry.term.clone()).or_insert(index);
+                if !entry.term.is_empty() {
+                    sensitive_patterns.push((index, entry.term.clone()));
+                }
+            } else {
+                exact_ascii
+                    .entry(entry.term.to_ascii_lowercase())
+                    .or_insert(index);
+                let lowercase = entry.term.to_lowercase();
+                exact_unicode.entry(lowercase.clone()).or_insert(index);
+                if !entry.term.is_empty() {
+                    insensitive_patterns.push((index, lowercase));
+                }
+            }
+        }
+        Self {
+            entries: entries.to_vec(),
+            exact_sensitive,
+            exact_ascii,
+            exact_unicode,
+            hint_sensitive: HintIndex::compile(sensitive_patterns.into_iter()),
+            hint_insensitive: HintIndex::compile(insensitive_patterns.into_iter()),
+        }
+    }
+
+    pub(crate) fn lookup_exact(&self, source: &str) -> Option<String> {
+        let trimmed = source.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let mut first = self
+            .exact_sensitive
+            .get(trimmed)
+            .into_iter()
+            .chain(self.exact_sensitive.get(source))
+            .chain(self.exact_ascii.get(&trimmed.to_ascii_lowercase()))
+            .copied()
+            .min();
+        // The original scan only attempted Unicode lowercase equality when the
+        // source was non-ASCII: e.g. "K" may match "k", but "k" must not match "K".
+        if !trimmed.is_ascii() {
+            if let Some(index) = self.exact_unicode.get(&trimmed.to_lowercase()) {
+                first = Some(first.map_or(*index, |previous| previous.min(*index)));
+            }
+        }
+        first.map(|index| self.entries[index].translation.clone())
+    }
+
+    pub(crate) fn hint(&self, text: &str, max_bytes: Option<(&str, usize)>) -> Option<String> {
+        if self.entries.is_empty() || text.is_empty() {
+            return None;
+        }
+        let mut matched = Vec::new();
+        self.hint_sensitive.collect_matches(text, &mut matched);
+        // Lowercase the entire string, not each character: contextual Unicode
+        // mappings (notably Greek final sigma) must agree with `str::contains`.
+        self.hint_insensitive
+            .collect_matches(&text.to_lowercase(), &mut matched);
+        if let Some((encoding, budget)) = max_bytes {
+            matched.retain(|index| {
+                matches!(
+                    crate::validation::encoded_byte_len(encoding, &self.entries[*index].translation),
+                    Some(bytes) if bytes <= budget
+                )
+            });
+        }
+        if matched.is_empty() {
+            return None;
+        }
+        matched.sort_unstable_by(|a, b| {
+            self.entries[*b]
+                .term
+                .len()
+                .cmp(&self.entries[*a].term.len())
+                .then_with(|| a.cmp(b))
+        });
+        let mut hint = String::from("Glossary (use these translations consistently):\n");
+        for index in matched.into_iter().take(20) {
+            let entry = &self.entries[index];
+            hint.push_str(&format!("  {} → {}\n", entry.term, entry.translation));
+        }
+        Some(hint)
+    }
+}
+
 pub struct Glossary {
     db: Arc<Database>,
     #[cfg(test)]
@@ -281,32 +470,27 @@ impl Glossary {
         text: &str,
         max_bytes: Option<(&str, usize)>,
     ) -> Option<String> {
+        // This helper serves a single query. Translation jobs reuse their
+        // PreparedGlossary instead of rebuilding its indexes for every row.
         if entries.is_empty() || text.is_empty() {
             return None;
         }
         let text_lower = text.to_lowercase();
-        let mut matched: Vec<&GlossaryEntry> = entries
+        let mut matched: Vec<_> = entries
             .iter()
-            .filter(|e| {
-                if e.term.is_empty() {
-                    return false;
-                }
-                let in_text = if e.case_sensitive {
-                    text.contains(&e.term)
-                } else {
-                    text_lower.contains(&e.term.to_lowercase())
-                };
-                if !in_text {
-                    return false;
-                }
-                if let Some((enc, budget)) = max_bytes {
-                    matches!(
-                        crate::validation::encoded_byte_len(enc, &e.translation),
-                        Some(n) if n <= budget
-                    )
-                } else {
-                    true
-                }
+            .filter(|entry| {
+                !entry.term.is_empty()
+                    && if entry.case_sensitive {
+                        text.contains(&entry.term)
+                    } else {
+                        text_lower.contains(&entry.term.to_lowercase())
+                    }
+                    && max_bytes.is_none_or(|(encoding, budget)| {
+                        matches!(
+                            crate::validation::encoded_byte_len(encoding, &entry.translation),
+                            Some(bytes) if bytes <= budget
+                        )
+                    })
             })
             .collect();
         if matched.is_empty() {
@@ -337,22 +521,25 @@ impl Glossary {
         entries: &[GlossaryEntry],
         source: &str,
     ) -> Option<String> {
+        // Index construction only pays off when the caller can reuse it.
         let trimmed = source.trim();
         if trimmed.is_empty() {
             return None;
         }
-        for e in entries {
-            let hit = if e.case_sensitive {
-                e.term == trimmed || e.term == source
-            } else {
-                e.term.eq_ignore_ascii_case(trimmed)
-                    || (!trimmed.is_ascii() && e.term.to_lowercase() == trimmed.to_lowercase())
-            };
-            if hit {
-                return Some(e.translation.clone());
-            }
-        }
-        None
+        let lowercase = (!trimmed.is_ascii()).then(|| trimmed.to_lowercase());
+        entries
+            .iter()
+            .find(|entry| {
+                if entry.case_sensitive {
+                    entry.term == trimmed || entry.term == source
+                } else {
+                    entry.term.eq_ignore_ascii_case(trimmed)
+                        || lowercase
+                            .as_ref()
+                            .is_some_and(|lowercase| entry.term.to_lowercase() == *lowercase)
+                }
+            })
+            .map(|entry| entry.translation.clone())
     }
 }
 
@@ -369,6 +556,296 @@ mod tests {
             context: None,
             case_sensitive: sensitive,
         }
+    }
+
+    // Kept independently of the prepared implementation as compatibility oracles.
+    fn scan_exact(entries: &[GlossaryEntry], source: &str) -> Option<String> {
+        let trimmed = source.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        entries
+            .iter()
+            .find(|entry| {
+                if entry.case_sensitive {
+                    entry.term == trimmed || entry.term == source
+                } else {
+                    entry.term.eq_ignore_ascii_case(trimmed)
+                        || (!trimmed.is_ascii()
+                            && entry.term.to_lowercase() == trimmed.to_lowercase())
+                }
+            })
+            .map(|entry| entry.translation.clone())
+    }
+
+    fn scan_hint(
+        entries: &[GlossaryEntry],
+        text: &str,
+        max_bytes: Option<(&str, usize)>,
+    ) -> Option<String> {
+        if entries.is_empty() || text.is_empty() {
+            return None;
+        }
+        let lowercase = text.to_lowercase();
+        let mut matched: Vec<_> = entries
+            .iter()
+            .filter(|entry| {
+                !entry.term.is_empty()
+                    && if entry.case_sensitive {
+                        text.contains(&entry.term)
+                    } else {
+                        lowercase.contains(&entry.term.to_lowercase())
+                    }
+                    && max_bytes.is_none_or(|(encoding, budget)| {
+                        matches!(
+                            crate::validation::encoded_byte_len(encoding, &entry.translation),
+                            Some(bytes) if bytes <= budget
+                        )
+                    })
+            })
+            .collect();
+        matched.sort_by(|a, b| b.term.len().cmp(&a.term.len()));
+        if matched.is_empty() {
+            return None;
+        }
+        let mut hint = String::from("Glossary (use these translations consistently):\n");
+        for entry in matched.into_iter().take(20) {
+            hint.push_str(&format!("  {} → {}\n", entry.term, entry.translation));
+        }
+        Some(hint)
+    }
+
+    #[test]
+    fn prepared_exact_matches_scan_for_unicode_case_trim_and_conflict_order() {
+        let mut entries = vec![
+            explicit(" raw ", "raw-sensitive", true),
+            explicit("raw", "trim-sensitive", true),
+            explicit("RAW", "insensitive", false),
+            explicit("k", "ascii-k", false),
+            explicit("K", "kelvin", false),
+            explicit("ÉMILE", "accent", false),
+            explicit("éMILE", "accent-sensitive", true),
+            explicit("İ", "dotted-i", false),
+            explicit("i\u{307}", "combining-i", false),
+            explicit("ΟΣ", "sigma-final", false),
+            explicit("οσ", "sigma-medial", false),
+            explicit("", "empty", false),
+            explicit(" ", "blank", true),
+        ];
+        let sources = [
+            "",
+            " ",
+            " raw ",
+            "\u{2003}raw\u{a0}",
+            "RAW",
+            "k",
+            "K",
+            "K",
+            "éMILE",
+            "Émile",
+            "İ",
+            "i\u{307}",
+            "I",
+            "ΟΣ",
+            "ος",
+            "οσ",
+            " ΟΣ ",
+            "missing",
+        ];
+        for _ in 0..entries.len() {
+            let prepared = PreparedGlossary::compile(&entries);
+            for source in sources {
+                let expected = scan_exact(&entries, source);
+                assert_eq!(
+                    prepared.lookup_exact(source),
+                    expected,
+                    "source={source:?}, first term={:?}",
+                    entries[0].term
+                );
+                assert_eq!(
+                    Glossary::lookup_exact_in_entries(&entries, source),
+                    expected
+                );
+            }
+            entries.rotate_left(1);
+        }
+        // Unicode equality is deliberately asymmetric when the source is ASCII.
+        let kelvin = PreparedGlossary::compile(&[explicit("K", "kelvin", false)]);
+        assert_eq!(kelvin.lookup_exact("k"), None);
+        assert_eq!(kelvin.lookup_exact("K").as_deref(), Some("kelvin"));
+    }
+
+    #[test]
+    fn prepared_hints_match_scan_for_overlap_unicode_case_and_binary_budgets() {
+        let mut entries = vec![
+            explicit("a", "A", false),
+            explicit("ana", "corto", false),
+            explicit("banana", "plátano", false),
+            explicit("BANANA", "B", true),
+            explicit("nana", "ñ", false),
+            explicit("Σ", "sigma", false),
+            explicit("ΟΣ", "final", false),
+            explicit("οσ", "medial", false),
+            explicit("İ", "dotted", false),
+            explicit("i\u{307}", "I", false),
+            explicit("É", "é", true),
+            explicit("é", "e", false),
+            explicit("猫", "猫", true),
+            explicit("", "ignored", false),
+        ];
+        let texts = [
+            "",
+            "no match",
+            "BANANA banana bananana",
+            "ΟΣ",
+            "ΟΣΑ",
+            "ΟΣ ΟΣΑ Σ",
+            "İ I i\u{307}",
+            "É é 猫",
+            "bananana İ ΟΣ É 猫",
+        ];
+        let budgets = [
+            None,
+            Some(("utf8", 0)),
+            Some(("utf8", 1)),
+            Some(("utf8", 4)),
+            Some(("utf16le", 4)),
+            Some(("shift_jis", 4)),
+            Some(("unknown", 100)),
+        ];
+        for _ in 0..entries.len() {
+            let prepared = PreparedGlossary::compile(&entries);
+            for text in texts {
+                for budget in budgets {
+                    let expected = scan_hint(&entries, text, budget);
+                    assert_eq!(
+                        prepared.hint(text, budget),
+                        expected,
+                        "text={text:?}, budget={budget:?}, first term={:?}",
+                        entries[0].term
+                    );
+                    assert_eq!(
+                        Glossary::hint_from_entries(&entries, text, budget),
+                        expected
+                    );
+                }
+            }
+            entries.rotate_left(1);
+        }
+    }
+
+    #[test]
+    fn prepared_hints_preserve_utf8_length_ties_cap_and_duplicate_entries() {
+        let mut entries: Vec<_> = (0..25)
+            .map(|index| explicit(&format!("t{index:02}"), &format!("v{index}"), false))
+            .collect();
+        entries.insert(0, explicit("猫", "cat", false)); // Three UTF-8 bytes, like t00.
+        entries.insert(1, explicit("t00", "first duplicate", true));
+        let text = format!(
+            "猫 {} t00 t00",
+            (0..25)
+                .rev()
+                .map(|index| format!("t{index:02}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let hint = PreparedGlossary::compile(&entries)
+            .hint(&text, None)
+            .unwrap();
+        assert_eq!(Some(hint.clone()), scan_hint(&entries, &text, None));
+        assert_eq!(hint.lines().count(), 21);
+        assert_eq!(hint.lines().nth(1), Some("  猫 → cat"));
+        assert_eq!(hint.lines().nth(2), Some("  t00 → first duplicate"));
+        assert_eq!(hint.lines().nth(3), Some("  t00 → v0"));
+    }
+
+    #[test]
+    fn prepared_hints_collect_suffix_outputs_once_across_repeated_occurrences() {
+        let entries: Vec<_> = (1..=30)
+            .map(|length| explicit(&"a".repeat(length), &format!("v{length}"), false))
+            .chain([
+                explicit("ba", "ba", true),
+                explicit("cba", "cba", true),
+                explicit("dcba", "dcba", true),
+            ])
+            .collect();
+        let text = format!("ba cba dcba {} cba ba", "a".repeat(10_000));
+        assert_eq!(
+            PreparedGlossary::compile(&entries).hint(&text, None),
+            scan_hint(&entries, &text, None)
+        );
+    }
+
+    #[test]
+    #[ignore = "100k-row/1k-term W3-01 synthetic matching measurement"]
+    fn benchmark_prepared_glossary_100k_rows_1k_terms() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let entries: Vec<_> = (0..1_000)
+            .map(|index| {
+                explicit(
+                    &format!("term{index:04}"),
+                    &format!("valor{index:04}"),
+                    false,
+                )
+            })
+            .collect();
+        let rows: Vec<_> = (0..100_000)
+            .map(|index| {
+                if index % 2 == 0 {
+                    format!("term{:04}", index % 1_000)
+                } else {
+                    format!("A dialogue containing TERM{:04}.", index % 1_000)
+                }
+            })
+            .collect();
+        let start = Instant::now();
+        let before_exact = rows
+            .iter()
+            .filter(|source| black_box(scan_exact(&entries, source)).is_some())
+            .count();
+        let before_exact_time = start.elapsed();
+        let start = Instant::now();
+        let before_hints = rows
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .filter(|source| black_box(scan_hint(&entries, source, None)).is_some())
+            .count();
+        let before_hint_time = start.elapsed();
+        let start = Instant::now();
+        let prepared = PreparedGlossary::compile(&entries);
+        let compile_time = start.elapsed();
+        let start = Instant::now();
+        let after_exact = rows
+            .iter()
+            .filter(|source| black_box(prepared.lookup_exact(source)).is_some())
+            .count();
+        let after_exact_time = start.elapsed();
+        let start = Instant::now();
+        let after_hints = rows
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .filter(|source| black_box(prepared.hint(source, None)).is_some())
+            .count();
+        let after_hint_time = start.elapsed();
+        assert_eq!((before_exact, before_hints), (50_000, 50_000));
+        assert_eq!((before_exact, before_hints), (after_exact, after_hints));
+        println!(
+            "W3-01 matching rows=100000 terms=1000 exact_hits={after_exact} hint_rows={after_hints} \
+             before_exact_ms={:.3} before_hint_ms={:.3} before_total_ms={:.3} \
+             compile_ms={:.3} after_exact_ms={:.3} after_hint_ms={:.3} after_total_ms={:.3} \
+             hint_term_lowercases_before=50000000 hint_term_lowercases_after=1000",
+            before_exact_time.as_secs_f64() * 1_000.0,
+            before_hint_time.as_secs_f64() * 1_000.0,
+            (before_exact_time + before_hint_time).as_secs_f64() * 1_000.0,
+            compile_time.as_secs_f64() * 1_000.0,
+            after_exact_time.as_secs_f64() * 1_000.0,
+            after_hint_time.as_secs_f64() * 1_000.0,
+            (compile_time + after_exact_time + after_hint_time).as_secs_f64() * 1_000.0,
+        );
     }
 
     fn canonical(entries: &[GlossaryEntry], text: &str) -> std::result::Result<String, ()> {

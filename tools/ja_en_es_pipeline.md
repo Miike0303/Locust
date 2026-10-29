@@ -87,10 +87,10 @@ The interface is intentionally narrower than the core's glossary API.
 | --- | --- |
 | Input | Plain single-link JSON outside the output; never rewritten, byte-hashed and rechecked during the run |
 | Canonical settings | Exact term content, sorted by source term within each phase; filename, JSON formatting and array order are not resume authority |
-| Installation | `glossary add` through the production CLI only; no SQL writes or target replacement |
+| Installation | One atomic `glossary import --overwrite` per nonempty phase through the production CLI; exclusive byte-bound JSON payload, complete glossary verification, and resource/metadata immutability checks |
 | Phase isolation | EN DB contains only JA→EN terms; fresh ES pivot contains only EN→ES terms; other pairs, context, case flags, extra/missing terms refuse |
 | Attribution | Exact full-source shortcuts may retain production `provider_used=glossary`; other accepted rows retain their dispatched primary/fallback provider |
-| Stage binding | Every glossary-enabled stage binds canonical policy **and** reconstructed provider config with `policy_sha256`; ordered, indexed successful CLI-add stages are required |
+| Stage binding | Every glossary-enabled stage binds canonical policy **and** reconstructed provider config with `policy_sha256`; ordered successful bulk-import stages are required for new runs, and complete historical indexed CLI-add histories remain valid |
 | Resume | Reconstruct settings/config from the current invocation, independently read the complete owned DB glossary tables, and verify logical/physical snapshots before any lock/publication/child |
 
 Primary and fallback consume the **same installed phase glossary** and keep memory
@@ -567,8 +567,8 @@ Databases and copies necessarily retain game text inside the private owned root;
 reports are not an anonymity guarantee for resource filenames.
 
 Focused checks from the checkout root, after `cargo build -p locust-cli` using
-the normal `target` directory (not an alternate verification target). Production
-transport tests **fail**, rather than skip, if `target/debug/locust[.exe]` is
+the configured `CARGO_TARGET_DIR` (or the normal `target` directory when unset).
+Production transport tests **fail**, rather than skip, if its `debug/locust[.exe]` is
 missing. Both Ubuntu and Windows CI jobs retain their frontend/fmt/Clippy/Rust
 gates and additionally set up Python 3.12, build that CLI, and run each Python
 suite as a separate mandatory step with `PYTHONDONTWRITEBYTECODE=1`.
@@ -580,6 +580,62 @@ PYTHONDONTWRITEBYTECODE=1 python tools/test_qa_replay_oracle.py
 
 In PowerShell, set `$env:PYTHONDONTWRITEBYTECODE = '1'` before the same two Python
 commands.
+
+Set `LOCUST_PIPELINE_TIMINGS=1` to emit JSON timing records to stderr. Normal
+stdout and manifest child `seconds` receipts are unchanged. For example, in
+PowerShell:
+
+```powershell
+$env:LOCUST_PIPELINE_TIMINGS = '1'
+python tools/test_ja_en_es_pipeline.py ProductionTransportTests.test_glossary_actual_cli_exact_partial_fallback_and_install
+```
+
+Records contain only stage names and seconds, including failed stages:
+
+```json
+{"event":"pipeline-timing","stage":"glossary-install:english","seconds":{"empty_glossary_check":0.001,"resource_snapshot_before":0.002,"payload_proof":0.001,"import_inclusive":0.05,"resource_snapshot_after":0.002,"exact_glossary_check":0.001,"total":0.057}}
+```
+
+`glossary-install:english` and `glossary-install:spanish` include the entire
+installation, including payload creation, resource snapshots, command guards,
+manifest publications and the exact final glossary check. Nested
+`command:glossary-english-bulk` / `command:glossary-spanish-bulk` records split
+`invariants`, `glossary_checks`, `publish_active`, `bound_input`, `child` and
+`publish_result`. Every command emits the same component names. `invariants`
+records split `source_tree`, `cli_hash`, `pristine_tree`, `pre_injection_trees`,
+`bound_inputs` and `owned_tree_structure`. Each record also has inclusive
+`total`; nested totals overlap and should not be summed.
+
+The owned-root traversal checks every directory/file for links, reparse points,
+hard links, special files and sensitive names, including unknown new members.
+It no longer hashes bytes whose digest was immediately discarded. Source,
+pristine and pre-injection work/install copies retain their byte comparisons;
+CLI, external inputs, databases, catalogs and publications retain their content
+proofs. No checksum cache spans a child process.
+
+For a fair comparison, `benchmark_pipeline_wall_time.py` loads the base Python
+pipeline from `git show HEAD:tools/ja_en_es_pipeline.py` in memory and the current
+working-tree pipeline. Both run the **same current test body**; it never changes
+branches or writes base files into the checkout. Its JSON output includes test,
+pipeline-source and CLI identities, child receipts, inclusive command timings
+and stage breakdowns. The default case is the glossary exact/partial/fallback/
+installation production test above.
+
+```powershell
+python tools/benchmark_pipeline_wall_time.py --mock --repeats 3 --binary-mib 64
+python tools/benchmark_pipeline_wall_time.py --base-cli C:/binaries/base/locust.exe --branch-cli C:/binaries/branch/locust.exe --repeats 2
+```
+
+Mock mode retains real invariant scans, manifest publications and file hashing,
+while substituting the CLI. To isolate Python orchestration on the real CLI,
+pass the **same freshly built executable** for both CLI arguments first. Then
+compare separately preserved binaries rebuilt from base/branch with identical
+toolchain, features and profile; an older release binary versus a newer debug
+binary is not a matched comparison, especially because every command rehashes
+the CLI. Respect the existing `CARGO_TARGET_DIR` when building. `--base-ref`
+selects another base revision without changing the worktree. Timing records are
+opt-in diagnostics; leave the flag unset for full suite checks that assert an
+empty stderr contract.
 
 Tests use mocked subprocess orchestration plus a threaded stdlib loopback HTTP
 server and the actual production CLI. Known neutral JA/EN/ES answers exercise

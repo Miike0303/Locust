@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::database::{Database, TranslationSaveGuard};
 use crate::error::{LocustError, Result};
-use crate::glossary::{Glossary, VisibleGlossary};
+use crate::glossary::{Glossary, PreparedGlossary, VisibleGlossary};
 use crate::models::{
     ProgressEvent, StringEntry, StringStatus, TranslationRequest, TranslationResult,
 };
@@ -29,6 +29,62 @@ use super::retry::{call_provider, ProviderCall, RetryConfig};
 
 /// One immutable snapshot per job, also shared by all fallback passes.
 struct CharacterNotes(SpeakerNotes);
+
+/// Immutable glossary policy shared by every provider pass in the job. Keeping
+/// preparation lazy preserves validation-before-glossary work for malformed rows.
+struct JobGlossary {
+    prepared: PreparedGlossary,
+    visible: VisibleGlossary,
+    is_empty: bool,
+}
+
+impl JobGlossary {
+    fn load(glossary: &Glossary, opts: &TranslationOptions, has_entries: bool) -> Self {
+        let pair = format!("{}-{}", opts.source_lang, opts.target_lang);
+        let entries = if opts.use_glossary && has_entries {
+            glossary.get_all(&pair).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        Self {
+            prepared: PreparedGlossary::compile(&entries),
+            visible: VisibleGlossary::compile(&entries, &pair),
+            is_empty: entries.is_empty(),
+        }
+    }
+}
+
+/// Publish progress only after the whole source-guarded batch commits. A stale
+/// member rolls back its peers and produces no success events for that batch.
+async fn save_exact_glossary_batch(
+    db: &Database,
+    hits: &mut Vec<(StringEntry, String)>,
+    tx: &mpsc::Sender<ProgressEvent>,
+    completed: &mut usize,
+) -> Result<()> {
+    let updates = hits
+        .iter()
+        .map(|(entry, term)| {
+            (
+                entry.id.clone(),
+                term.clone(),
+                "glossary".into(),
+                TranslationSaveGuard::from(entry),
+            )
+        })
+        .collect();
+    db.save_guarded_updates(updates).await?;
+    for (entry, translation) in hits.drain(..) {
+        let _ = tx
+            .send(ProgressEvent::StringTranslated {
+                entry_id: entry.id,
+                translation,
+            })
+            .await;
+        *completed += 1;
+    }
+    Ok(())
+}
 
 impl CharacterNotes {
     fn load(db: &Database) -> Result<Self> {
@@ -759,6 +815,7 @@ impl TranslationManager {
         emit_lifecycle: bool,
     ) -> Result<()> {
         let notes = CharacterNotes::load(&self.db)?;
+        let glossary = OnceLock::new();
         self.translate_entries_accounted(
             entries,
             opts,
@@ -768,6 +825,7 @@ impl TranslationManager {
             emit_lifecycle,
             &mut ObservedCost::default(),
             &notes,
+            &glossary,
         )
         .await
     }
@@ -783,6 +841,7 @@ impl TranslationManager {
         emit_lifecycle: bool,
         cumulative_cost: &mut ObservedCost,
         notes: &CharacterNotes,
+        job_glossary: &OnceLock<JobGlossary>,
     ) -> Result<()> {
         let start = Instant::now();
 
@@ -874,18 +933,15 @@ impl TranslationManager {
         let started_at = chrono::Utc::now().to_rfc3339();
         let lang_pair = format!("{}-{}", opts.source_lang, opts.target_lang);
 
-        // Compile only explicit entries for this pair, once per run. Capacity
+        // Compile only explicit entries for this pair, once per job. Capacity
         // eligibility comes from the original row, never a cleared hint budget.
-        let glossary_entries = if opts.use_glossary && !translatable.is_empty() {
-            self.glossary.get_all(&lang_pair).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let matcher = VisibleGlossary::compile(&glossary_entries, &lang_pair);
+        let glossary = job_glossary
+            .get_or_init(|| JobGlossary::load(&self.glossary, &opts, !translatable.is_empty()));
+        let matcher = &glossary.visible;
         let mut glossary_plans = HashMap::new();
         let mut eligible = Vec::with_capacity(translatable.len());
         'entries: for entry in translatable {
-            if !glossary_entries.is_empty()
+            if !glossary.is_empty
                 && !crate::textasset_group::is_grouped_entry(&entry)
                 && crate::validation::binary_slot_budget(&entry)?.is_none()
             {
@@ -999,6 +1055,7 @@ impl TranslationManager {
         // short UI binary slots where the user already fixed a fitting form.
         if opts.use_glossary && !remaining.is_empty() {
             let mut still = Vec::with_capacity(remaining.len());
+            let mut hits = Vec::new();
             for entry in remaining.drain(..) {
                 if glossary_plans.get(&entry.id).is_some_and(|(_, phs, _)| {
                     phs.iter()
@@ -1009,9 +1066,7 @@ impl TranslationManager {
                     still.push(entry);
                     continue;
                 }
-                let Some(term) =
-                    Glossary::lookup_exact_in_entries(&glossary_entries, &entry.source)
-                else {
+                let Some(term) = glossary.prepared.lookup_exact(&entry.source) else {
                     still.push(entry);
                     continue;
                 };
@@ -1020,17 +1075,12 @@ impl TranslationManager {
                     still.push(entry);
                     continue;
                 }
-                self.db
-                    .save_translation_guarded(&entry, &term, "glossary")
-                    .await?;
-                let _ = tx
-                    .send(ProgressEvent::StringTranslated {
-                        entry_id: entry.id.clone(),
-                        translation: term,
-                    })
-                    .await;
-                completed += 1;
+                hits.push((entry, term));
+                if hits.len() == opts.batch_size {
+                    save_exact_glossary_batch(&self.db, &mut hits, &tx, &mut completed).await?;
+                }
             }
+            save_exact_glossary_batch(&self.db, &mut hits, &tx, &mut completed).await?;
             remaining = still;
         }
 
@@ -1081,7 +1131,7 @@ impl TranslationManager {
         );
         let mut in_flight: tokio::task::JoinSet<BatchOutcome> = tokio::task::JoinSet::new();
         // Group across the entire pending run, before batching/concurrency.
-        // Memory/glossary hits have already taken their normal per-row path.
+        // Memory/glossary hits have already committed through their guarded batches.
         // Only request-working copies change: save guards, cache inputs and
         // entries_by_id above retain the original row context. This feeds notes
         // through the existing dedup key AND token-budget batching estimate.
@@ -1207,8 +1257,7 @@ impl TranslationManager {
                         // Per-entry glossary: terms present in source; for binary
                         // slots also drop translations that cannot fit the budget.
                         let glossary_hint = if opts.use_glossary {
-                            Glossary::hint_from_entries(
-                                &glossary_entries,
+                            glossary.prepared.hint(
                                 &entry.source,
                                 slot_budget
                                     .as_ref()
@@ -2144,6 +2193,7 @@ pub async fn run_fallback_chain(
     }
 
     let notes = CharacterNotes::load(&db)?;
+    let job_glossary = OnceLock::new();
     let mut cumulative_completed = 0usize;
     let mut cumulative_cost = ObservedCost::default();
 
@@ -2195,6 +2245,7 @@ pub async fn run_fallback_chain(
                 false,
                 &mut cumulative_cost,
                 &notes,
+                &job_glossary,
             )
             .await
         {
@@ -2364,6 +2415,10 @@ mod observed_cost_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "w3_glossary_tests.rs"]
+mod w3_glossary_tests;
 
 #[cfg(test)]
 mod tests {

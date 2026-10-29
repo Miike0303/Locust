@@ -751,6 +751,7 @@ impl Database {
         self.save_guarded_updates(updates).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn save_translation_guarded(
         &self,
         entry: &StringEntry,

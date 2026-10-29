@@ -16,7 +16,8 @@ import unittest
 from unittest.mock import patch
 
 SCRATCH = Path(__file__).resolve().parents[1] / ".test-tmp"
-CLI = Path(__file__).resolve().parents[1] / "target/debug" / ("locust.exe" if os.name == "nt" else "locust")
+CLI = Path(os.environ.get("CARGO_TARGET_DIR", Path(__file__).resolve().parents[1] / "target")) / "debug" / (
+    "locust.exe" if os.name == "nt" else "locust")
 
 import ja_en_es_pipeline as pipeline
 from test_qa_replay_oracle import LAYOUT_CASES, layout_rejections, layout_row
@@ -236,6 +237,52 @@ class AdditionalGates(PipelineCase):
             st_file_attributes = 0x400
         self.assertTrue(pipeline.linked(Junction()))
 
+    def test_structure_only_scan_inventories_unknown_files_without_hashing(self):
+        (self.game / "unknown.bin").write_bytes(b"unknown regular member")
+        with patch.object(pipeline, "file_hash", side_effect=AssertionError("Structural scan must not read file bytes")):
+            tree = pipeline.scan(self.game, hash_files=False)
+        self.assertEqual(tree, {"files": {"game/script.rpy": None, "unknown.bin": None}, "directories": ["game"]})
+        self.assertNotEqual(pipeline.scan(self.game), tree)
+
+    def test_structure_only_scan_refuses_sensitive_and_hardlinked_members(self):
+        sensitive = self.game / ".env"
+        sensitive.write_bytes(b"synthetic, not a credential")
+        with patch.object(pipeline, "file_hash", side_effect=AssertionError("Structural scan opened file bytes")):
+            with self.assertRaisesRegex(pipeline.PipelineError, "Sensitive file/tree refused"):
+                pipeline.scan(self.game, hash_files=False)
+        sensitive.unlink()
+        member = self.game / "hardlink.bin"
+        member.write_bytes(b"not opened")
+        original = Path.lstat
+        class HardlinkInfo:
+            st_mode = 0o100644
+            st_file_attributes = 0
+            st_nlink = 2
+        def lstat(path, *args, **kwargs):
+            return HardlinkInfo() if path == member else original(path, *args, **kwargs)
+        with patch.object(Path, "lstat", lstat), patch.object(
+                pipeline, "file_hash", side_effect=AssertionError("Structural scan opened file bytes")):
+            with self.assertRaisesRegex(pipeline.PipelineError, "Hard-linked tree member refused"):
+                pipeline.scan(self.game, hash_files=False)
+
+    def test_structure_only_scan_refuses_reparse_symlink_and_special_members(self):
+        member = self.game / "unsafe.bin"
+        member.write_bytes(b"not opened")
+        original = Path.lstat
+        for mode, attributes, message in ((0o100644, 0x400, "Linked/reparse tree member refused"),
+                                          (0o120777, 0, "Linked/reparse tree member refused"),
+                                          (0o010644, 0, "Special tree member refused")):
+            with self.subTest(mode=mode, attributes=attributes):
+                class MemberInfo:
+                    st_mode = mode
+                    st_file_attributes = attributes
+                def lstat(path, *args, **kwargs):
+                    return MemberInfo() if path == member else original(path, *args, **kwargs)
+                with patch.object(Path, "lstat", lstat), patch.object(
+                        pipeline, "file_hash", side_effect=AssertionError("Structural scan opened file bytes")):
+                    with self.assertRaisesRegex(pipeline.PipelineError, message):
+                        pipeline.scan(self.game, hash_files=False)
+
     def test_nonsecret_environment_and_subscription_discovery(self):
         inherited = {"LOCUST_CONFIG": "owner-secret-config", "LOCUST_DATA_DIR": "owner-data",
                      "HTTP_PROXY": "owner-proxy", "https_proxy": "owner-proxy", "ALL_PROXY": "owner-proxy",
@@ -407,17 +454,22 @@ class GlossaryOrchestration(GlossaryRules):
             result = actual(argv, **kwargs)
             if args[0] in {"extract", "pivot"}:
                 glossaries[Path(args[-1] if args[0] == "extract" else args[3])] = []
-            if args[:2] == ["glossary", "add"]:
-                entry = tuple(a.split("=", 1)[1] for a in args if a.startswith(("--term=", "--translation=")))
-                glossaries[Path(args[2])].append((*entry, args[-1], None, 0))
-                glossaries[Path(args[2])].sort()
+            if args[:2] == ["glossary", "import"]:
+                payload = pipeline.read_json_file(Path(args[args.index("--input") + 1]))
+                self.assertIn("--overwrite", args)
+                glossaries[Path(args[2])] = sorted((entry["term"], entry["translation"], entry["lang_pair"],
+                                                   entry["context"], int(entry["case_sensitive"])) for entry in payload)
                 if fault == "wrong-case":
                     value = glossaries[Path(args[2])][-1]
                     glossaries[Path(args[2])][-1] = (*value[:-1], 1)
+                elif fault == "partial-import":
+                    glossaries[Path(args[2])].pop()
+                elif fault == "resource-drift":
+                    cli.rows[Path(args[2])][0]["source"] = "Unexpected"
             if args[0] == "translate":
                 db = Path(args[1])
                 for r in cli.rows[db]:
-                    if r["source"] == ("こんにちは" if db.name == "english.db" else "Hello"):
+                    if r["status"] in pipeline.READY and any(entry[0].lower() == r["source"].lower() for entry in glossaries[db]):
                         r["provider_used"] = "glossary"
                         if fault == "unbound-target":
                             r["translation"] = "Unexpected"
@@ -440,7 +492,131 @@ class GlossaryOrchestration(GlossaryRules):
         for database in ("english.db", "spanish.db"):
             self.assertEqual({v["provider"] for v in manifest["accepted_rows"][database].values()}, {"glossary"})
         self.assertTrue(all("policy_sha256" in stage for stage in manifest["stages"]))
-        self.assertEqual(sum(c[:2] == ["glossary", "add"] for c in cli.calls), 2)
+        self.assertEqual(sum(c[:2] == ["glossary", "import"] for c in cli.calls), 2)
+        self.assertFalse(any(c[:2] == ["glossary", "add"] for c in cli.calls))
+        self.assertEqual([s["stage"] for s in manifest["stages"] if s["stage"].startswith("glossary-")],
+                         ["glossary-english-bulk", "glossary-spanish-bulk"])
+
+    def test_bulk_installs_multiple_terms_with_one_command_per_nonempty_phase(self):
+        policy = {"version": 1, "ja-en": [
+            {"term": "進む", "translation": "Proceed"}, {"term": "こんにちは", "translation": "Hello"},
+            {"term": "学者", "translation": "Scholar"}], "en-es": []}
+        options = self.options(glossary_json=str(self.glossary(policy)))
+        cli, glossaries, reader, glossary_reader, runner = self.session(options)
+        with reader, glossary_reader, runner:
+            with self.assertRaisesRegex(pipeline.PipelineError, "inject-spanish"):
+                pipeline.Pipeline(options).run()
+        calls = [c for c in cli.calls if c[:2] == ["glossary", "import"]]
+        self.assertEqual(len(calls), 1)
+        payload = pipeline.read_json_file(Path(calls[0][calls[0].index("--input") + 1]))
+        self.assertEqual(payload, [{**entry, "lang_pair": "ja-en", "context": None, "case_sensitive": False}
+                                   for entry in sorted(policy["ja-en"], key=lambda entry: entry["term"])])
+        self.assertEqual(len(glossaries[self.root / "run/english.db"]), 3)
+        self.assertEqual(glossaries[self.root / "run/spanish.db"], [])
+
+    def test_bulk_timing_covers_checks_and_child_without_changing_receipts(self):
+        options = self.options(glossary_json=str(self.glossary()))
+        _, _, reader, glossary_reader, runner = self.session(options)
+        stderr = StringIO()
+        with reader, glossary_reader, runner, patch.dict(os.environ, {"LOCUST_PIPELINE_TIMINGS": "1"}), patch(
+                "sys.stderr", stderr):
+            with self.assertRaisesRegex(pipeline.PipelineError, "inject-spanish"):
+                pipeline.Pipeline(options).run()
+        events = [json.loads(line) for line in stderr.getvalue().splitlines()]
+        self.assertTrue(events)
+        for event in events:
+            self.assertEqual(set(event), {"event", "stage", "seconds"})
+            self.assertEqual(event["event"], "pipeline-timing")
+            self.assertTrue(all(type(value) in (int, float) and value >= 0 for value in event["seconds"].values()))
+            self.assertGreaterEqual(event["seconds"]["total"], max(event["seconds"].values()))
+        for language in ("english", "spanish"):
+            install = next(event["seconds"] for event in events if event["stage"] == "glossary-install:" + language)
+            command = next(event["seconds"] for event in events if event["stage"] == "command:glossary-" + language + "-bulk")
+            self.assertEqual(set(install), {"empty_glossary_check", "resource_snapshot_before", "payload_proof",
+                                            "import_inclusive", "resource_snapshot_after", "exact_glossary_check", "total"})
+            self.assertGreaterEqual(install["import_inclusive"], command["total"])
+            self.assertEqual(set(command), {"invariants", "glossary_checks", "publish_active", "bound_input",
+                                           "child", "publish_result", "total"})
+        invariant = next(event["seconds"] for event in events if event["stage"] == "invariants")
+        self.assertIn("cli_hash", invariant)
+        self.assertIn("owned_tree_structure", invariant)
+        manifest = pipeline.read_json_file(self.root / "run/pipeline-manifest.json")
+        for receipt in manifest["stages"]:
+            self.assertNotIn("invariants", receipt)
+            self.assertNotIn("import_inclusive", receipt)
+
+    def test_bulk_import_still_checks_complete_glossary_and_resource_immutability(self):
+        original_root = self.root
+        for fault, message in (("partial-import", "phase glossary drift"),
+                               ("resource-drift", "Glossary CLI changed resource rows/metadata")):
+            with self.subTest(fault=fault):
+                self.root = original_root / fault
+                self.root.mkdir()
+                options = self.options(glossary_json=str(self.glossary()))
+                cli, _, reader, glossary_reader, runner = self.session(options, fault)
+                with reader, glossary_reader, runner:
+                    with self.assertRaisesRegex(pipeline.PipelineError, message):
+                        pipeline.Pipeline(options).run()
+                self.assertFalse(any(c[0] == "translate" for c in cli.calls))
+        self.root = original_root
+
+    def test_bulk_and_legacy_install_histories_resume_without_reinstalling_terms(self):
+        policy = {"version": 1, "ja-en": [
+            {"term": "こんにちは", "translation": "Hello"}, {"term": "学者", "translation": "Scholar"}],
+            "en-es": [{"term": "Hello", "translation": "Hola"}]}
+        options = self.options(glossary_json=str(self.glossary(policy)))
+        cli, _, reader, glossary_reader, runner = self.session(options)
+        cli.missing = True
+        with reader, glossary_reader, runner:
+            with self.assertRaisesRegex(pipeline.PipelineError, "Missing/blank/pending"):
+                pipeline.Pipeline(options).run()
+            path = self.root / "run/pipeline-manifest.json"
+            bulk = pipeline.read_json_file(path)
+            pipeline.validate_resume_manifest(bulk)
+            legacy = copy.deepcopy(bulk)
+            index = next(i for i, stage in enumerate(legacy["stages"]) if stage["stage"] == "glossary-english-bulk")
+            receipt = legacy["stages"][index]
+            legacy["stages"][index:index + 1] = [dict(receipt, stage="glossary-english-" + str(i)) for i in range(2)]
+            pipeline.validate_resume_manifest(legacy)
+            partial = copy.deepcopy(legacy)
+            del partial["stages"][index + 1]
+            with self.assertRaisesRegex(pipeline.PipelineError, "Unordered/unknown resume stage"):
+                pipeline.validate_resume_manifest(partial)
+            path.write_bytes(pipeline.encoded(legacy))
+            before = len(cli.calls)
+            with self.assertRaisesRegex(pipeline.PipelineError, "inject-spanish"):
+                pipeline.Pipeline(replace(options, resume=True)).run()
+            imports = [c for c in cli.calls[before:] if c[:2] == ["glossary", "import"]]
+            self.assertEqual(len(imports), 1)
+            self.assertEqual(Path(imports[0][2]), self.root / "run/spanish.db")
+            stages = pipeline.read_json_file(path)["stages"]
+            self.assertEqual([s["stage"] for s in stages if s["stage"].startswith("glossary-")],
+                             ["glossary-english-0", "glossary-english-1", "glossary-spanish-bulk"])
+
+    def test_generated_bulk_payload_drift_before_launch_refuses_without_import(self):
+        original_root = self.root
+        for method in ("invariants", "save"):
+            with self.subTest(method=method):
+                self.root = original_root / method
+                self.root.mkdir()
+                options = self.options(glossary_json=str(self.glossary()))
+                cli, _, reader, glossary_reader, runner = self.session(options)
+                original, changed = getattr(pipeline.Pipeline, method), []
+                def tamper(program, *args, **kwargs):
+                    result = original(program, *args, **kwargs)
+                    catalog = program.root / "profile/glossary-english.json"
+                    if catalog.exists() and not changed:
+                        payload = pipeline.read_json_file(catalog)
+                        payload[0]["translation"] = "Untrusted"
+                        catalog.write_bytes(pipeline.encoded(payload))
+                        changed.append(True)
+                    return result
+                with reader, glossary_reader, runner, patch.object(pipeline.Pipeline, method, autospec=True, side_effect=tamper):
+                    with self.assertRaisesRegex(pipeline.PipelineError, "Publication file bytes changed"):
+                        pipeline.Pipeline(options).run()
+                self.assertEqual(changed, [True])
+                self.assertFalse(any(c[:2] == ["glossary", "import"] for c in cli.calls))
+        self.root = original_root
 
     def test_wrong_db_case_policy_and_forged_glossary_attribution_refuse(self):
         original_root = self.root
@@ -1409,7 +1585,7 @@ def fixture(root, engine, mixed_kirikiri=False, layouts=False):
 
 class ProductionTransportTests(unittest.TestCase):
     def setUp(self):
-        self.assertTrue(CLI.is_file(), "Build the checkout CLI in target/debug with cargo build -p locust-cli before these tests")
+        self.assertTrue(CLI.is_file(), "Build the checkout CLI with cargo build -p locust-cli before these tests")
         self.temp = tempfile.TemporaryDirectory(prefix="pipeline-transport-", dir=SCRATCH)
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
