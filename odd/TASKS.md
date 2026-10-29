@@ -1,8 +1,12 @@
 # Current task index
 
+## Cycle 2026-10-28 (current)
+
+Owner **"termina lo de gentle shell… sube todo a main… analiza el proyecto y continúalo"** plus speed-first steering and the 10%-Codex stop rule own [cycle 2026-10-28](tasks/cycle-2026-10-28.md). Delivered through Codex writers verified outside the sandbox, landed on `main` in four CI-green fast-forwards (`a9acd81`, `8ad661d`, `362286a`, `a84b56d`, `0ebed00`), with the fifth candidate `6d45065` (W3-01/04/06/08/09) gated locally (fe1400/0, Rust3253/0/34, fmt, clippy, CLI, 4 Python steps) and CI pending at write time. Next session: [wave 4 plan](tasks/cycle-2026-10-28-wave4-research.md) and the "Next session" section of the ledger. Owner decision pending: OPUS EN→ES local NMT pilot.
+
 ## Overnight UI/API polish
 
-Owner **"hazlo, lo  voy a dejar toda la  noche"** authorizes the accepted audit queue under [overnight UI/API polish](tasks/overnight-ui-api-polish.md). Base `d2ac99a`, new local feature branch `feat/overnight-ui-api-polish`; accessible table and notification units start first, then public reproductions, bounded memory API, measurements and current-candidate isolated screenshots. Baseline frontend1126/0, Rust3006/0/25ignored, build/fmt/Clippy PASS; no new UI/runtime acceptance yet. B2 history, retained evidence and unrelated human config are preserved. Local-only delivery remains.
+Owner **"hazlo, lo  voy a dejar toda la  noche"** authorizes the accepted audit queue under [overnight UI/API polish](tasks/overnight-ui-api-polish.md). Base `d2ac99a`, local feature branch `feat/overnight-ui-api-polish`: T1 keyboard/selection `e85417c`, T2 notifications `03305f6` (independent Risk3 PASS4138probes), T3 approval cache/isolation `5e5d377` (independent Risk4 PASS52+9). Latest frontend1180/0+build PASS; backend debug build PASS. T4 memory page cap `6b65e02` done 2026-10-28; T5-T8 superseded by cycle 2026-10-28 units (NEXT-05/06/08/10/11). Baseline Rust3006/0/25ignored; no new browser/native/runtime acceptance yet. B2 history, retained evidence and unrelated human config are preserved. Local-only delivery remains.
 
 ## Renewed continuation
 
