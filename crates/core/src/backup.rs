@@ -601,6 +601,52 @@ fn scan_source(root: &Path) -> Result<BTreeMap<PathBuf, InventoryEntry>> {
     scan_inner(root, false, exclude_store)
 }
 
+/// Large file workloads benefit from concurrent I/O; keep tiny trees serial.
+/// Metadata chooses scheduling only, never whether content must be hashed.
+pub(crate) fn file_worker_count(files: usize, bytes: u64) -> usize {
+    if bytes >= 8 * 1024 * 1024 {
+        files.clamp(1, 4)
+    } else {
+        1
+    }
+}
+
+/// Owned results in input order. Join every worker, including on failure, so
+/// callers retain their source/destination locks until all writes have stopped.
+pub(crate) fn bounded_file_work<T: Sync, U: Send>(
+    items: &[T],
+    workers: usize,
+    perform: impl Fn(&T) -> Result<U> + Sync,
+) -> Result<Vec<U>> {
+    let workers = workers.clamp(1, 4).min(items.len().max(1));
+    if workers == 1 {
+        return items.iter().map(perform).collect();
+    }
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for worker in 0..workers {
+            let perform = &perform;
+            handles.push(scope.spawn(move || {
+                items
+                    .iter()
+                    .enumerate()
+                    .skip(worker)
+                    .step_by(workers)
+                    .map(|(index, item)| perform(item).map(|value| (index, value)))
+                    .collect::<Result<Vec<_>>>()
+            }));
+        }
+        // Collect joins before inspecting errors: no worker escapes this scope.
+        let joined: Vec<_> = handles.into_iter().map(|handle| handle.join()).collect();
+        let mut results = Vec::with_capacity(items.len());
+        for entries in joined {
+            results.extend(entries.map_err(|_| failure("file worker panicked"))??);
+        }
+        results.sort_unstable_by_key(|(index, _)| *index);
+        Ok(results.into_iter().map(|(_, value)| value).collect())
+    })
+}
+
 fn scan_inner(
     root: &Path,
     legacy: bool,
@@ -611,6 +657,8 @@ fn scan_inner(
         return Err(failure("backup payload is not a directory"));
     }
     let mut inventory = BTreeMap::new();
+    let mut files = Vec::new();
+    let mut bytes = 0u64;
     for entry in WalkDir::new(root)
         .follow_links(false)
         .min_depth(1)
@@ -630,18 +678,26 @@ fn scan_inner(
             .strip_prefix(root)
             .map_err(|e| failure(e.to_string()))?
             .to_owned();
-        reject_link(entry.path(), &fs::symlink_metadata(entry.path())?)?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        reject_link(entry.path(), &metadata)?;
         if legacy && rel == Path::new("manifest.json") {
             continue;
         }
         plain_relative(&rel)?;
-        let value = if entry.file_type().is_dir() {
-            InventoryEntry::Directory
+        if entry.file_type().is_dir() {
+            inventory.insert(rel, InventoryEntry::Directory);
         } else {
-            let (sha256, size) = sha256_file(entry.path())?;
-            InventoryEntry::File { size, sha256 }
-        };
-        inventory.insert(rel, value);
+            bytes = bytes.saturating_add(metadata.len());
+            files.push(rel);
+        }
+    }
+    let entries = bounded_file_work(&files, file_worker_count(files.len(), bytes), |rel| {
+        let path = checked_absolute(&root.join(rel))?;
+        let (sha256, size) = sha256_file(&path)?;
+        Ok((rel.clone(), InventoryEntry::File { size, sha256 }))
+    })?;
+    for (rel, entry) in entries {
+        inventory.insert(rel, entry);
     }
     Ok(inventory)
 }
@@ -3138,6 +3194,90 @@ mod tests {
                 .with_pristine_tree(&backup.id, game.path(), |_| Ok(()))
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn bounded_file_work_preserves_order_and_caps_workers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let barrier = std::sync::Barrier::new(4);
+        let items: Vec<_> = (0..16).collect();
+        let output = bounded_file_work(&items, 99, |index| {
+            let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(count, Ordering::SeqCst);
+            if *index < 4 {
+                barrier.wait();
+            }
+            active.fetch_sub(1, Ordering::SeqCst);
+            Ok(index * 2)
+        })
+        .unwrap();
+        assert_eq!(
+            output,
+            items.iter().map(|index| index * 2).collect::<Vec<_>>()
+        );
+        assert_eq!(peak.load(Ordering::SeqCst), 4);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(file_worker_count(20, 7 * 1024 * 1024), 1);
+        assert_eq!(file_worker_count(20, 8 * 1024 * 1024), 4);
+    }
+
+    #[test]
+    fn bounded_file_work_joins_all_workers_before_returning_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let finished = AtomicUsize::new(0);
+        let barrier = std::sync::Barrier::new(4);
+        let result = bounded_file_work(&[0, 1, 2, 3], 4, |index| {
+            barrier.wait();
+            if *index == 0 {
+                return Err(failure("injected worker failure"));
+            }
+            finished.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(finished.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn backup_source_after_copy_rejects_same_size_restored_timestamp_drift() {
+        let game = tempdir();
+        let root = tempdir();
+        let source = game.path().join("asset.bin");
+        fs::write(&source, b"original").unwrap();
+        // Cross the parallel-hashing threshold without depending on hard links.
+        for name in ["large-a.bin", "large-b.bin"] {
+            fs::write(game.path().join(name), vec![0x5a; 4 * 1024 * 1024]).unwrap();
+        }
+        let manager = BackupManager::new(root.path().to_owned());
+        let first = manager.create_backup(game.path()).unwrap();
+        let before = fs::metadata(&source).unwrap();
+        let mut attempts = 0;
+        let result = manager.create_backup_with_linker(game.path(), |_, _| {
+            attempts += 1;
+            fs::write(&source, b"modified")?;
+            fs::File::options()
+                .write(true)
+                .open(&source)?
+                .set_times(fs::FileTimes::new().set_modified(before.modified()?))?;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "force independent copy after source drift",
+            ))
+        });
+        assert!(attempts >= 1);
+        assert!(result.is_err());
+        assert_eq!(fs::metadata(&source).unwrap().len(), before.len());
+        assert_eq!(
+            fs::metadata(&source).unwrap().modified().unwrap(),
+            before.modified().unwrap()
+        );
+        assert_eq!(manager.list_backups().unwrap().len(), 1);
+        assert_eq!(
+            fs::read(first.path.join("payload/asset.bin")).unwrap(),
+            b"original"
+        );
     }
 
     #[test]

@@ -1712,6 +1712,8 @@ fn copy_dir_for_inject_under_lock(
             callback(dest_lock.root());
         }
     });
+    let mut files = Vec::new();
+    let mut bytes = 0u64;
     for entry in WalkDir::new(&source)
         .follow_links(false)
         .into_iter()
@@ -1741,17 +1743,51 @@ fn copy_dir_for_inject_under_lock(
             if let Some(parent) = destination.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let mut input = std::fs::File::open(entry.path())?;
-            let mut output = std::fs::File::create_new(&destination)?;
-            std::io::copy(&mut input, &mut output)?;
-            output.set_permissions(input.metadata()?.permissions())?;
+            bytes = bytes.saturating_add(entry.metadata().map_err(std::io::Error::other)?.len());
+            files.push(rel.to_owned());
         }
     }
+    crate::backup::bounded_file_work(
+        &files,
+        crate::backup::file_worker_count(files.len(), bytes),
+        |rel| {
+            // Recheck after the coordinator's traversal, before opening bytes.
+            crate::patch::zipsec::ensure_no_links(root, rel)?;
+            crate::patch::zipsec::ensure_no_links(&target, rel)?;
+            let mut input = std::fs::File::open(root.join(rel))?;
+            let mut output = std::fs::File::create_new(target.join(rel))?;
+            std::io::copy(&mut input, &mut output)?;
+            output.set_permissions(input.metadata()?.permissions())?;
+            Ok(())
+        },
+    )?;
     Ok(dest_lock)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parallel_replace_copy_keeps_source_and_destination_independent() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("game");
+        let destination = temp.path().join("copy");
+        std::fs::create_dir_all(source.join("assets/empty")).unwrap();
+        let content = vec![0x5a; 3 * 1024 * 1024];
+        for name in ["a.bin", "b.bin", "c.bin"] {
+            std::fs::write(source.join("assets").join(name), &content).unwrap();
+        }
+        super::copy_dir_for_inject(&source, &destination).unwrap();
+        assert!(destination.join("assets/empty").is_dir());
+        for name in ["a.bin", "b.bin", "c.bin"] {
+            assert_eq!(
+                std::fs::read(destination.join("assets").join(name)).unwrap(),
+                content
+            );
+        }
+        std::fs::write(destination.join("assets/a.bin"), b"edited copy").unwrap();
+        assert_eq!(std::fs::read(source.join("assets/a.bin")).unwrap(), content);
+    }
+
     #[test]
     fn replace_destination_requires_one_normal_child_component() {
         let temp = tempfile::tempdir().unwrap();

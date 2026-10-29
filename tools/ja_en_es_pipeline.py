@@ -7,8 +7,11 @@ See ja_en_es_pipeline.md for the bounded engine and resume contracts.
 """
 import argparse
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from contextvars import ContextVar, copy_context
 from dataclasses import asdict, dataclass
+from functools import wraps
 import hashlib
 import ipaddress
 import json
@@ -20,6 +23,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import threading
 import time
 from urllib.parse import urlsplit
 import uuid
@@ -45,6 +49,9 @@ RESUME_PHASES = {"english-pending", "english-ready", "spanish-pending", "spanish
 PUBLICATION_FAILURE = "pipeline-publication-failure.json"
 PUBLICATION_DELAYS = (0.05, 0.1, 0.2)
 UNSET = object()
+MEASUREMENTS = ContextVar("pipeline_measurements", default=None)
+IO_COUNTERS = ("hash_bytes", "hash_files", "hash_seconds", "copy_bytes", "copy_files", "copy_seconds",
+               "scan_entries", "scan_seconds", "invariant_calls", "invariant_seconds", "child_seconds")
 RECOVERY = ("Resume refused. Retain this run; inspect owned work-game with Locust inject-status/"
             "inject-recover if needed. After any timeout, independently ensure descendants have stopped. "
             "Start a fresh output root from the untouched source; no automatic cleanup is performed.")
@@ -61,6 +68,107 @@ class ManifestPublicationError(PipelineError):
 def require(condition, message):
     if not condition:
         raise PipelineError(message)
+
+
+class Measurements:
+    """Diagnostic counters only; never inputs to any proof or resume decision.
+
+    Stage deltas include nested work. Work seconds sum worker time and can
+    exceed wall seconds; bytes count actual reads/writes, including repeats.
+    """
+    def __init__(self):
+        self.started = time.perf_counter()
+        self.counters = dict.fromkeys(IO_COUNTERS, 0)
+        self.stages = []
+        self.lock = threading.Lock()
+
+    def add(self, **counters):
+        with self.lock:
+            for key, value in counters.items():
+                self.counters[key] += value
+
+    @contextmanager
+    def activate(self):
+        token = MEASUREMENTS.set(self)
+        try:
+            yield self
+        finally:
+            MEASUREMENTS.reset(token)
+
+    @contextmanager
+    def stage(self, name):
+        before = dict(self.counters)
+        started, completed = time.perf_counter(), False
+        try:
+            yield
+            completed = True
+        finally:
+            self.stages.append({"stage": name, "completed": completed,
+                                "seconds": time.perf_counter() - started,
+                                **{key: self.counters[key] - before[key] for key in IO_COUNTERS}})
+
+    def report(self):
+        return {"version": 1, "scope": "current-invocation", "io_workers": io_workers(),
+                "seconds": time.perf_counter() - self.started,
+                "totals": dict(self.counters), "stages": list(self.stages)}
+
+
+@contextmanager
+def measured_stage(name):
+    measurements = MEASUREMENTS.get()
+    if measurements is None:
+        yield
+    else:
+        with measurements.stage(name):
+            yield
+
+
+@contextmanager
+def measured_work(kind):
+    """Record partial byte counts even when an operation fails."""
+    measurements = MEASUREMENTS.get()
+    counters = defaultdict(int)
+    started = time.perf_counter() if measurements is not None else None
+    try:
+        yield counters
+    finally:
+        if measurements is not None:
+            counters[kind + "_seconds"] += time.perf_counter() - started
+            measurements.add(**counters)
+
+
+def io_workers():
+    value = os.environ.get("LOCUST_PIPELINE_IO_WORKERS", "4")
+    require(value in {"1", "2", "3", "4"}, "I/O workers must be 1..4")
+    return int(value)
+
+
+def file_jobs(function, items, size_bytes=None):
+    """Ordered results; all workers finish before returning or raising."""
+    workers = io_workers()
+    # Size selects scheduling only. Every file is still fully content-verified.
+    if size_bytes is not None and size_bytes < 8 * 1024 * 1024:
+        workers = 1
+    if workers == 1 or len(items) < 2:
+        return list(map(function, items))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="locust-io") as pool:
+        futures = [pool.submit(copy_context().run, function, item) for item in items]
+        return [future.result() for future in futures]
+
+
+def measured_method(name, kind=None):
+    def decorate(function):
+        @wraps(function)
+        def invoke(self, *args, **kwargs):
+            stage = name(*args, **kwargs) if callable(name) else name
+            with self.measurements.activate(), measured_stage(stage):
+                if kind is None:
+                    return function(self, *args, **kwargs)
+                with measured_work(kind) as counters:
+                    counters[kind + "_calls"] += 1
+                    return function(self, *args, **kwargs)
+        return invoke
+    return decorate
 
 
 @contextmanager
@@ -182,6 +290,11 @@ def directory_identity(path):
 
 
 def file_hash(path):
+    with measured_work("hash") as counters:
+        return _file_hash(path, counters)
+
+
+def _file_hash(path, counters):
     path = plain(path)
     before = path.stat()
     require(stat.S_ISREG(before.st_mode), "Expected regular file")
@@ -194,9 +307,11 @@ def file_hash(path):
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             sha.update(chunk)
             size += len(chunk)
+            counters["hash_bytes"] += len(chunk)
         after = os.fstat(stream.fileno())
     require((before.st_size, before.st_mtime_ns) == (after.st_size, after.st_mtime_ns)
             and size == before.st_size, "File changed while hashing")
+    counters["hash_files"] += 1
     return {"sha256": sha.hexdigest(), "size": size}
 
 
@@ -239,14 +354,21 @@ def publication_state(manifest):
 
 def scan(root, source=False, hash_files=True):
     """Full tree: never blanket-ignore a .locust* prefix or an unknown file."""
+    with measured_work("scan") as counters:
+        return _scan(root, source, hash_files, counters)
+
+
+def _scan(root, source, hash_files, counters):
     root = plain(root)
     require(root.is_dir(), "Game must be a plain directory")
     files, directories = {}, []
+    size_bytes = 0
     stack = [root]
     while stack:
         directory = stack.pop()
         plain(directory)
         for path in sorted(directory.iterdir()):
+            counters["scan_entries"] += 1
             rel = safe_rel(path.relative_to(root).as_posix())
             info = path.lstat()
             require(not linked(info), "Linked/reparse tree member refused")
@@ -262,7 +384,12 @@ def scan(root, source=False, hash_files=True):
                 stack.append(path)
             else:
                 require(info.st_nlink == 1, "Hard-linked tree member refused")
-                files[rel] = file_hash(path) if hash_files else None
+                files[rel] = None
+                size_bytes += info.st_size
+    if hash_files:
+        paths = sorted(files)
+        identities = file_jobs(lambda rel: file_hash(root / rel), paths, size_bytes=size_bytes)
+        files = dict(zip(paths, identities))
     return {"files": dict(sorted(files.items())), "directories": sorted(directories)}
 
 
@@ -383,20 +510,35 @@ def preflight(options):
 
 
 def copy_tree(source, destination, expected, readonly=False):
+    with measured_stage("copy-tree"):
+        _copy_tree(source, destination, expected, readonly)
+
+
+def copy_bytes(source, destination):
+    with measured_work("copy") as counters:
+        with source.open("rb") as incoming, destination.open("xb") as outgoing:
+            for chunk in iter(lambda: incoming.read(1024 * 1024), b""):
+                outgoing.write(chunk)
+                counters["copy_bytes"] += len(chunk)
+        counters["copy_files"] += 1
+
+
+def _copy_tree(source, destination, expected, readonly):
     require(not destination.exists(), "Copy destination occupied")
     destination.mkdir()
     for rel in expected["directories"]:
         (destination / rel).mkdir(parents=True, exist_ok=True)
-    for rel, identity in expected["files"].items():
+    def copy_one(item):
+        rel, identity = item
         src, dst = plain(source / rel), destination / rel
         require(file_hash(src) == identity, "Source changed before copy")
-        with src.open("rb") as incoming, dst.open("xb") as outgoing:
-            for chunk in iter(lambda: incoming.read(1024 * 1024), b""):
-                outgoing.write(chunk)
+        copy_bytes(src, dst)
         # Preserve executable bits, not hard links or original write permissions.
         mode = stat.S_IMODE(src.stat().st_mode)
         dst.chmod((mode & ~0o222) if readonly else (mode | stat.S_IRUSR | stat.S_IWUSR))
         require(file_hash(dst) == identity, "Copy hash mismatch")
+    file_jobs(copy_one, list(expected["files"].items()),
+              size_bytes=sum(identity["size"] for identity in expected["files"].values()))
     require(scan(destination) == expected and scan(source, source=True) == expected, "Copy inventory drift")
     if readonly and os.name != "nt":
         for rel in sorted(expected["directories"], key=lambda p: p.count("/"), reverse=True):
@@ -441,6 +583,29 @@ def manifest_inventory(value):
         safe_rel(locator[0])
 
 
+def validate_measurements(value):
+    fields(value, {"version", "scope", "io_workers", "seconds", "totals", "stages"})
+    require(type(value["version"]) is int and value["version"] == 1
+            and value["scope"] == "current-invocation" and type(value["io_workers"]) is int
+            and 1 <= value["io_workers"] <= 4, "Malformed performance header")
+
+    def number(key, item):
+        if key.endswith("seconds"):
+            return type(item) in (int, float) and 0 <= item <= sys.float_info.max and math.isfinite(item)
+        return integer(item)
+
+    require(number("seconds", value["seconds"]), "Malformed performance wall time")
+    fields(value["totals"], set(IO_COUNTERS))
+    require(all(number(key, item) for key, item in value["totals"].items()), "Malformed performance counters")
+    require(isinstance(value["stages"], list), "Malformed performance stages")
+    for stage in value["stages"]:
+        fields(stage, {"stage", "completed", "seconds", *IO_COUNTERS})
+        require(nonblank(stage["stage"]) and len(stage["stage"]) <= 100
+                and type(stage["completed"]) is bool
+                and all(number(key, stage[key]) for key in ("seconds", *IO_COUNTERS)),
+                "Malformed performance stage")
+
+
 def validate_resume_manifest(value, seed_legacy=False):
     """Validate the ENTIRE resumable schema before trusting or republishing it.
 
@@ -466,7 +631,10 @@ def validate_resume_manifest(value, seed_legacy=False):
     legacy = value["version"] == 1
     if not legacy:
         required.add("accepted_rows")
-    fields(value, required, {"diagnostic"} if legacy else {"diagnostic", "seed"})
+    # Performance remains optional diagnostic data for both manifest versions.
+    fields(value, required, {"diagnostic", "performance"} if legacy else {"diagnostic", "seed", "performance"})
+    if "performance" in value:
+        validate_measurements(value["performance"])
     require(isinstance(value["run_id"], str)
             and re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", value["run_id"]),
             "Malformed resume run ID")
@@ -1114,10 +1282,13 @@ def verify_zip(path, original, work, format_id, reported):
             strict = False
             for rel, entry in entries.items():
                 sha, size = hashlib.sha256(), 0
-                with archive.open(rel) as stream:
-                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                        sha.update(chunk)
-                        size += len(chunk)
+                with measured_work("hash") as counters:
+                    with archive.open(rel) as stream:
+                        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                            sha.update(chunk)
+                            size += len(chunk)
+                            counters["hash_bytes"] += len(chunk)
+                    counters["hash_files"] += 1
                 identity = {"sha256": sha.hexdigest(), "size": size}
                 require(identity == work["files"][rel] and integer(entry.get("size"))
                         and entry["size"] == size and entry.get("patched_sha256") == identity["sha256"], "ZIP payload hash/size mismatch")
@@ -1307,6 +1478,12 @@ def derive_seed_catalog(original, destination, complete, subset):
 
 class Pipeline:
     def __init__(self, options):
+        self.measurements = Measurements()
+        with self.measurements.activate(), measured_stage("preflight"):
+            io_workers()  # Reject invalid worker settings before touching output.
+            self.prepare(options)
+
+    def prepare(self, options):
         self.options = options
         self.cli, self.game, self.root = preflight(options)
         self.manifest = None
@@ -1355,6 +1532,7 @@ class Pipeline:
     def save(self):
         if self.publication_failure is not None:
             raise self.publication_failure
+        self.manifest["performance"] = self.measurements.report()
         target, temporary = self.root / "pipeline-manifest.json", self.root / "pipeline-manifest.next"
         attempts, original_error, next_file = 0, None, None
         reason = "publication-prepare-failed"
@@ -1416,6 +1594,7 @@ class Pipeline:
                 pass
             raise failure from original_error
 
+    @measured_method("invariants", kind="invariant")
     def invariants(self, before_injection=False):
         with timing("invariants") as mark:
             require(scan(self.game, source=True) == self.original, "Original source changed")
@@ -1515,6 +1694,7 @@ class Pipeline:
     def checkpoints(self):
         return {path.name: self.snapshot(path) for path in (self.en, self.es) if path.exists()}
 
+    @measured_method(lambda stage, *args, **kwargs: "command:" + stage)
     def command(self, stage, args, structured=False, accepted_codes=(0,), bound_input=None):
         with timing("command:" + stage) as mark:
             self.invariants(before_injection=not self.manifest["injection_started"])
@@ -1532,11 +1712,12 @@ class Pipeline:
             mark("bound_input")
             start = time.monotonic()
             try:
-                result = subprocess.run([str(self.cli), "--config", str(self.root / "profile/config.json"), *map(str, args)],
-                                        cwd=self.root, env=self.env if args[0] == "translate" and not stage.endswith("-fallback-google") else
-                                        child_environment(self.root, self.options, subscription_login=False), stdin=subprocess.DEVNULL,
-                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                        timeout=self.options.timeout, check=False)
+                with measured_work("child"):
+                    result = subprocess.run([str(self.cli), "--config", str(self.root / "profile/config.json"), *map(str, args)],
+                                            cwd=self.root, env=self.env if args[0] == "translate" and not stage.endswith("-fallback-google") else
+                                            child_environment(self.root, self.options, subscription_login=False), stdin=subprocess.DEVNULL,
+                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                            timeout=self.options.timeout, check=False)
             except subprocess.TimeoutExpired as error:
                 # subprocess.run kills its immediate process, NOT guaranteed agy or
                 # other descendants. Preserve active marker; never retry this run.
@@ -1558,6 +1739,7 @@ class Pipeline:
             require(result.returncode in accepted_codes, "Child command failed: " + stage)
             return strict_json(result.stdout) if structured else None
 
+    @measured_method(lambda path, stage: "validation:" + stage)
     def validate(self, path, stage):
         report = self.command(stage, ["validate", path, "--json"], structured=True, accepted_codes=(0, 1))
         gate_validation(report, self.db_rows(path))
@@ -1565,6 +1747,7 @@ class Pipeline:
         self.manifest["stages"][-1]["classified_identical_resources"] = report["count"]
         self.save()
 
+    @measured_method(lambda path, baseline, stage: "ready:" + stage)
     def ready(self, path, baseline, stage):
         rows = self.db_rows(path)
         gate_rows(rows, baseline, self.work, self.options.format, ready=True)
@@ -1623,6 +1806,7 @@ class Pipeline:
         self.proven_rows(path, after)
         return after
 
+    @measured_method(lambda path, source, target: "translate:" + source + "-" + target)
     def translate(self, path, source, target):
         baseline = self.manifest["japanese_inventory" if source == "ja" else "spanish_inventory"]
         language = "english" if source == "ja" else "spanish"
@@ -1647,16 +1831,20 @@ class Pipeline:
             dispatch(fallback)
             self.accept_changes(path, after, fallback, baseline)
 
+    @measured_method("import-seed")
     def import_seed(self):
         self.seed_input = seed_owner(self.options.english_seed, self.original, self.options.format, self.root, self.game)
         path, identity, _, owner_identity, owner = self.seed_input
         snapshot = self.root / "seed-snapshot.db"
         publication_file(path, identity)
-        with path.open("rb") as incoming, snapshot.open("xb") as outgoing:
-            for chunk in iter(lambda: incoming.read(1024 * 1024), b""):
-                outgoing.write(chunk)
-            outgoing.flush()
-            os.fsync(outgoing.fileno())
+        with measured_work("copy") as counters:
+            with path.open("rb") as incoming, snapshot.open("xb") as outgoing:
+                for chunk in iter(lambda: incoming.read(1024 * 1024), b""):
+                    outgoing.write(chunk)
+                    counters["copy_bytes"] += len(chunk)
+                outgoing.flush()
+                os.fsync(outgoing.fileno())
+            counters["copy_files"] += 1
         self.invariants(before_injection=True)
         require(file_hash(snapshot) == {k: identity[k] for k in ("sha256", "size")}, "Seed snapshot hash mismatch")
         rows, metadata = read_database(snapshot)
@@ -1762,6 +1950,7 @@ class Pipeline:
         self.manifest["databases"] = self.checkpoints()
         self.save()
 
+    @measured_method("initialize")
     def initialize(self):
         if self.options.resume:
             require(self.root.is_dir(), "Resume root missing")
@@ -1822,9 +2011,10 @@ class Pipeline:
             with (self.root / "profile/config.json").open("xb") as stream:
                 stream.write(encoded(permitted_config(self.options)))
             self.manifest["config"] = file_hash(self.root / "profile/config.json")
-            copy_tree(self.game, self.pristine, self.original, readonly=True)
-            copy_tree(self.game, self.work, self.original)
-            copy_tree(self.game, self.install, self.original)
+            with measured_stage("prepare-copies"):
+                copy_tree(self.game, self.pristine, self.original, readonly=True)
+                copy_tree(self.game, self.work, self.original)
+                copy_tree(self.game, self.install, self.original)
             self.command("cli-capability", ["inject", "--help"])
             self.command("extract-japanese", ["extract", self.work, "--format", self.options.format, "-o", self.en])
             rows = self.db_rows(self.en)
@@ -1834,6 +2024,7 @@ class Pipeline:
             self.change_phase("english-pending")
             self.install_glossary(self.en)
 
+    @measured_method("execute")
     def execute(self):
         self.initialize()
         phase = self.manifest["phase"]
@@ -1865,20 +2056,21 @@ class Pipeline:
             self.ready(self.es, spanish_inventory, "validate-spanish")
             self.change_phase("spanish-ready")
         spanish = self.ready(self.es, spanish_inventory, "validate-spanish-current")
-        self.invariants(before_injection=True)
-        # The durable boundary precedes the command, including spawn/timeout.
-        self.manifest["injection_started"] = True
-        self.manifest["phase"] = "injection-started"
-        self.save()
-        report = self.command("inject-spanish", ["inject", self.work, "-P", self.es, "--direct", "-l", "es", "--json"], structured=True)
-        notice, evidence = verify_injection_evidence(report, self.work, self.root / "backups", self.original, self.options.format)
-        reported = gate_injection(report, spanish, self.work, self.root / "backups", informational_notice=notice)
-        if self.options.format == "html-game":
-            self.verify_html_bytes(spanish)
-        self.manifest["injection"] = {"strings_written": report["strings_written"], "strings_skipped": report["strings_skipped"],
-                                      "files_modified": report["files_modified"], "skip_reasons": report["reports"]["es"]["skip_reasons"],
-                                      "outcome": "Recorded", "backup_id": report["backup_id"], **evidence}
-        self.save()
+        with measured_stage("inject-and-proof"):
+            self.invariants(before_injection=True)
+            # The durable boundary precedes the command, including spawn/timeout.
+            self.manifest["injection_started"] = True
+            self.manifest["phase"] = "injection-started"
+            self.save()
+            report = self.command("inject-spanish", ["inject", self.work, "-P", self.es, "--direct", "-l", "es", "--json"], structured=True)
+            notice, evidence = verify_injection_evidence(report, self.work, self.root / "backups", self.original, self.options.format)
+            reported = gate_injection(report, spanish, self.work, self.root / "backups", informational_notice=notice)
+            if self.options.format == "html-game":
+                self.verify_html_bytes(spanish)
+            self.manifest["injection"] = {"strings_written": report["strings_written"], "strings_skipped": report["strings_skipped"],
+                                          "files_modified": report["files_modified"], "skip_reasons": report["reports"]["es"]["skip_reasons"],
+                                          "outcome": "Recorded", "backup_id": report["backup_id"], **evidence}
+            self.save()
         # Extract a separate resource-only work copy. Never reextract the pivot
         # DB or the recorded Direct tree (which deliberately refuses refresh).
         work_tree = scan(self.work)
@@ -1890,12 +2082,13 @@ class Pipeline:
         self.copy_proof(proof, clean_work)
         self.command("reextract-work", ["extract", proof, "--format", self.options.format, "-o", self.root / "work-proof.db"])
         self.manifest["work_equivalence"] = compare_reextraction(spanish, self.work, self.db_rows(self.root / "work-proof.db", proof), proof, self.options.format)
-        self.command("pack-spanish", ["patch", self.work, "-P", self.es, "-l", "es", "--pristine", self.pristine,
-                                      "--no-detect-id", "-o", self.archive])
-        manifest = verify_zip(self.archive, self.original, clean_work, self.options.format, reported)
-        archive_hash = file_hash(self.archive)
-        self.manifest["artifact"] = archive_hash
-        self.save()
+        with measured_stage("pack-and-proof"):
+            self.command("pack-spanish", ["patch", self.work, "-P", self.es, "-l", "es", "--pristine", self.pristine,
+                                          "--no-detect-id", "-o", self.archive])
+            manifest = verify_zip(self.archive, self.original, clean_work, self.options.format, reported)
+            archive_hash = file_hash(self.archive)
+            self.manifest["artifact"] = archive_hash
+            self.save()
         self.command("strict-apply-dry-run", ["apply", self.install, self.archive, "--dry-run"])
         require(scan(self.install) == self.original, "Dry-run changed install game")
         self.command("strict-apply", ["apply", self.install, self.archive])
@@ -1949,21 +2142,30 @@ class Pipeline:
         require(clean == {"files": wanted, "directories": self.original["directories"]},
                 "HTML bytes outside selected targets or exact writer output differ")
 
+    @measured_method("copy-proof")
     def copy_proof(self, proof, inventory_value):
         proof.mkdir()
         for rel in inventory_value["directories"]:
             (proof / rel).mkdir(parents=True, exist_ok=True)
-        for rel, identity in inventory_value["files"].items():
+        def copy_one(item):
+            rel, identity = item
             source = plain(self.work / rel)
             require(file_hash(source) == identity, "Work proof drift")
-            with source.open("rb") as incoming, (proof / rel).open("xb") as outgoing:
-                for chunk in iter(lambda: incoming.read(1024 * 1024), b""):
-                    outgoing.write(chunk)
+            copy_bytes(source, proof / rel)
+        file_jobs(copy_one, list(inventory_value["files"].items()),
+                  size_bytes=sum(identity["size"] for identity in inventory_value["files"].values()))
         require(scan(proof) == inventory_value, "Work proof copy mismatch")
+        after = scan(self.work)
+        resources = {"files": {path: value for path, value in after["files"].items() if path.split("/")[0] not in RESERVED},
+                     "directories": [path for path in after["directories"] if path.split("/")[0] not in RESERVED]}
+        require(resources == inventory_value, "Work proof source changed after copying")
 
     def run(self):
         try:
-            return self.execute()
+            with self.measurements.activate(), measured_stage("workflow"):
+                result = self.execute()
+            self.save()  # Publish the completed inclusive spans while still locked.
+            return result
         except (PipelineError, OSError, ValueError, TypeError, KeyError) as error:
             diagnostic = str(error) if isinstance(error, PipelineError) else "Malformed artifact or owned filesystem operation failed"
             if self.manifest is not None and self.lock is not None:

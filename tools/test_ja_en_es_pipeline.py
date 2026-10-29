@@ -1,5 +1,6 @@
 """Deterministic safety and release gates; production transport tests below."""
 import copy
+from contextlib import closing
 from dataclasses import replace
 import errno
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -50,6 +51,214 @@ class PipelineCase(unittest.TestCase):
                       format="renpy", provider="google")
         values.update(updates)
         return pipeline.Options(**values)
+
+
+class WorkflowMeasurements(PipelineCase):
+    def test_benchmark_failure_retains_owned_evidence_and_lock(self):
+        import benchmark_workflow as benchmark
+        scratch = self.root / "benchmark-scratch"
+
+        def uncertain(options):
+            output = Path(options.output)
+            output.mkdir()
+            (output / "pipeline.lock").write_bytes(b"uncertain child")
+            raise pipeline.PipelineError("injected uncertain child")
+
+        with patch.object(benchmark, "mocked", side_effect=uncertain), patch("builtins.print"):
+            with self.assertRaisesRegex(pipeline.PipelineError, "injected uncertain child"):
+                benchmark.main(["--mib", "1", "--small-files", "8", "--workers", "1", "--repeats", "1",
+                                "--scratch", str(scratch)])
+        retained = list(scratch.iterdir())
+        self.assertEqual(len(retained), 1)
+        self.assertEqual((retained[0] / "run/pipeline.lock").read_bytes(), b"uncertain child")
+        self.assertTrue((retained[0] / "source/game/script.rpy").is_file())
+
+    def test_benchmark_budget_refuses_before_generating_any_files(self):
+        import benchmark_workflow as benchmark
+        scratch = self.root / "benchmark-scratch"
+        with patch.object(benchmark, "generate", side_effect=AssertionError("Oversized fixture generated")):
+            with self.assertRaisesRegex(pipeline.PipelineError, "fit within 2 GiB"):
+                benchmark.main(["--mib", "249", "--scratch", str(scratch)])
+        self.assertFalse(scratch.exists())
+
+    def test_mocked_benchmark_bounds_generated_bytes_and_proves_installation(self):
+        import benchmark_workflow as benchmark
+        source = self.root / "benchmark-source"
+        benchmark.generate(source, 1, 8, 3)
+        original = pipeline.scan(source, source=True)
+        self.assertEqual(sum(identity["size"] for identity in original["files"].values()), benchmark.MIB)
+        options = self.options(game=str(source), output=str(self.root / "benchmark-run"))
+        report = benchmark.mocked(options)
+        self.assertEqual(pipeline.scan(source, source=True), original)
+        self.assertEqual(pipeline.scan(Path(options.output) / "backups/payload"), original)
+        self.assertTrue(all(stage["completed"] for stage in report["stages"]))
+        summary = benchmark.summarize(report)
+        self.assertGreaterEqual(summary["overall (includes preflight)"]["seconds"],
+                                summary["workflow"]["seconds"] + summary["preflight"]["seconds"])
+        self.assertGreaterEqual(report["totals"]["copy_bytes"], benchmark.MIB * 5)
+        self.assertGreaterEqual(report["totals"]["hash_bytes"], benchmark.MIB * 40)
+        pipeline.validate_measurements(report)
+
+    def test_worker_inventories_and_actual_io_counts_match_serial(self):
+        (self.game / "game/media.bin").write_bytes(b"\0" * (8 * 1024 * 1024 + 7))
+        original = pipeline.scan(self.game, source=True)
+        size = sum(identity["size"] for identity in original["files"].values())
+        count = len(original["files"])
+        for workers in (1, 2, 4):
+            with self.subTest(workers=workers), patch.dict(os.environ, {"LOCUST_PIPELINE_IO_WORKERS": str(workers)}):
+                measurements = pipeline.Measurements()
+                with measurements.activate(), measurements.stage("test-copy"):
+                    destination = self.root / f"copy-{workers}"
+                    pipeline.copy_tree(self.game, destination, original)
+                self.assertEqual(pipeline.scan(destination), original)
+                report = measurements.report()
+                self.assertEqual(report["totals"]["copy_bytes"], size)
+                self.assertEqual(report["totals"]["copy_files"], count)
+                self.assertEqual(report["totals"]["hash_bytes"], size * 4)
+                self.assertEqual(report["totals"]["hash_files"], count * 4)
+                self.assertTrue(all(stage["completed"] for stage in report["stages"]))
+                pipeline.validate_measurements(report)
+
+    def test_source_after_copy_detects_same_size_and_timestamp_drift(self):
+        (self.game / "game/media.bin").write_bytes(b"\0" * (8 * 1024 * 1024 + 7))
+        original_copy = pipeline.copy_bytes
+        script = self.game / "game/script.rpy"
+        original_bytes = script.read_bytes()
+        for workers in (1, 2, 4):
+            script.write_bytes(original_bytes)
+            before = script.stat()
+            expected = pipeline.scan(self.game, source=True)
+
+            def copy_and_mutate(source, destination):
+                original_copy(source, destination)
+                if source == script:
+                    script.write_bytes(b"L" + original_bytes[1:])
+                    os.utime(script, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+            with self.subTest(workers=workers), patch.dict(os.environ, {"LOCUST_PIPELINE_IO_WORKERS": str(workers)}), patch.object(
+                    pipeline, "copy_bytes", side_effect=copy_and_mutate):
+                with self.assertRaisesRegex(pipeline.PipelineError, "Copy inventory drift"):
+                    pipeline.copy_tree(self.game, self.root / f"drift-{workers}", expected)
+            self.assertEqual(script.stat().st_size, before.st_size)
+            self.assertEqual(script.stat().st_mtime_ns, before.st_mtime_ns)
+
+    def test_payload_proof_detects_same_size_and_timestamp_corruption(self):
+        (self.game / "game/media.bin").write_bytes(b"\0" * (8 * 1024 * 1024 + 7))
+        expected = pipeline.scan(self.game, source=True)
+        original_copy = pipeline.copy_bytes
+
+        def corrupt(source, destination):
+            original_copy(source, destination)
+            before = destination.stat()
+            content = destination.read_bytes()
+            destination.write_bytes(bytes([content[0] ^ 1]) + content[1:])
+            os.utime(destination, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+        with patch.dict(os.environ, {"LOCUST_PIPELINE_IO_WORKERS": "4"}), patch.object(
+                pipeline, "copy_bytes", side_effect=corrupt):
+            with self.assertRaisesRegex(pipeline.PipelineError, "Copy hash mismatch"):
+                pipeline.copy_tree(self.game, self.root / "corrupted", expected)
+
+    def test_work_proof_refuses_source_drift_after_copy(self):
+        program = pipeline.Pipeline(self.options())
+        program.work = self.game
+        expected = pipeline.scan(self.game)
+        original_copy = pipeline.copy_bytes
+
+        def mutate(source, destination):
+            original_copy(source, destination)
+            before = source.stat()
+            content = source.read_bytes()
+            source.write_bytes(bytes([content[0] ^ 1]) + content[1:])
+            os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+        with patch.dict(os.environ, {"LOCUST_PIPELINE_IO_WORKERS": "4"}), patch.object(
+                pipeline, "copy_bytes", side_effect=mutate):
+            with self.assertRaisesRegex(pipeline.PipelineError, "Work proof source changed after copying"):
+                program.copy_proof(self.root / "proof", expected)
+
+    def test_worker_failure_waits_for_other_workers_and_records_partial_io(self):
+        started, finished = threading.Event(), threading.Event()
+
+        def worker(index):
+            if index == 0:
+                self.assertTrue(started.wait(5))
+                raise pipeline.PipelineError("worker failed")
+            started.set()
+            with pipeline.measured_work("copy") as counters:
+                counters["copy_bytes"] += 7
+            finished.set()
+
+        measurements = pipeline.Measurements()
+        with patch.dict(os.environ, {"LOCUST_PIPELINE_IO_WORKERS": "2"}), measurements.activate():
+            with self.assertRaisesRegex(pipeline.PipelineError, "worker failed"), measurements.stage("failure"):
+                pipeline.file_jobs(worker, [0, 1])
+        self.assertTrue(finished.is_set())
+        self.assertEqual(measurements.report()["totals"]["copy_bytes"], 7)
+        self.assertFalse(measurements.report()["stages"][-1]["completed"])
+
+    def test_inclusive_command_keeps_child_receipt_and_records_invariant_bytes(self):
+        cli = MockCli(self)
+        clock = [0.0]
+        with patch.object(pipeline.time, "perf_counter", side_effect=lambda: clock[0]), patch.object(
+                pipeline, "read_database", side_effect=cli.read), patch.object(pipeline.subprocess, "run", side_effect=cli.run):
+            program = pipeline.Pipeline(self.options())
+            program.initialize()
+            original_invariants = program.invariants
+
+            def invariants(**kwargs):
+                original_invariants(**kwargs)
+                clock[0] += 7
+
+            def child(argv, **kwargs):
+                clock[0] += 3
+                return cli.run(argv, **kwargs)
+
+            with patch.object(program, "invariants", side_effect=invariants), patch.object(
+                    pipeline.subprocess, "run", side_effect=child):
+                program.command("ja-en", ["translate", program.en, "--from", "ja"])
+            record = program.measurements.report()["stages"][-1]
+            self.assertEqual(record["stage"], "command:ja-en")
+            self.assertEqual(record["seconds"], 10)
+            self.assertEqual(record["child_seconds"], 3)
+            source_size = sum(identity["size"] for identity in program.original["files"].values())
+            self.assertGreaterEqual(record["hash_bytes"], source_size * 4)
+            self.assertEqual(record["invariant_calls"], 1)
+            self.assertNotIn("hash_bytes", program.manifest["stages"][-1])
+            program.lock.close()
+            program.lock = None
+
+    def test_performance_schema_refuses_nonfinite_and_foreign_fields(self):
+        value = pipeline.Measurements().report()
+        pipeline.validate_measurements(value)
+        for change in ({"seconds": float("nan")}, {"io_workers": 5}, {"seconds": True}, {"foreign": 1}):
+            with self.subTest(change=change), self.assertRaises(pipeline.PipelineError):
+                pipeline.validate_measurements(dict(value, **change))
+        for workers in ("0", "5", "-1", "2.0"):
+            with patch.dict(os.environ, {"LOCUST_PIPELINE_IO_WORKERS": workers}), self.assertRaisesRegex(
+                    pipeline.PipelineError, "I/O workers"):
+                pipeline.Pipeline(self.options())
+        self.assertFalse(Path(self.options().output).exists())
+        with patch.dict(os.environ, {"LOCUST_PIPELINE_IO_WORKERS": "4"}), patch.object(
+                pipeline, "ThreadPoolExecutor", side_effect=AssertionError("Small trees must stay serial")):
+            self.assertEqual(pipeline.file_jobs(lambda item: item * 2, [1, 2], size_bytes=1024), [2, 4])
+
+    def test_manifest_without_performance_still_resumes_with_full_proofs(self):
+        cli = MockCli(self)
+        with patch.object(pipeline, "read_database", side_effect=cli.read), patch.object(
+                pipeline.subprocess, "run", side_effect=cli.run):
+            with self.assertRaisesRegex(pipeline.PipelineError, "Missing/blank/pending"):
+                pipeline.Pipeline(self.options()).run()
+            path = self.root / "run/pipeline-manifest.json"
+            manifest = pipeline.read_json_file(path)
+            del manifest["performance"]
+            path.write_bytes(pipeline.encoded(manifest))
+            with self.assertRaisesRegex(pipeline.PipelineError, "Child command failed: inject-spanish"):
+                pipeline.Pipeline(self.options(resume=True)).run()
+            self.assertEqual(sum(args[0] == "extract" for args in cli.calls), 1)
+            resumed = pipeline.read_json_file(path)
+            self.assertGreater(resumed["performance"]["totals"]["invariant_calls"], 0)
+            self.assertEqual(resumed["performance"]["scope"], "current-invocation")
 
 
 class GlossaryRules(PipelineCase):
@@ -384,8 +593,9 @@ class AdditionalGates(PipelineCase):
 
 class MockCli:
     """Virtual rows only: Python never writes SQL translations, even in mocks."""
-    def __init__(self, case):
+    def __init__(self, case, output=None):
         self.case, self.rows, self.calls = case, {}, []
+        self.root = Path(output) if output is not None else case.root / "run"
         self.missing = True
         self.timeout_stage = None
         self.inject_called_after_marker = False
@@ -401,13 +611,13 @@ class MockCli:
             connection.close()
 
     def read(self, path):
-        return copy.deepcopy(self.rows[Path(path)]), {"extraction_warnings": [], "game_root": str(self.case.root / "run/work-game")}
+        return copy.deepcopy(self.rows[Path(path)]), {"extraction_warnings": [], "game_root": str(self.root / "work-game")}
 
     def run(self, argv, **kwargs):
-        self.case.assertEqual(argv[:3], [str(self.case.cli), "--config", str(self.case.root / "run/profile/config.json")])
+        self.case.assertEqual(argv[:3], [str(self.case.cli), "--config", str(self.root / "profile/config.json")])
         args = argv[3:]
         self.calls.append(args)
-        self.case.assertEqual(kwargs["cwd"], self.case.root / "run")
+        self.case.assertEqual(kwargs["cwd"], self.root)
         self.case.assertEqual(kwargs["timeout"], 900)
         self.case.assertNotIn(str(self.case.game), list(map(str, args)))
         self.case.assertNotIn("LOCUST_CONFIG", kwargs["env"])
@@ -437,10 +647,135 @@ class MockCli:
                 value["metadata"]["locust_injection_source"] = value["source"]
                 value.update(source=value["translation"], translation=None, status="pending", provider_used=None, translated_at=None)
         elif args[0] == "inject" and "--help" not in args:
-            manifest = pipeline.read_json_file(self.case.root / "run/pipeline-manifest.json")
+            manifest = pipeline.read_json_file(self.root / "pipeline-manifest.json")
             self.inject_called_after_marker = manifest["injection_started"] is True
             returncode = 1
         return subprocess.CompletedProcess(argv, returncode, stdout, b"do not log source/credentials")
+
+
+class SeedManifestTests(PipelineCase):
+    def closed_seed(self):
+        cli = MockCli(self)
+        cli.missing = False
+
+        def run(argv, **kwargs):
+            result = cli.run(argv, **kwargs)
+            if argv[3] == "translate":
+                # Provenance tables only; translation rows remain virtual.
+                with closing(sqlite3.connect(argv[4])) as connection:
+                    connection.execute("CREATE TABLE injected_files (id INTEGER)")
+                    connection.execute("CREATE TABLE translation_runs (provider TEXT, source_lang TEXT, target_lang TEXT, strings_translated INTEGER)")
+                    connection.execute("INSERT INTO translation_runs VALUES ('google', 'ja', 'en', 1)")
+                    connection.commit()
+            elif argv[3] == "validate":
+                return subprocess.CompletedProcess(argv, 2, b"", b"synthetic validation failure")
+            return result
+
+        with patch.object(pipeline, "read_database", side_effect=cli.read), patch.object(
+                pipeline.subprocess, "run", side_effect=run):
+            with self.assertRaisesRegex(pipeline.PipelineError, "Child command failed: validate-english"):
+                pipeline.Pipeline(self.options()).run()
+        return cli, self.root / "run/english.db", pipeline.read_json_file(self.root / "run/pipeline-manifest.json")
+
+    def manifest(self, original, version, performance):
+        manifest = copy.deepcopy(original)
+        manifest["version"] = version
+        if version == 1:
+            manifest.pop("accepted_rows")
+            for key in ("english_seed", "fallback_provider", "test_fallback_endpoint"):
+                manifest["settings"].pop(key)
+        if performance:
+            manifest["performance"]["totals"] = dict.fromkeys(pipeline.IO_COUNTERS, 10**20)
+            manifest["performance"]["stages"] = [dict(manifest["performance"]["totals"],
+                stage="seed-performance-authority", completed=True, seconds=0)]
+        else:
+            manifest.pop("performance")
+        return manifest
+
+    def test_seed_import_with_and_without_performance_uses_current_authority(self):
+        owner_cli, seed, original = self.closed_seed()
+        for version in (1, pipeline.VERSION):
+            for performance in (False, True):
+                with self.subTest(version=version, performance=performance):
+                    manifest = self.manifest(original, version, performance)
+                    # Historical command/config/binary claims never authorize the new run.
+                    manifest["settings"].update(cli=str(self.root / "foreign.exe"),
+                                                game=str(self.root / "foreign-game"), timeout=1)
+                    for key in ("binary", "config"):
+                        manifest[key]["sha256"] = "0" * 64
+                    manifest["tool_sha256"] = "0" * 64
+                    owner_path = seed.parent / "pipeline-manifest.json"
+                    owner_path.write_bytes(pipeline.encoded(manifest))
+                    before = (pipeline.file_hash(seed), owner_path.read_bytes())
+                    output = self.root / f"fresh-{version}-{performance}"
+                    cli = MockCli(self, output=output)
+
+                    def read(path):
+                        return owner_cli.read(seed) if Path(path) == output / "seed-snapshot.db" else cli.read(path)
+
+                    def run(argv, **kwargs):
+                        result = cli.run(argv, **kwargs)
+                        args = argv[3:]
+                        if args[0] == "export":
+                            xml = pipeline.ET.Element("xliff", version="1.2", xmlns="urn:oasis:names:tc:xliff:document:1.2")
+                            file = pipeline.ET.SubElement(xml, "file", {"source-language": "ja", "target-language": "en", "datatype": "plaintext"})
+                            body = pipeline.ET.SubElement(file, "body")
+                            for value in owner_cli.rows[seed]:
+                                unit = pipeline.ET.SubElement(body, "trans-unit", id=value["id"])
+                                pipeline.ET.SubElement(unit, "source").text = value["source"]
+                                pipeline.ET.SubElement(unit, "target").text = value["translation"]
+                            Path(args[args.index("-o") + 1]).write_bytes(pipeline.ET.tostring(xml, encoding="utf-8"))
+                        elif args[0] == "import":
+                            for value, target in zip(cli.rows[Path(args[1])], owner_cli.rows[seed]):
+                                value.update(translation=target["translation"], status="translated",
+                                             provider_used="import", translated_at="2026-01-02")
+                        return result
+
+                    with patch.object(pipeline, "read_database", side_effect=read), patch.object(
+                            pipeline.subprocess, "run", side_effect=run):
+                        program = pipeline.Pipeline(self.options(output=str(output), english_seed=str(seed)))
+                        try:
+                            program.initialize()
+                            program.import_seed()
+                            program.save()
+                            pipeline.validate_resume_manifest(program.manifest)
+                            self.assertEqual(cli.rows[program.en][0]["translation"], "Hello")
+                            self.assertEqual(program.manifest["seed"]["run_id"], manifest["run_id"])
+                            self.assertEqual(program.manifest["accepted_rows"]["english.db"]["script.rpy#1"]["provider"], "import")
+                            self.assertNotIn("performance", program.manifest["seed"])
+                            current = program.manifest["performance"]
+                            self.assertEqual(current["totals"], program.measurements.report()["totals"])
+                            self.assertLess(current["totals"]["hash_bytes"], 10**20)
+                            self.assertNotIn("seed-performance-authority", [s["stage"] for s in current["stages"]])
+                            self.assertEqual([args[0] for args in cli.calls], ["inject", "extract", "export", "import", "validate"])
+                            self.assertEqual((pipeline.file_hash(seed), owner_path.read_bytes()), before)
+                        finally:
+                            if program.lock is not None:
+                                program.lock.close()
+
+    def test_seed_performance_is_optional_without_loosening_other_schema_fields(self):
+        _, _, original = self.closed_seed()
+        for version in (1, pipeline.VERSION):
+            for performance in (False, True):
+                with self.subTest(version=version, performance=performance):
+                    manifest = self.manifest(original, version, performance)
+                    pipeline.validate_resume_manifest(manifest, seed_legacy=True)
+                    self.assertEqual(pipeline.publication_state(manifest), pipeline.publication_state(original))
+                    mutations = [lambda m: m.update(foreign=True), lambda m: m.pop("binary"),
+                                 lambda m: m["settings"].update(foreign=True),
+                                 lambda m: m["stages"][0].update(exit_code=1),
+                                 lambda m: m.update(performance=dict(original["performance"], foreign=True)),
+                                 lambda m: m.update(performance=dict(original["performance"], seconds=-1))]
+                    if version == 1:
+                        mutations.extend([lambda m: m.update(seed={}), lambda m: m.update(accepted_rows={})])
+                        with self.assertRaises(pipeline.PipelineError):
+                            pipeline.validate_resume_manifest(manifest)
+                    for index, mutate in enumerate(mutations):
+                        with self.subTest(mutation=index):
+                            changed = copy.deepcopy(manifest)
+                            mutate(changed)
+                            with self.assertRaises(pipeline.PipelineError):
+                                pipeline.validate_resume_manifest(changed, seed_legacy=True)
 
 
 class GlossaryOrchestration(GlossaryRules):
