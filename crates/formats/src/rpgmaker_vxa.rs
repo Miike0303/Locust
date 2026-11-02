@@ -969,6 +969,20 @@ const ITEM_FIELDS: &[(&str, &str)] = &[
     ("@note", "note"),
 ];
 
+// VX Ace only. Switches, variables and resource filenames are developer data.
+const SYSTEM_TEXT_FIELDS: &[&str] = &[
+    "game_title",
+    "currency_unit",
+    "elements",
+    "skill_types",
+    "weapon_types",
+    "armor_types",
+    "terms.basic",
+    "terms.params",
+    "terms.etypes",
+    "terms.commands",
+];
+
 pub struct RpgMakerVxaPlugin;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1013,15 +1027,99 @@ impl RpgMakerVxaPlugin {
 
     /// Extract from the exact tree injection will mutate, before any message
     /// splices change command indices or wrapping widths.
-    fn extract_root(filename: &str, root: &MarshalValue, path: &Path) -> Vec<StringEntry> {
+    fn extract_root(filename: &str, root: &MarshalValue, path: &Path) -> Extraction {
         let stem = strip_marshal_ext(filename).to_lowercase();
-        if stem.starts_with("map") {
+        if stem == "system" && filename.ends_with(".rvdata2") {
+            return match Self::system_text_fields(root) {
+                Ok(fields) => Extraction {
+                    complete: true,
+                    warnings: Vec::new(),
+                    entries: fields
+                        .into_iter()
+                        .map(|(field, text)| {
+                            let mut entry = StringEntry::new(
+                                format!("{filename}#{field}"),
+                                text,
+                                path.to_path_buf(),
+                            )
+                            .with_format_id("rpgmaker-vxa");
+                            entry.tags = vec!["system".into(), "ui".into()];
+                            entry
+                        })
+                        .collect(),
+                },
+                Err(reason) => Extraction {
+                    complete: false,
+                    entries: Vec::new(),
+                    warnings: vec![format!(
+                        "skipped unsupported System layout in {}: {reason}",
+                        path.display()
+                    )],
+                },
+            };
+        }
+        let entries = if stem.starts_with("map") {
             Self::extract_map_file(filename, root, path)
         } else if stem == "commonevents" {
             Self::extract_common_events(filename, root, path)
         } else {
             Self::extract_array_file(filename, root, path)
+        };
+        Extraction {
+            entries,
+            complete: true,
+            warnings: Vec::new(),
         }
+    }
+
+    /// Validate the whole layout before publishing any rows. An incomplete
+    /// System extraction must not authorize removing previously saved entries.
+    fn system_text_fields(root: &MarshalValue) -> std::result::Result<Vec<(String, &str)>, String> {
+        let has_class = |value: &MarshalValue, expected: &str| match value.value() {
+            MarshalValue::Object { class, .. } => class == expected,
+            MarshalValue::OrderedObject {
+                kind: b'o', class, ..
+            } => class.symbol_bytes() == Some(expected.as_bytes()),
+            _ => false,
+        };
+        if !has_class(root, "RPG::System") {
+            return Err("root: expected RPG::System object".into());
+        }
+        if !root
+            .get_ivar("@terms")
+            .is_some_and(|terms| has_class(terms, "RPG::System::Terms"))
+        {
+            return Err("terms: expected RPG::System::Terms object".into());
+        }
+
+        let mut fields = Vec::new();
+        for &field in SYSTEM_TEXT_FIELDS {
+            let value = field
+                .split('.')
+                .try_fold(root, |value, part| value.get_ivar(&format!("@{part}")))
+                .ok_or_else(|| format!("{field}: missing field"))?;
+            if matches!(field, "game_title" | "currency_unit") {
+                let text = value
+                    .as_str()
+                    .ok_or_else(|| format!("{field}: expected string"))?;
+                if !text.trim().is_empty() {
+                    fields.push((field.to_string(), text));
+                }
+            } else {
+                let values = value
+                    .as_array()
+                    .ok_or_else(|| format!("{field}: expected array of strings"))?;
+                for (index, value) in values.iter().enumerate() {
+                    let text = value
+                        .as_str()
+                        .ok_or_else(|| format!("{field}#{index}: expected string"))?;
+                    if !text.trim().is_empty() {
+                        fields.push((format!("{field}#{index}"), text));
+                    }
+                }
+            }
+        }
+        Ok(fields)
     }
 
     fn extract_array_file(
@@ -1257,9 +1355,44 @@ impl RpgMakerVxaPlugin {
         } else if stem_lower == "commonevents" {
             // CommonEvents: navigate array → @list → commands
             Self::apply_common_event_translations(root, filename, &lookup, &mut next_object_id);
+        } else if stem_lower == "system" && filename.ends_with(".rvdata2") {
+            Self::apply_system_translations(root, filename, &lookup);
         } else {
             // Array data files (Actors, Items, etc.): update ivars
             Self::apply_array_translations(root, filename, &lookup);
+        }
+    }
+
+    fn apply_system_translations(
+        root: &mut MarshalValue,
+        filename: &str,
+        lookup: &HashMap<&str, &str>,
+    ) {
+        for &field in SYSTEM_TEXT_FIELDS {
+            let Some(value) = field.split('.').try_fold(&mut *root, |value, part| {
+                value.get_ivar_mut(&format!("@{part}"))
+            }) else {
+                continue;
+            };
+            match value.value_mut() {
+                MarshalValue::Str(text) => {
+                    if let Some(&translation) = lookup.get(format!("{filename}#{field}").as_str()) {
+                        *text = translation.to_string();
+                    }
+                }
+                MarshalValue::Array(values) => {
+                    for (index, value) in values.iter_mut().enumerate() {
+                        if let Some(&translation) =
+                            lookup.get(format!("{filename}#{field}#{index}").as_str())
+                        {
+                            if let MarshalValue::Str(text) = value.value_mut() {
+                                *text = translation.to_string();
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -1606,11 +1739,7 @@ impl FormatPlugin for RpgMakerVxaPlugin {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            return Ok(Extraction {
-                complete: true,
-                entries: Self::extract_root(&filename, &root, path),
-                warnings: Vec::new(),
-            });
+            return Ok(Self::extract_root(&filename, &root, path));
         }
 
         let data_dir = find_capital_data_dir(path).ok_or_else(|| LocustError::ParseError {
@@ -1632,7 +1761,9 @@ impl FormatPlugin for RpgMakerVxaPlugin {
                             .unwrap_or_default()
                             .to_string_lossy()
                             .to_string();
-                        all.extend(Self::extract_root(&fname, &root, &fpath));
+                        let extraction = Self::extract_root(&fname, &root, &fpath);
+                        all.extend(extraction.entries);
+                        warnings.extend(extraction.warnings);
                     }
                     Err(e) => {
                         tracing::warn!("Failed to parse {}: {}", fpath.display(), e);
@@ -1723,7 +1854,10 @@ impl RpgMakerVxaPlugin {
                     continue;
                 }
             };
-            let current: HashMap<_, _> = Self::extract_root(filename, &root, &file_path)
+            let extraction = Self::extract_root(filename, &root, &file_path);
+            warnings.extend(extraction.warnings);
+            let current: HashMap<_, _> = extraction
+                .entries
                 .into_iter()
                 .map(|entry| (entry.id, entry.source))
                 .collect();
@@ -1852,6 +1986,451 @@ mod tests {
         let bytes = build_test_fixture();
         fs::write(data_dir.join("Actors.rvdata2"), &bytes).unwrap();
         dir_guard
+    }
+
+    fn system_string(text: &str) -> MarshalValue {
+        MarshalValue::Ivar {
+            value: Box::new(MarshalValue::Str(text.into())),
+            ivars: vec![(MarshalValue::Symbol("E".into()), MarshalValue::Bool(true))],
+        }
+    }
+
+    fn system_strings(texts: &[&str]) -> MarshalValue {
+        MarshalValue::Array(texts.iter().map(|text| system_string(text)).collect())
+    }
+
+    fn system_fixture() -> MarshalValue {
+        let object = |class: &str, fields: Vec<(&str, MarshalValue)>| MarshalValue::Object {
+            class: class.into(),
+            ivars: fields.into_iter().map(|(k, v)| (k.into(), v)).collect(),
+        };
+        let terms = object(
+            "RPG::System::Terms",
+            vec![
+                (
+                    "@basic",
+                    system_strings(&["Level", "Lv", "HP", "HP", "MP", "MP", "TP", "TP"]),
+                ),
+                (
+                    "@params",
+                    system_strings(&["Max HP", "Max MP", "ATK", "DEF", "MAT", "MDF", "AGI", "LUK"]),
+                ),
+                (
+                    "@etypes",
+                    system_strings(&["Weapon", "Shield", "Head", "Body", "Accessory"]),
+                ),
+                (
+                    "@commands",
+                    system_strings(&[
+                        "Fight",
+                        "Escape",
+                        "Attack",
+                        "Guard",
+                        "Items",
+                        "Skills",
+                        "Equip",
+                        "Status",
+                        "Formation",
+                        "Save",
+                        "Game End",
+                        "Weapons",
+                        "Armor",
+                        "Key Items",
+                        "Equipment",
+                        "Optimize",
+                        "Clear",
+                        "New Game",
+                        "Continue",
+                        "Shutdown",
+                        "To Title",
+                        "Cancel",
+                        "Buy",
+                    ]),
+                ),
+                ("@developer_note", system_string("Internal terms label")),
+            ],
+        );
+        object(
+            "RPG::System",
+            vec![
+                ("@game_title", system_string("Test Adventure")),
+                ("@currency_unit", system_string("Gold")),
+                ("@elements", system_strings(&["", "Physical", "Fire"])),
+                ("@skill_types", system_strings(&["", "Special", "Magic"])),
+                ("@weapon_types", system_strings(&["", "Axe", "Sword"])),
+                ("@armor_types", system_strings(&["", "Light", "Heavy"])),
+                ("@terms", terms),
+                (
+                    "@switches",
+                    system_strings(&["", "Quest started", "Boss defeated"]),
+                ),
+                ("@variables", system_strings(&["", "Quest progress"])),
+                ("@version_id", MarshalValue::Int(12345)),
+                (
+                    "@party_members",
+                    MarshalValue::Array(vec![MarshalValue::Int(1)]),
+                ),
+                ("@opt_display_tp", MarshalValue::Bool(true)),
+                ("@title1_name", system_string("TitleAsset")),
+                (
+                    "@unknown_data",
+                    MarshalValue::UserDefined {
+                        class: "Table".into(),
+                        data: vec![0, 255, 12, 128],
+                    },
+                ),
+            ],
+        )
+    }
+
+    fn write_system_fixture(filename: &str, root: &MarshalValue) -> tempfile::TempDir {
+        let dir = tempdir();
+        fs::create_dir(dir.path().join("Data")).unwrap();
+        fs::write(
+            dir.path().join("Data").join(filename),
+            root.try_serialize().unwrap(),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_system_vxa_extracts_all_ui_paths() {
+        let dir = write_system_fixture("System.rvdata2", &system_fixture());
+        let path = dir.path().join("Data/System.rvdata2");
+        let plugin = RpgMakerVxaPlugin::new();
+        let extraction = plugin.extract_with_diagnostics(&path).unwrap();
+        assert!(extraction.complete);
+        assert!(extraction.warnings.is_empty());
+        assert_eq!(extraction.entries.len(), 54);
+
+        let mut expected = vec![
+            (
+                "System.rvdata2#game_title".to_string(),
+                "Test Adventure".to_string(),
+            ),
+            (
+                "System.rvdata2#currency_unit".to_string(),
+                "Gold".to_string(),
+            ),
+        ];
+        let fixture = system_fixture();
+        for (prefix, parent, fields) in [
+            (
+                "",
+                &fixture,
+                &["elements", "skill_types", "weapon_types", "armor_types"][..],
+            ),
+            (
+                "terms.",
+                fixture.get_ivar("@terms").unwrap(),
+                &["basic", "params", "etypes", "commands"][..],
+            ),
+        ] {
+            for field in fields {
+                for (index, value) in parent
+                    .get_ivar(&format!("@{field}"))
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .enumerate()
+                {
+                    let text = value.as_str().unwrap();
+                    if !text.is_empty() {
+                        expected.push((
+                            format!("System.rvdata2#{prefix}{field}#{index}"),
+                            text.to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+        let mut actual: Vec<_> = extraction
+            .entries
+            .iter()
+            .map(|e| (e.id.clone(), e.source.clone()))
+            .collect();
+        expected.sort();
+        actual.sort();
+        assert_eq!(actual, expected);
+        for entry in &extraction.entries {
+            assert_eq!(entry.tags, ["system", "ui"]);
+            assert_eq!(
+                entry
+                    .metadata
+                    .get("format_id")
+                    .and_then(|value| value.as_str()),
+                Some("rpgmaker-vxa")
+            );
+            assert_eq!(entry.file_path, path);
+        }
+        let directory = plugin.extract_with_diagnostics(dir.path()).unwrap();
+        assert!(directory.complete);
+        assert!(directory.warnings.is_empty());
+        assert_eq!(directory.entries.len(), 54);
+        assert_eq!(
+            plugin
+                .extract(&path)
+                .unwrap()
+                .iter()
+                .map(|e| &e.id)
+                .collect::<Vec<_>>(),
+            extraction.entries.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_system_vxa_skips_empty_strings_without_renumbering() {
+        let mut root = system_fixture();
+        *root.get_ivar_mut("@game_title").unwrap() = MarshalValue::Str("   ".into());
+        let commands = root
+            .get_ivar_mut("@terms")
+            .unwrap()
+            .get_ivar_mut("@commands")
+            .unwrap();
+        if let MarshalValue::Array(values) = commands {
+            values[0] = system_string("");
+            values[2] = system_string(" \t ");
+        }
+        let dir = write_system_fixture("System.rvdata2", &root);
+        let entries = RpgMakerVxaPlugin::new().extract(dir.path()).unwrap();
+        assert_eq!(entries.len(), 51);
+        assert!(entries.iter().all(|e| !e.source.trim().is_empty()));
+        assert!(entries
+            .iter()
+            .any(|e| e.id == "System.rvdata2#terms.commands#1" && e.source == "Escape"));
+        assert!(entries
+            .iter()
+            .any(|e| e.id == "System.rvdata2#terms.commands#22" && e.source == "Buy"));
+    }
+
+    #[test]
+    fn test_system_vxa_injection_preserves_other_ivars_and_encoding() {
+        let dir = write_system_fixture("System.rvdata2", &system_fixture());
+        let path = dir.path().join("Data/System.rvdata2");
+        let original_bytes = fs::read(&path).unwrap();
+        let original = MarshalValue::parse(&original_bytes).unwrap();
+        let plugin = RpgMakerVxaPlugin::new();
+        let mut entries = plugin.extract(&path).unwrap();
+        assert_eq!(entries.len(), 54);
+        for entry in &mut entries {
+            if entry.id != "System.rvdata2#terms.commands#1" {
+                entry.translation = Some(format!("Traducción: {}", entry.source));
+            }
+        }
+        // Even supplied translations cannot write developer labels or empty slots.
+        for (id, source) in [
+            ("switches#1", "Quest started"),
+            ("variables#1", "Quest progress"),
+            ("title1_name", "TitleAsset"),
+            ("elements#0", ""),
+            ("terms.commands#999", "Missing"),
+        ] {
+            let mut entry = StringEntry::new(format!("System.rvdata2#{id}"), source, path.clone());
+            entry.translation = Some("Do not write".into());
+            entries.push(entry);
+        }
+        let report = plugin.inject(dir.path(), &entries).unwrap();
+        assert_eq!(report.files_modified, 1);
+        assert_eq!(report.strings_written, 53);
+        assert_eq!(report.strings_skipped, 6);
+        assert_eq!(report.skip_reasons.get("missing_target"), Some(&5));
+        assert_eq!(report.skip_reasons.get("untranslated"), Some(&1));
+        assert!(report.warnings.is_empty());
+
+        let mut after = MarshalValue::parse(&fs::read(&path).unwrap()).unwrap();
+        let reextracted = plugin.extract(&path).unwrap();
+        assert_eq!(reextracted.len(), 54);
+        for entry in &reextracted {
+            let before = entries.iter().find(|e| e.id == entry.id).unwrap();
+            assert_eq!(
+                entry.source,
+                before
+                    .translation
+                    .as_ref()
+                    .unwrap_or(&before.source)
+                    .as_str()
+            );
+            // Restore only the translated string payloads. Exact whole-file equality
+            // below checks every other ivar, empty slot, ordering and encoding wrapper.
+            let mut parts = entry.id.split('#').skip(1);
+            let mut value = &mut after;
+            for field in parts.next().unwrap().split('.') {
+                value = value.get_ivar_mut(&format!("@{field}")).unwrap();
+            }
+            if let Some(index) = parts.next() {
+                let MarshalValue::Array(values) = value else {
+                    panic!("expected string array")
+                };
+                value = values[index.parse::<usize>().unwrap()].value_mut();
+            }
+            let MarshalValue::Str(text) = value.value_mut() else {
+                panic!("expected string")
+            };
+            *text = before.source.clone();
+        }
+        for field in [
+            "@switches",
+            "@variables",
+            "@version_id",
+            "@party_members",
+            "@opt_display_tp",
+            "@title1_name",
+            "@unknown_data",
+        ] {
+            assert_eq!(
+                format!("{:?}", after.get_ivar(field)),
+                format!("{:?}", original.get_ivar(field)),
+                "changed {field}"
+            );
+        }
+        assert_eq!(after.try_serialize().unwrap(), original_bytes);
+    }
+
+    fn assert_invalid_system(root: &MarshalValue, diagnostic: &str) {
+        let dir = write_system_fixture("System.rvdata2", root);
+        let file_path = dir.path().join("Data/System.rvdata2");
+        let original = fs::read(&file_path).unwrap();
+        let plugin = RpgMakerVxaPlugin::new();
+        for path in [
+            dir.path().to_path_buf(),
+            dir.path().join("Data/System.rvdata2"),
+        ] {
+            let extraction = plugin.extract_with_diagnostics(&path).unwrap();
+            assert!(
+                extraction.entries.is_empty(),
+                "unexpected rows for {diagnostic}"
+            );
+            assert!(!extraction.complete, "missing diagnostic for {diagnostic}");
+            assert_eq!(extraction.warnings.len(), 1);
+            assert!(extraction.warnings[0].contains("System.rvdata2"));
+            assert!(
+                extraction.warnings[0].contains(diagnostic),
+                "{:?}",
+                extraction.warnings
+            );
+            assert!(plugin.extract(&path).unwrap().is_empty());
+        }
+        let mut entry = StringEntry::new("System.rvdata2#currency_unit", "Gold", file_path.clone());
+        entry.translation = Some("Oro".into());
+        let report = plugin.inject(dir.path(), &[entry]).unwrap();
+        assert_eq!(report.files_modified, 0);
+        assert_eq!(report.strings_written, 0);
+        assert_eq!(report.strings_skipped, 1);
+        assert_eq!(report.warnings.len(), 1);
+        assert!(report.warnings[0].contains(diagnostic));
+        assert_eq!(fs::read(file_path).unwrap(), original);
+    }
+
+    #[test]
+    fn test_system_vxa_diagnoses_missing_and_malformed_fields() {
+        let mut missing_terms = system_fixture();
+        if let MarshalValue::Object { ivars, .. } = &mut missing_terms {
+            ivars.remove("@terms");
+        }
+        assert_invalid_system(&missing_terms, "terms");
+        for (parent, fields) in [
+            (
+                "",
+                &["@elements", "@skill_types", "@weapon_types", "@armor_types"][..],
+            ),
+            ("@terms", &["@basic", "@params", "@etypes", "@commands"][..]),
+        ] {
+            for field in fields {
+                for invalid in [
+                    MarshalValue::Nil,
+                    MarshalValue::Str("not an array".into()),
+                    MarshalValue::Array(vec![MarshalValue::Int(42)]),
+                ] {
+                    let mut root = system_fixture();
+                    let target = if parent.is_empty() {
+                        &mut root
+                    } else {
+                        root.get_ivar_mut(parent).unwrap()
+                    };
+                    *target.get_ivar_mut(field).unwrap() = invalid;
+                    assert_invalid_system(&root, field.trim_start_matches('@'));
+                }
+                let mut root = system_fixture();
+                let target = if parent.is_empty() {
+                    &mut root
+                } else {
+                    root.get_ivar_mut(parent).unwrap()
+                };
+                if let MarshalValue::Object { ivars, .. } = target {
+                    ivars.remove(*field);
+                }
+                assert_invalid_system(&root, field.trim_start_matches('@'));
+            }
+        }
+        for field in ["@game_title", "@currency_unit"] {
+            let mut root = system_fixture();
+            *root.get_ivar_mut(field).unwrap() = MarshalValue::Int(42);
+            assert_invalid_system(&root, field.trim_start_matches('@'));
+            if let MarshalValue::Object { ivars, .. } = &mut root {
+                ivars.remove(field);
+            }
+            assert_invalid_system(&root, field.trim_start_matches('@'));
+        }
+    }
+
+    #[test]
+    fn test_system_vxa_diagnoses_unexpected_objects() {
+        assert_invalid_system(&MarshalValue::Nil, "RPG::System");
+        assert_invalid_system(&MarshalValue::Array(vec![]), "RPG::System");
+        let mut wrong_class = system_fixture();
+        if let MarshalValue::Object { class, .. } = &mut wrong_class {
+            *class = "Custom::System".into();
+        }
+        assert_invalid_system(&wrong_class, "RPG::System");
+        for invalid in [
+            MarshalValue::Nil,
+            MarshalValue::Array(vec![]),
+            MarshalValue::Object {
+                class: "Custom::Terms".into(),
+                ivars: HashMap::new(),
+            },
+        ] {
+            let mut root = system_fixture();
+            *root.get_ivar_mut("@terms").unwrap() = invalid;
+            assert_invalid_system(&root, "terms");
+        }
+    }
+
+    fn assert_legacy_system_ignored(ext: &str) {
+        let filename = format!("System.{ext}");
+        let mut root = system_fixture();
+        if let MarshalValue::Object { ivars, .. } = &mut root {
+            let terms = ivars.remove("@terms").unwrap();
+            ivars.insert("@words".into(), terms);
+        }
+        let dir = write_system_fixture(&filename, &root);
+        let path = dir.path().join("Data").join(&filename);
+        let original = fs::read(&path).unwrap();
+        let plugin = RpgMakerVxaPlugin::new();
+        for target in [dir.path(), path.as_path()] {
+            let extraction = plugin.extract_with_diagnostics(target).unwrap();
+            assert!(extraction.complete);
+            assert!(extraction.entries.is_empty());
+            assert!(extraction.warnings.is_empty());
+        }
+        let mut entry = StringEntry::new(format!("{filename}#currency_unit"), "Gold", path.clone());
+        entry.translation = Some("Oro".into());
+        let report = plugin.inject(dir.path(), &[entry]).unwrap();
+        assert_eq!(report.strings_written, 0);
+        assert_eq!(report.strings_skipped, 1);
+        assert_eq!(fs::read(path).unwrap(), original);
+    }
+
+    #[test]
+    fn test_system_vx_remains_unextracted() {
+        assert_legacy_system_ignored("rvdata");
+    }
+
+    #[test]
+    fn test_system_xp_remains_unextracted() {
+        assert_legacy_system_ignored("rxdata");
     }
 
     #[test]
