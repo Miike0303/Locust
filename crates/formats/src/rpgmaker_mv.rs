@@ -15,6 +15,7 @@ const ARRAY_FILES: &[&str] = &[
 
 const EXTRACTABLE_FIELDS: &[(&str, &str)] = &[
     ("name", "actor_name"),
+    ("nickname", "actor_nickname"),
     ("description", "description"),
     ("profile", "description"),
     ("message1", "dialogue"),
@@ -598,14 +599,19 @@ impl RpgMakerMvPlugin {
                         }
                     }
                 }
-                // Change Actor Name
-                320 => {
+                // Change Actor Name / Nickname / Profile
+                320 | 324 | 325 => {
                     if let Some(text) = params.get(1).and_then(|v| v.as_str()) {
                         if !text.trim().is_empty() {
                             let id = format!("{}#cmd_{}", id_prefix, cmd_idx);
                             let mut entry = StringEntry::new(id, text, file_path.to_path_buf())
                                 .with_format_id("rpgmaker-mv");
-                            entry.tags = vec!["actor_name".to_string()];
+                            let tag = match code {
+                                324 => "actor_nickname",
+                                325 => "description",
+                                _ => "actor_name",
+                            };
+                            entry.tags = vec![tag.to_string()];
                             entries.push(entry);
                         }
                     }
@@ -1102,8 +1108,8 @@ impl RpgMakerMvPlugin {
                 return;
             }
             if let Some(params) = cmd.get_mut("parameters").and_then(|v| v.as_array_mut()) {
-                if code == 320 {
-                    // Change Actor Name: text is in params[1]
+                if matches!(code, 320 | 324 | 325) {
+                    // Change Actor Name / Nickname / Profile: text is in params[1]
                     if let Some(val) = params.get_mut(1) {
                         *val = serde_json::Value::String(translation.to_string());
                     }
@@ -1277,7 +1283,7 @@ impl RpgMakerMvPlugin {
                 return;
             }
             if let Some(params) = cmd.get_mut("parameters").and_then(|v| v.as_array_mut()) {
-                if code == 320 {
+                if matches!(code, 320 | 324 | 325) {
                     if let Some(val) = params.get_mut(1) {
                         *val = serde_json::Value::String(translation.to_string());
                     }
@@ -1359,7 +1365,7 @@ impl RpgMakerMvPlugin {
                 return;
             }
             if let Some(params) = cmd.get_mut("parameters").and_then(|v| v.as_array_mut()) {
-                if code == 320 {
+                if matches!(code, 320 | 324 | 325) {
                     if let Some(val) = params.get_mut(1) {
                         *val = serde_json::Value::String(translation.to_string());
                     }
@@ -2822,6 +2828,306 @@ mod tests {
             again.iter().find(|e| e.id == id).unwrap().source,
             translation
         );
+    }
+
+    #[test]
+    fn test_mv_actor_nickname_roundtrip() {
+        let game = temp_game_dir();
+        let file = game.path().join("data/Actors.json");
+        let original = serde_json::json!([null, {
+            "id": 1, "name": "Hero", "nickname": "The Wanderer",
+            "profile": "A former knight.\nNow a wanderer.", "classId": 2
+        }]);
+        fs::write(&file, serde_json::to_vec(&original).unwrap()).unwrap();
+        let plugin = RpgMakerMvPlugin::new();
+        let mut entries = plugin.extract(game.path()).unwrap();
+        let id = "Actors.json#1#nickname";
+        let row = entries
+            .iter_mut()
+            .find(|e| e.id == id)
+            .expect("nickname row");
+        assert_eq!(row.source, "The Wanderer");
+        assert_eq!(row.tags, ["actor_nickname"]);
+        assert_eq!(row.context, None);
+        assert_eq!(row.metadata["format_id"], "rpgmaker-mv");
+        row.translation = Some("El viajero".into());
+        let report = plugin.inject(game.path(), &entries).unwrap();
+        assert_eq!(report.strings_written, 1);
+        assert_eq!(report.files_modified, 1);
+        let mut expected = original;
+        expected[1]["nickname"] = serde_json::json!("El viajero");
+        let written: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        assert_eq!(written, expected);
+        let again = plugin.extract(game.path()).unwrap();
+        let row = again.iter().find(|e| e.id == id).unwrap();
+        assert_eq!(row.source, "El viajero");
+        assert_eq!(row.tags, ["actor_nickname"]);
+    }
+
+    fn assert_mv_actor_text_roundtrip(filename: &str, code: i64, source: &str, translation: &str) {
+        let game = tempfile::tempdir().unwrap();
+        let file = game.path().join(filename);
+        let (mut original, id) = mv_plugin_fixture(filename, "D_TEXT Placeholder");
+        let command = mv_plugin_command_mut(filename, &mut original);
+        command["code"] = serde_json::json!(code);
+        command["parameters"] = serde_json::json!([1, source]);
+        fs::write(&file, serde_json::to_vec(&original).unwrap()).unwrap();
+        let plugin = RpgMakerMvPlugin::new();
+        let mut entries = plugin.extract(&file).unwrap();
+        assert_eq!(entries.iter().filter(|e| e.id == id).count(), 1);
+        assert_eq!(entries.iter().filter(|e| e.source == source).count(), 1);
+        let row = entries.iter_mut().find(|e| e.id == id).unwrap();
+        assert_eq!(row.source, source);
+        assert_eq!(
+            row.tags,
+            [if code == 324 {
+                "actor_nickname"
+            } else {
+                "description"
+            }]
+        );
+        assert_eq!(row.context, None);
+        assert_eq!(row.metadata["format_id"], "rpgmaker-mv");
+        row.translation = Some(translation.into());
+        let report = plugin.inject(&file, &entries).unwrap();
+        assert_eq!(report.strings_written, 1);
+        assert_eq!(report.files_modified, 1);
+        let mut expected = original;
+        mv_plugin_command_mut(filename, &mut expected)["parameters"][1] =
+            serde_json::json!(translation);
+        let written: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        assert_eq!(written, expected, "only the text parameter may change");
+        let again = plugin.extract(&file).unwrap();
+        let row = again.iter().find(|e| e.id == id).unwrap();
+        assert_eq!(row.source, translation);
+        assert_eq!(row.tags, entries.iter().find(|e| e.id == id).unwrap().tags);
+    }
+
+    #[test]
+    fn test_mv_actor_text_nickname_map_roundtrip() {
+        assert_mv_actor_text_roundtrip("Map001.json", 324, "The Wanderer", "El viajero");
+    }
+
+    #[test]
+    fn test_mv_actor_text_nickname_common_event_roundtrip() {
+        assert_mv_actor_text_roundtrip("CommonEvents.json", 324, "The Wanderer", "El viajero");
+    }
+
+    #[test]
+    fn test_mv_actor_text_nickname_troop_roundtrip() {
+        assert_mv_actor_text_roundtrip("Troops.json", 324, "The Wanderer", "El viajero");
+    }
+
+    #[test]
+    fn test_mv_actor_text_profile_map_roundtrip() {
+        assert_mv_actor_text_roundtrip(
+            "Map001.json",
+            325,
+            "A former knight.\nNow a wanderer.",
+            "Fue caballero.\nHoy, viajero.",
+        );
+    }
+
+    #[test]
+    fn test_mv_actor_text_profile_common_event_roundtrip() {
+        assert_mv_actor_text_roundtrip(
+            "CommonEvents.json",
+            325,
+            "A former knight.\nNow a wanderer.",
+            "Fue caballero.\nHoy, viajero.",
+        );
+    }
+
+    #[test]
+    fn test_mv_actor_text_profile_troop_roundtrip() {
+        assert_mv_actor_text_roundtrip(
+            "Troops.json",
+            325,
+            "A former knight.\nNow a wanderer.",
+            "Fue caballero.\nHoy, viajero.",
+        );
+    }
+
+    #[test]
+    fn test_mv_actor_text_writers_only_change_text_parameter() {
+        for filename in ["Map001.json", "CommonEvents.json", "Troops.json"] {
+            for code in [320, 324, 325] {
+                let (mut json, id) = mv_plugin_fixture(filename, "D_TEXT Placeholder");
+                let command = mv_plugin_command_mut(filename, &mut json);
+                command["code"] = serde_json::json!(code);
+                command["parameters"] = serde_json::json!([
+                    7, "Original", {"untouched": [1, false, "asset"]}, null, 42
+                ]);
+                let mut expected = json.clone();
+                mv_plugin_command_mut(filename, &mut expected)["parameters"][1] =
+                    serde_json::json!("Translated\nprofile");
+                RpgMakerMvPlugin::apply_translation(
+                    &mut json,
+                    filename,
+                    &id,
+                    "Translated\nprofile",
+                );
+                assert_eq!(json, expected, "{filename}, code {code}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_mv_actor_text_profiles_keep_existing_width_rules() {
+        let source = "A former knight.\nNow a wanderer.";
+        let translation = "Un antiguo caballero que ahora recorre todos los caminos del mundo.";
+        let mut written_profiles = Vec::new();
+        for filename in [
+            "Actors.json",
+            "Map001.json",
+            "CommonEvents.json",
+            "Troops.json",
+        ] {
+            let game = tempfile::tempdir().unwrap();
+            let file = game.path().join(filename);
+            let (mut original, id) = if filename == "Actors.json" {
+                (
+                    serde_json::json!([null, {"profile": source}]),
+                    "Actors.json#1#profile".into(),
+                )
+            } else {
+                let (mut json, id) = mv_plugin_fixture(filename, "D_TEXT Placeholder");
+                let command = mv_plugin_command_mut(filename, &mut json);
+                command["code"] = serde_json::json!(325);
+                command["parameters"] = serde_json::json!([1, source]);
+                (json, id)
+            };
+            fs::write(&file, serde_json::to_vec(&original).unwrap()).unwrap();
+            let plugin = RpgMakerMvPlugin::new();
+            let mut entries = plugin.extract(&file).unwrap();
+            entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .expect("profile row")
+                .translation = Some(translation.into());
+            assert_eq!(plugin.inject(&file, &entries).unwrap().strings_written, 1);
+            let written: serde_json::Value =
+                serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+            let again = plugin.extract(&file).unwrap();
+            let profile = &again.iter().find(|e| e.id == id).unwrap().source;
+            assert!(profile.contains('\n'));
+            assert!(profile.lines().all(|line| visible_len(line) <= 16));
+            assert_eq!(
+                profile.split_whitespace().collect::<Vec<_>>(),
+                translation.split_whitespace().collect::<Vec<_>>()
+            );
+            if filename == "Actors.json" {
+                original[1]["profile"] = serde_json::json!(profile);
+            } else {
+                mv_plugin_command_mut(filename, &mut original)["parameters"][1] =
+                    serde_json::json!(profile);
+            }
+            assert_eq!(written, original);
+            written_profiles.push(profile.clone());
+        }
+        assert!(written_profiles.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    #[test]
+    fn test_mv_actor_text_existing_ids_are_stable() {
+        let plugin = RpgMakerMvPlugin::new();
+        let rows = |entries: Vec<StringEntry>| -> HashMap<String, String> {
+            entries
+                .into_iter()
+                .map(|entry| (entry.id, entry.source))
+                .collect()
+        };
+        let game = temp_game_dir();
+        let file = game.path().join("data/Actors.json");
+        let with_nicknames: serde_json::Value =
+            serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        let mut without_nicknames = with_nicknames.clone();
+        for actor in without_nicknames.as_array_mut().unwrap().iter_mut().skip(1) {
+            actor.as_object_mut().unwrap().remove("nickname");
+        }
+        fs::write(&file, serde_json::to_vec(&without_nicknames).unwrap()).unwrap();
+        let before = rows(plugin.extract(&file).unwrap());
+        let expected = HashMap::from([
+            ("Actors.json#1#name".into(), "Hero".into()),
+            ("Actors.json#1#description".into(), "The protagonist".into()),
+            ("Actors.json#1#profile".into(), "A brave hero.".into()),
+            ("Actors.json#2#name".into(), "Mage".into()),
+            ("Actors.json#2#description".into(), "A powerful mage".into()),
+        ]);
+        assert_eq!(before, expected);
+        fs::write(&file, serde_json::to_vec(&with_nicknames).unwrap()).unwrap();
+        let mut after = rows(plugin.extract(&file).unwrap());
+        after.retain(|id, _| !id.ends_with("#nickname"));
+        assert_eq!(after, before);
+
+        for filename in ["Map001.json", "CommonEvents.json", "Troops.json"] {
+            let (mut json, id) = mv_plugin_fixture(filename, "D_TEXT Placeholder");
+            let prefix = id.strip_suffix("#cmd_0").unwrap();
+            *speaker_list_mut(filename, &mut json) = serde_json::json!([
+                {"code": 101, "parameters": ["", 0, 0, 2, "Alice"]},
+                {"code": 401, "parameters": ["Hello!"]},
+                {"code": 324, "parameters": [1, ""]},
+                {"code": 320, "parameters": [1, "Hero"]},
+                {"code": 325, "parameters": [1, ""]},
+                {"code": 102, "parameters": [["Leave"], 0, 0, 2, 0]},
+                {"code": 401, "parameters": ["Goodbye!"]}
+            ]);
+            let file = game.path().join("data").join(filename);
+            fs::write(&file, serde_json::to_vec(&json).unwrap()).unwrap();
+            let before = rows(plugin.extract(&file).unwrap());
+            let expected = HashMap::from([
+                (format!("{prefix}#cmd_0#speaker"), "Alice".into()),
+                (format!("{prefix}#cmd_1#msg"), "Hello!".into()),
+                (format!("{prefix}#cmd_3"), "Hero".into()),
+                (format!("{prefix}#cmd_5#choice_0"), "Leave".into()),
+                (format!("{prefix}#cmd_6#msg"), "Goodbye!".into()),
+            ]);
+            let mut baseline = expected.clone();
+            // The plugin fixture also has a map display name or troop name.
+            match filename {
+                "Map001.json" => {
+                    baseline.insert("Map001.json#displayName".into(), "Room".into());
+                }
+                "Troops.json" => {
+                    baseline.insert("Troops.json#1#name".into(), "Troop".into());
+                }
+                _ => {}
+            }
+            assert_eq!(before, baseline);
+            let list = speaker_list_mut(filename, &mut json);
+            list[2]["parameters"][1] = serde_json::json!("The Wanderer");
+            list[4]["parameters"][1] = serde_json::json!("A former knight.\nNow a wanderer.");
+            fs::write(&file, serde_json::to_vec(&json).unwrap()).unwrap();
+            let mut after = rows(plugin.extract(&file).unwrap());
+            after.remove(&format!("{prefix}#cmd_2"));
+            after.remove(&format!("{prefix}#cmd_4"));
+            assert_eq!(after, before, "{filename}");
+        }
+    }
+
+    #[test]
+    fn test_mv_actor_text_skips_empty_or_missing_text() {
+        for filename in ["Map001.json", "CommonEvents.json", "Troops.json"] {
+            for code in [320, 324, 325] {
+                for params in [
+                    serde_json::json!([1, " \n\t"]),
+                    serde_json::json!([1]),
+                    serde_json::json!([1, null]),
+                    serde_json::json!([1, 42]),
+                ] {
+                    let (mut json, id) = mv_plugin_fixture(filename, "D_TEXT Placeholder");
+                    let command = mv_plugin_command_mut(filename, &mut json);
+                    command["code"] = serde_json::json!(code);
+                    command["parameters"] = params;
+                    let entries =
+                        RpgMakerMvPlugin::extract_file_json(Path::new(filename), &json).unwrap();
+                    assert!(
+                        entries.iter().all(|e| e.id != id),
+                        "{filename}, code {code}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
