@@ -368,28 +368,98 @@ pub struct XaiPendingAuth {
     pub last_poll: Option<Instant>,
 }
 
+/// A startup storage failure, retaining the affected path and original cause.
+#[derive(Debug)]
+pub enum StartupError {
+    DataDirectory {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    ProjectDatabase {
+        path: PathBuf,
+        source: locust_core::error::LocustError,
+    },
+    GlobalMemory {
+        path: PathBuf,
+        source: locust_core::error::LocustError,
+    },
+}
+
+impl std::fmt::Display for StartupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DataDirectory { path, source } => write!(
+                f,
+                "Cannot create data directory '{}': {source}. Check directory permissions or set LOCUST_DATA_DIR to a writable directory.",
+                path.display()
+            ),
+            Self::ProjectDatabase { path, source } => write!(
+                f,
+                "Cannot open project database '{}': {source}. Check its permissions and validity, or set LOCUST_DATA_DIR to a different writable directory. Locust has not moved or replaced the database.",
+                path.display()
+            ),
+            Self::GlobalMemory { path, source } => write!(
+                f,
+                "Cannot initialize translation memory for '{}' even with an in-memory fallback: {source}. Check available system resources.",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StartupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DataDirectory { source, .. } => Some(source),
+            Self::ProjectDatabase { source, .. } | Self::GlobalMemory { source, .. } => {
+                Some(source)
+            }
+        }
+    }
+}
+
 /// Create production AppState with persistent storage in the user data directory.
-pub fn create_app_state() -> Arc<AppState> {
-    let data_dir = AppConfig::config_dir();
-    std::fs::create_dir_all(&data_dir).expect("Failed to create data directory");
+pub fn create_app_state() -> Result<Arc<AppState>, StartupError> {
+    create_app_state_in(&AppConfig::config_dir())
+}
+
+fn create_app_state_in(data_dir: &Path) -> Result<Arc<AppState>, StartupError> {
+    std::fs::create_dir_all(data_dir).map_err(|source| StartupError::DataDirectory {
+        path: data_dir.to_path_buf(),
+        source,
+    })?;
 
     let db_path = data_dir.join("project.db");
-    let db = Arc::new(Database::open(&db_path).expect("Failed to open project database"));
+    let db =
+        Arc::new(
+            Database::open(&db_path).map_err(|source| StartupError::ProjectDatabase {
+                path: db_path,
+                source,
+            })?,
+        );
     let glossary = Arc::new(Glossary::new(db.clone()));
-    let backup_root = locust_core::backup::effective_backup_root();
+    let backup_root = std::env::var_os("LOCUST_BACKUP_ROOT")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_dir.join("backups"));
     std::fs::create_dir_all(&backup_root).ok();
 
     // Startup never prunes: project DB recordings may reference any backup; users delete in Settings → Data.
 
-    let config_path = AppConfig::default_path();
+    let config_path = data_dir.join("config.json");
     let (config, config_load_failed) = config_persistence::load_startup_config(&config_path);
     let format_registry = locust_formats::default_registry();
     let provider_registry = locust_providers::default_registry(&config);
 
-    let global_memory = GlobalMemoryDb::open_default()
-        .unwrap_or_else(|_| GlobalMemoryDb::open_in_memory().unwrap());
+    let memory_path = data_dir.join("global_memory.db");
+    let global_memory = GlobalMemoryDb::open(&memory_path)
+        .or_else(|_| GlobalMemoryDb::open_in_memory())
+        .map_err(|source| StartupError::GlobalMemory {
+            path: memory_path,
+            source,
+        })?;
 
-    Arc::new(AppState {
+    Ok(Arc::new(AppState {
         text_fit_cache: Arc::new(std::sync::Mutex::new(Default::default())),
         format_registry: Arc::new(format_registry),
         provider_registry: Arc::new(RwLock::new(provider_registry)),
@@ -407,7 +477,7 @@ pub fn create_app_state() -> Arc<AppState> {
         current_project: Arc::new(RwLock::new(None)),
         project_exclusive: Arc::new(AtomicUsize::new(0)),
         test_temp_dirs: std::sync::Mutex::new(Vec::new()),
-    })
+    }))
 }
 
 pub fn create_test_state() -> Arc<AppState> {
@@ -709,6 +779,54 @@ mod tests {
     use locust_core::models::ProgressEvent;
     use std::time::Duration;
 
+    #[test]
+    fn startup_reports_data_directory_path_and_preserves_existing_file() {
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("profile");
+        let original = b"keep this existing file";
+        std::fs::write(&data_dir, original).unwrap();
+
+        let error = create_app_state_in(&data_dir)
+            .err()
+            .expect("a file cannot be used as the data directory");
+        assert!(matches!(
+            &error,
+            StartupError::DataDirectory { path, .. } if path == &data_dir
+        ));
+        let message = error.to_string();
+        assert!(message.contains(&data_dir.display().to_string()));
+        assert!(message.contains("LOCUST_DATA_DIR"));
+        assert!(std::error::Error::source(&error).is_some());
+        assert_eq!(std::fs::read(&data_dir).unwrap(), original);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn startup_reports_corrupt_database_path_and_preserves_existing_files() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("project.db");
+        let original = b"this is not a SQLite database";
+        std::fs::write(&db_path, original).unwrap();
+        let config_path = root.path().join("config.json");
+        let config = b"{\"recent_projects\": []}";
+        std::fs::write(&config_path, config).unwrap();
+
+        let error = create_app_state_in(root.path())
+            .err()
+            .expect("a corrupt project database must fail startup");
+        assert!(matches!(
+            &error,
+            StartupError::ProjectDatabase { path, .. } if path == &db_path
+        ));
+        let message = error.to_string();
+        assert!(message.contains(&db_path.display().to_string()));
+        assert!(message.contains("Check its permissions and validity"));
+        assert!(std::error::Error::source(&error).is_some());
+        assert_eq!(std::fs::read(&db_path).unwrap(), original);
+        assert_eq!(std::fs::read(&config_path).unwrap(), config);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
+    }
+
     static DATA_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct DataDirRestore(Option<std::ffi::OsString>);
@@ -745,7 +863,7 @@ mod tests {
         assert_eq!(backup_manager.list_backups().unwrap().len(), 6);
         drop(backup_manager);
 
-        let state = create_app_state();
+        let state = create_app_state().unwrap();
         assert_eq!(state.backup_manager.list_backups().unwrap().len(), 6);
     }
 

@@ -1,10 +1,97 @@
 // Prevents additional console window on Windows in release
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use anyhow::Context;
 #[cfg(not(debug_assertions))]
 use human_panic::setup_panic;
+use tauri_plugin_dialog::DialogExt;
 
 mod commands;
+
+fn write_startup_note(message: &str) {
+    use std::io::Write;
+
+    eprintln!("{message}");
+    // Release builds have no console. Leave a diagnostic even if Tauri itself
+    // cannot initialize the native dialog. Never overwrite an existing note.
+    let path = std::env::temp_dir().join(format!("locust-startup-{}.log", std::process::id()));
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "{message}");
+        eprintln!("Startup diagnostic: {}", path.display());
+    }
+}
+
+fn exit_with_startup_error(error: anyhow::Error) -> ! {
+    let message = format!("Locust could not start.\n\n{error:#}");
+    write_startup_note(&message);
+
+    // The plugin needs an app handle, but no webview or parent window. Create
+    // only the error dialog; the normal window must not open on failed startup.
+    let mut context = tauri::generate_context!();
+    context.config_mut().app.windows.clear();
+    let result = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .setup(move |app| {
+            let handle = app.handle().clone();
+            app.dialog()
+                .message(message)
+                .title("Locust startup error")
+                .kind(tauri_plugin_dialog::MessageDialogKind::Error)
+                .show(move |_| handle.exit(1));
+            Ok(())
+        })
+        .run(context);
+    if let Err(error) = result {
+        eprintln!("Cannot show startup error dialog: {error}");
+    }
+    std::process::exit(1);
+}
+
+fn start_backend() -> anyhow::Result<(std::sync::Arc<locust_server::AppState>, u16)> {
+    let state = locust_server::create_app_state()?;
+    let state_for_server = state.clone();
+
+    // Keep the socket bound while handing it to the backend. Probing a free
+    // port and reopening it races other processes and other Locust instances.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").context(
+        "Cannot bind the embedded server on 127.0.0.1:0. Check loopback availability and socket permissions.",
+    )?;
+    listener
+        .set_nonblocking(true)
+        .context("Cannot configure the embedded server socket on 127.0.0.1")?;
+    let port = listener
+        .local_addr()
+        .context("Cannot read the embedded server address on 127.0.0.1")?
+        .port();
+
+    // Finish all fallible runtime/socket initialization before opening a window.
+    let rt = tokio::runtime::Runtime::new()
+        .context("Cannot create the embedded server runtime. Check available system resources.")?;
+    let listener = {
+        let _guard = rt.enter();
+        tokio::net::TcpListener::from_std(listener).with_context(|| {
+            format!("Cannot initialize the embedded server socket on 127.0.0.1:{port}")
+        })?
+    };
+    std::thread::Builder::new()
+        .name("locust-server".into())
+        .spawn(move || {
+            rt.block_on(async {
+                tracing::info!("Starting embedded server on port {}", port);
+                if let Err(e) =
+                    locust_server::start_server_with_listener(state_for_server, listener).await
+                {
+                    tracing::error!("Server error: {}", e);
+                }
+            });
+        })
+        .context("Cannot start the embedded server thread. Check available system resources.")?;
+    Ok((state, port))
+}
 
 fn main() {
     #[cfg(not(debug_assertions))]
@@ -18,36 +105,7 @@ fn main() {
         )
         .init();
 
-    // Create production backend state
-    let state = locust_server::create_app_state();
-    let state_for_server = state.clone();
-
-    // Keep the socket bound while handing it to the backend. Probing a free
-    // port and reopening it races other processes and other Locust instances.
-    let listener =
-        std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind the embedded server");
-    listener
-        .set_nonblocking(true)
-        .expect("Failed to configure embedded server socket");
-    let port = listener
-        .local_addr()
-        .expect("Failed to read embedded server address")
-        .port();
-
-    // Start the backend server in a background thread
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-        rt.block_on(async {
-            tracing::info!("Starting embedded server on port {}", port);
-            let listener = tokio::net::TcpListener::from_std(listener)
-                .expect("Failed to initialize embedded server socket");
-            if let Err(e) =
-                locust_server::start_server_with_listener(state_for_server, listener).await
-            {
-                tracing::error!("Server error: {}", e);
-            }
-        });
-    });
+    let (state, port) = start_backend().unwrap_or_else(|error| exit_with_startup_error(error));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -90,5 +148,8 @@ fn main() {
             commands::add_glossary_entry,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .unwrap_or_else(|error| {
+            write_startup_note(&format!("Cannot run Locust desktop application: {error}"));
+            std::process::exit(1);
+        });
 }
