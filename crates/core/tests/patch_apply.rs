@@ -869,6 +869,225 @@ fn patch_tree_hashes(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<
         .collect()
 }
 
+// Exercise each entry point independently so a failed verify assertion cannot
+// hide a later partial apply or a dry-run that incorrectly accepts the plan.
+fn preflight_error(game: &Path, zip: &Path, dry_run: Option<bool>, force: bool) -> LocustError {
+    if let Some(dry_run) = dry_run {
+        let before = patch_tree_hashes(game);
+        let mut progress = Vec::new();
+        let result = apply(
+            game,
+            zip,
+            ApplyOptions {
+                force,
+                dry_run,
+                ..Default::default()
+            },
+            |event| progress.push(event),
+        );
+        assert_eq!(
+            patch_tree_hashes(game),
+            before,
+            "refusal must preserve the entire game tree"
+        );
+        assert!(!PatchStore::new(game).journal_path().exists());
+        assert!(
+            progress.is_empty(),
+            "preflight must precede installation progress"
+        );
+        result.expect_err("invalid destinations must be refused before installation")
+    } else {
+        verify(game, zip).expect_err("invalid destinations must be refused by verify")
+    }
+}
+
+fn assert_planned_file_ancestor_refused(dry_run: Option<bool>) {
+    for parent in ["a", "A"] {
+        for reverse in [false, true] {
+            for force in [false, true] {
+                let game = tmp_game("planned_file_ancestor");
+                write_file(game.path(), "c.txt", b"ORIGINAL_C");
+                let zip = game.path().join("patch.zip");
+                let mut files: Vec<PatchZipFile<'_>> = vec![
+                    ("c.txt", b"PATCHED_C", Some(b"ORIGINAL_C")),
+                    (parent, b"ADDED_A", None),
+                    ("a/b.txt", b"ADDED_B", None),
+                ];
+                if reverse {
+                    files.reverse();
+                }
+                build_patch_zip(&zip, &files, "1.0.0", "planned-file-ancestor");
+                let before = patch_tree_hashes(game.path());
+                let error = preflight_error(game.path(), &zip, dry_run, force);
+                assert!(
+                    matches!(error, LocustError::PatchUnsafeEntry(_)),
+                    "{error:?}"
+                );
+                let message = error.to_string();
+                assert!(message.contains(&format!("file {parent}")), "{message}");
+                assert!(message.contains("a/b.txt"), "{message}");
+                assert_eq!(patch_tree_hashes(game.path()), before);
+                assert!(!PatchStore::new(game.path()).journal_path().exists());
+                assert!(!game.path().join(".locust").exists());
+            }
+        }
+    }
+}
+
+#[test]
+fn preflight_planned_file_ancestor_verify_refuses_without_mutation() {
+    assert_planned_file_ancestor_refused(None);
+}
+
+#[test]
+fn preflight_planned_file_ancestor_dry_run_refuses_without_mutation() {
+    assert_planned_file_ancestor_refused(Some(true));
+}
+
+#[test]
+fn preflight_planned_file_ancestor_apply_refuses_without_mutation() {
+    assert_planned_file_ancestor_refused(Some(false));
+}
+
+// Restore even when a regression assertion panics, so TempDir can remove the file.
+struct RestorePermissions {
+    path: PathBuf,
+    permissions: fs::Permissions,
+}
+
+impl Drop for RestorePermissions {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(&self.path, self.permissions.clone());
+    }
+}
+
+fn assert_read_only_destination_refused(dry_run: Option<bool>) {
+    let game = tmp_game("read_only_destination");
+    write_file(game.path(), "a.txt", b"ORIGINAL_A");
+    write_file(game.path(), "b.txt", b"ORIGINAL_B");
+    let zip = game.path().join("patch.zip");
+    build_patch_zip(
+        &zip,
+        &[
+            ("a.txt", b"FIRST_A", Some(b"ORIGINAL_A")),
+            ("b.txt", b"FIRST_B", Some(b"ORIGINAL_B")),
+        ],
+        "1.0.0",
+        "read-only-destination",
+    );
+    apply(game.path(), &zip, ApplyOptions::default(), |_| {}).unwrap();
+    build_patch_zip(
+        &zip,
+        &[
+            ("a.txt", b"SECOND_A", Some(b"ORIGINAL_A")),
+            ("b.txt", b"SECOND_B", Some(b"ORIGINAL_B")),
+        ],
+        "1.0.0",
+        "read-only-destination",
+    );
+    let path = game.path().join("b.txt");
+    let restore = RestorePermissions {
+        permissions: fs::metadata(&path).unwrap().permissions(),
+        path,
+    };
+    let mut permissions = restore.permissions.clone();
+    permissions.set_readonly(true);
+    fs::set_permissions(&restore.path, permissions).unwrap();
+    let before = patch_tree_hashes(game.path());
+    let store = PatchStore::new(game.path());
+    assert!(!store.journal_path().exists());
+    let error = preflight_error(game.path(), &zip, dry_run, true);
+    assert!(
+        matches!(error, LocustError::GameDirNotWritable(_)),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("b.txt"), "{error}");
+    assert!(error.to_string().contains("read-only"), "{error}");
+    assert_eq!(fs::read(game.path().join("a.txt")).unwrap(), b"FIRST_A");
+    assert_eq!(patch_tree_hashes(game.path()), before);
+    assert!(!store.journal_path().exists());
+
+    fs::set_permissions(&restore.path, restore.permissions.clone()).unwrap();
+    drop(restore);
+    let report = apply(
+        game.path(),
+        &zip,
+        ApplyOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!((report.replaced, report.added), (2, 0));
+    assert_eq!(fs::read(game.path().join("a.txt")).unwrap(), b"SECOND_A");
+    assert_eq!(fs::read(game.path().join("b.txt")).unwrap(), b"SECOND_B");
+    assert!(!store.journal_path().exists());
+    rollback(game.path(), RollbackOptions::default()).unwrap();
+    assert_eq!(fs::read(game.path().join("a.txt")).unwrap(), b"ORIGINAL_A");
+    assert_eq!(fs::read(game.path().join("b.txt")).unwrap(), b"ORIGINAL_B");
+}
+
+#[test]
+fn preflight_read_only_destination_verify_refuses_without_mutation() {
+    assert_read_only_destination_refused(None);
+}
+
+#[test]
+fn preflight_read_only_destination_dry_run_refuses_without_mutation() {
+    assert_read_only_destination_refused(Some(true));
+}
+
+#[test]
+fn preflight_read_only_destination_apply_refuses_without_mutation() {
+    assert_read_only_destination_refused(Some(false));
+}
+
+#[test]
+fn preflight_valid_sibling_and_prefix_names_still_apply() {
+    let game = tmp_game("valid_planned_namespace");
+    write_file(game.path(), "c.txt", b"ORIGINAL_C");
+    let zip = game.path().join("patch.zip");
+    build_patch_zip(
+        &zip,
+        &[
+            ("c.txt", b"PATCHED_C", Some(b"ORIGINAL_C")),
+            ("A.txt", b"ADDED_A", None),
+            ("a/b.txt", b"ADDED_B", None),
+            ("a/c.txt", b"ADDED_C", None),
+        ],
+        "1.0.0",
+        "valid-planned-namespace",
+    );
+    let before = patch_tree_hashes(game.path());
+    assert_eq!(
+        verify(game.path(), &zip).unwrap().outcome,
+        VerificationOutcome::Clean
+    );
+    assert_eq!(patch_tree_hashes(game.path()), before);
+    let dry_run = apply(
+        game.path(),
+        &zip,
+        ApplyOptions {
+            dry_run: true,
+            ..Default::default()
+        },
+        |_| panic!("dry-run must not install files"),
+    )
+    .unwrap();
+    assert_eq!((dry_run.replaced, dry_run.added), (1, 3));
+    assert_eq!(patch_tree_hashes(game.path()), before);
+    let report = apply(game.path(), &zip, ApplyOptions::default(), |_| {}).unwrap();
+    assert_eq!((report.replaced, report.added), (1, 3));
+    assert_eq!(fs::read(game.path().join("c.txt")).unwrap(), b"PATCHED_C");
+    assert_eq!(fs::read(game.path().join("A.txt")).unwrap(), b"ADDED_A");
+    assert_eq!(fs::read(game.path().join("a/b.txt")).unwrap(), b"ADDED_B");
+    assert_eq!(fs::read(game.path().join("a/c.txt")).unwrap(), b"ADDED_C");
+    assert!(!PatchStore::new(game.path()).journal_path().exists());
+    rollback(game.path(), RollbackOptions::default()).unwrap();
+    assert_eq!(patch_tree_hashes(game.path()), before);
+}
+
 fn rollback_inventory_fixture(state: Option<JournalState>) -> tempfile::TempDir {
     let game = tmp_game("rollback_inventory");
     write_file(game.path(), "a.txt", b"ORIGINAL_A");

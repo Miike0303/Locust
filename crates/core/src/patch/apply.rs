@@ -148,8 +148,9 @@ where
         manifest: report.manifest.clone(),
         files,
     };
-    // Path types are never force-overridable, including before a transition
-    // rolls back the installed patch. No recovery state has been published.
+    // Path types and read-only permissions are never force-overridable,
+    // including before a transition rolls back the installed patch. No recovery
+    // state has been published.
     ensure_file_destinations(game_root, prepared.files.keys().map(String::as_str))?;
     enforce_verify_gates(&report, &opts)?;
 

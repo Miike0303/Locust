@@ -302,7 +302,15 @@ fn classify_destination(game_root: &Path, rel: &Path) -> Result<Destination> {
     // dangling links. Installation retains its independent link/type checks.
     super::zipsec::ensure_no_links(game_root, rel)?;
     match std::fs::symlink_metadata(game_root.join(rel)) {
-        Ok(metadata) if metadata.is_file() => Ok(Destination::File),
+        Ok(metadata) if metadata.is_file() => {
+            if metadata.permissions().readonly() {
+                return Err(LocustError::GameDirNotWritable(format!(
+                    "read-only file: {}",
+                    game_root.join(rel).display()
+                )));
+            }
+            Ok(Destination::File)
+        }
         Ok(_) => Ok(Destination::Conflict(FileMismatch {
             path: rel.to_string_lossy().replace('\\', "/"),
             expected: "regular file or absent".into(),
@@ -313,8 +321,9 @@ fn classify_destination(game_root: &Path, rel: &Path) -> Result<Destination> {
     }
 }
 
-/// Force can replace conflicting file content, but cannot override path types.
-/// Check the whole plan before publishing backup/journal state or mutating games.
+/// Force can replace conflicting content, but cannot override path types or
+/// read-only permissions. Check the whole plan before publishing recovery state
+/// or mutating games, including before rollback transitions.
 pub(super) fn ensure_file_destinations<'a>(
     game_root: &Path,
     paths: impl IntoIterator<Item = &'a str>,
@@ -368,7 +377,7 @@ pub(super) fn scan_zip_entries(
             return Err(LocustError::PatchUnsafeEntry(original));
         }
         let normalized = super::zipsec::canonical_archive_name(&original)?;
-        let key = normalized.to_lowercase();
+        let key = super::zipsec::case_fold_key(Path::new(&normalized));
         // Metadata and directory entries share the same collision registry as
         // payloads. Never let verify and apply select different manifests.
         if !seen.insert(key.clone()) {
@@ -437,6 +446,28 @@ pub(super) fn scan_zip_entries(
             meta_data,
             is_dir: false,
         });
+    }
+    // A file cannot also be a directory required by another planned path.
+    // Index the complete namespace first so archive order cannot affect safety.
+    let planned_files: HashMap<_, _> = out
+        .iter()
+        .filter(|entry| entry.rel.is_some())
+        .map(|entry| {
+            (
+                super::zipsec::case_fold_key(Path::new(&entry.normalized)),
+                entry.normalized.as_str(),
+            )
+        })
+        .collect();
+    for entry in &out {
+        for ancestor in Path::new(&entry.normalized).ancestors().skip(1) {
+            if let Some(file) = planned_files.get(&super::zipsec::case_fold_key(ancestor)) {
+                return Err(LocustError::PatchUnsafeEntry(format!(
+                    "planned file {file} is an ancestor of planned path {}",
+                    entry.normalized
+                )));
+            }
+        }
     }
     Ok(out)
 }
