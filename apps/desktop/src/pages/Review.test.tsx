@@ -4,6 +4,7 @@ import { after, beforeEach, test } from "node:test";
 import { QueryClient, QueryObserver } from "@tanstack/react-query";
 import { ApiError } from "../lib/apiError.ts";
 import type { FileStats, StringEntry } from "../lib/api.ts";
+import * as contextLibrary from "../lib/reviewContext.ts";
 import { draftProjectKey, projectScopedQueryFn } from "../lib/projectScope.ts";
 import { useProjectStore } from "../stores/projectStore.ts";
 import { draftEntryKey, editDraft, saveDraft, useDraftStore } from "../stores/draftStore.ts";
@@ -70,6 +71,12 @@ const h = {
   get format() { return useProjectStore.getState().project?.format_id ?? ""; },
   set format(format_id: string) { useProjectStore.getState().setProject({ ...project, format_id }); },
   contextFailure: false, contextWaits: {} as Record<string, Promise<void> | undefined>,
+  contextBuilds: [] as string[],
+  reviewContext: contextLibrary.reviewContext,
+  buildContextIndex(rows: StringEntry[]) {
+    this.contextBuilds.push(rows[0]?.file_path ?? "");
+    return contextLibrary.buildReviewContextIndex(rows);
+  },
   focused: 0,
   storage: new Map<string, string>(), storageFailure: false,
   fileStatsFailure: false,
@@ -124,6 +131,7 @@ const hooks = registerHooks({
         "react-router-dom": `export const useNavigate=()=>path=>globalThis.__reviewTest.navigations.push(path);`,
         "@tanstack/react-query": `export const useQueryClient=()=>globalThis.__reviewTest.client;`,
         "../stores/projectStore": `const store=globalThis.__reviewTest.projectStore;export const useProjectStore=Object.assign(select=>select(store.getState()),{getState:store.getState});`,
+        "../lib/reviewContext": `const h=globalThis.__reviewTest;export const buildReviewContextIndex=rows=>h.buildContextIndex(rows);export const reviewContext=(...args)=>h.reviewContext(...args);`,
         "../lib/i18n": `export const useT=()=>globalThis.__reviewTest.t;`,
         "../lib/api": `const h=globalThis.__reviewTest;export const getFileStats=()=>h.getFileStats();export const getStrings=filter=>h.getStrings(filter);export const patchString=(id,patch)=>h.patchString(id,patch);export const getSpeakers=async()=>({groups:h.speakers,unassigned_entry_ids:[]});`,
       };
@@ -223,7 +231,7 @@ beforeEach(async () => {
   h.keydown = null; h.navigations = []; h.speakers = []; h.reads = [];
   h.format = "renpy"; h.contextFailure = false; h.contextWaits = {}; h.focused = 0;
   h.storage.clear(); h.storageFailure = false; h.fetchWaits = {};
-  h.fileStatsFailure = false;
+  h.fileStatsFailure = false; h.contextBuilds = [];
   render();
   await settle();
   assert.equal(textarea().props.value, "Translation A");
@@ -557,6 +565,7 @@ test("Review header uses the shared status badge and success progress color", as
 });
 
 async function startWith(entries: StringEntry[]) {
+  h.contextBuilds = [];
   h.values = []; h.effects = []; h.pending = [];
   h.rows = Object.fromEntries(entries.map(entry => [entry.id, entry]));
   render();
@@ -963,4 +972,87 @@ test("file stats failure keeps All files review usable and exposes a retry", asy
   button(t("common.retry")).props.onClick();
   await settle();
   assert.deepEqual(nodes(scopeSelector()).filter(node => node.type === "option").map(node => node.props.value), ["", "A.json", "B.json"]);
+});
+
+test("many selections and approvals in one file build its complete context index once", async () => {
+  h.reads = [];
+  await startWith(Array.from({ length: 80 }, (_, n) => row(`r${n}`)));
+  assert.deepEqual(h.contextBuilds, ["dialogue.json"]);
+  for (let n = 0; n < 60; n++) {
+    if (n % 3 === 0) await approve();
+    else { button(t("review.skip")).props.onClick(); await settle(); }
+  }
+  for (let n = 0; n < 10; n++) {
+    button(t("review.previous")).props.onClick();
+    await settle();
+  }
+  assert.deepEqual(h.contextBuilds, ["dialogue.json"]);
+  assert.equal(h.reads.filter(filter => filter.file_path === "dialogue.json" && !filter.status).length, 2,
+    "the index includes both context pages");
+  assert.deepEqual(contextRows().map(node => node.props["data-entry-id"]),
+    [47, 48, 49, 50, 51, 52, 53].map(n => `r${n}`));
+});
+
+test("switching file scope clears completed context indexes before returning to the same file", async () => {
+  await startWith(fileRows());
+  assert.deepEqual(h.contextBuilds, ["A.json"]);
+  selectScope("B.json");
+  await settle();
+  selectScope("A.json");
+  await settle();
+  selectScope("");
+  await settle();
+  assert.deepEqual(h.contextBuilds, ["A.json", "B.json", "A.json", "A.json"]);
+});
+
+for (const replacement of [
+  { ...project, database_path: "/context.db" }, { ...project, path: "/context-game" },
+  { ...project, format_id: "rpgmaker-mv" },
+]) {
+  test(`project change clears the context index: ${draftProjectKey(replacement)}`, async () => {
+    assert.deepEqual(h.contextBuilds, ["dialogue.json"]);
+    h.rows = { A: row("A"), B: { ...row("B"), translation: "Replacement neighbor", status: "pending" } };
+    useProjectStore.getState().setProject(replacement);
+    render();
+    await settle();
+    assert.deepEqual(h.contextBuilds, ["dialogue.json", "dialogue.json"]);
+    assert.ok(text(contextRows()[1]).includes("Replacement neighbor"));
+  });
+}
+
+test("context index LRU keeps four files and refreshes a file when revisited", async () => {
+  const files = ["A", "B", "C", "D", "A", "E", "B"];
+  await startWith(files.map((file, n) => ({ ...row(`${file}.rpy#s${n}`), file_path: `${file}.rpy` })));
+  for (let n = 1; n < files.length; n++) {
+    button(t("review.skip")).props.onClick();
+    await settle();
+  }
+  assert.deepEqual(h.contextBuilds, ["A.rpy", "B.rpy", "C.rpy", "D.rpy", "E.rpy", "B.rpy"]);
+});
+
+test("cached context keeps saved neighbor text and the selected live draft", async () => {
+  edit("Saved neighbor");
+  await approve();
+  assert.ok(text(contextRows()[0]).includes("Saved neighbor"));
+  edit("Current draft");
+  assert.ok(text(contextRows()[1]).includes("Current draft"));
+  assert.deepEqual(h.contextBuilds, ["dialogue.json"]);
+});
+
+test("navigation while context pages are pending builds only the completed file index", async () => {
+  let finish!: () => void;
+  h.contextWaits["delayed.rpy"] = new Promise<void>(resolve => { finish = resolve; });
+  await startWith(Array.from({ length: 60 }, (_, n) => ({
+    ...row(`delayed.rpy#s${n}`), file_path: "delayed.rpy",
+  })));
+  for (let n = 0; n < 5; n++) {
+    button(t("review.skip")).props.onClick();
+    render();
+  }
+  assert.deepEqual(h.contextBuilds, []);
+  finish();
+  await flushScope();
+  assert.deepEqual(h.contextBuilds, ["delayed.rpy"]);
+  assert.deepEqual(contextRows().map(node => node.props["data-entry-id"]),
+    [2, 3, 4, 5, 6, 7, 8].map(n => `delayed.rpy#s${n}`));
 });

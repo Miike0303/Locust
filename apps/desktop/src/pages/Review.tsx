@@ -7,7 +7,7 @@ import { getFileStats, getSpeakers, getStrings, patchString, type FileStats, typ
 import { speakerOwner } from "../lib/speakers";
 import { pathBasename } from "../lib/path";
 import { placeholderParts, placeholderCheck } from "../lib/placeholders";
-import { reviewContext } from "../lib/reviewContext";
+import { buildReviewContextIndex, type ReviewContextIndex } from "../lib/reviewContext";
 import DiffView from "../components/DiffView";
 import EmptyState from "../components/EmptyState";
 import { shouldHandleEscape, shouldRunActionHotkey } from "../lib/hotkeyPolicy";
@@ -82,6 +82,7 @@ export default function Review() {
   const [speakers, setSpeakers] = useState<Record<string, string>>({});
   const [context, setContext] = useState<{ id: string; rows: StringEntry[]; error: boolean } | null>(null);
   const contextPages = useRef(new Map<string, ReturnType<typeof getStrings>>());
+  const contextIndexes = useRef(new Map<string, ReviewContextIndex<StringEntry>>());
   const approvingRef = useRef(false);
   const fetchingRef = useRef(false);
   const queueRef = useRef(queue);
@@ -115,6 +116,7 @@ export default function Review() {
     setSpeakers({});
     setContext(null);
     contextPages.current.clear();
+    contextIndexes.current.clear();
     const owner = speakerOwner(project);
     if (owner) {
       void getSpeakers(owner).then(result => {
@@ -137,6 +139,7 @@ export default function Review() {
     fetchingRef.current = false;
     setContext(null);
     contextPages.current.clear();
+    contextIndexes.current.clear();
   }, []);
 
   useEffect(() => {
@@ -245,10 +248,20 @@ export default function Review() {
     if (!entry || !projectPath) return;
     let active = true;
     const current = entry;
+    const gen = loadGenRef.current;
+    const indexes = contextIndexes.current;
+    const cached = indexes.get(current.file_path);
+    if (cached) {
+      // Map insertion order tracks the four most recently used files.
+      indexes.delete(current.file_path);
+      indexes.set(current.file_path, cached);
+      setContext({ id: current.id, rows: cached.lookup(current), error: false });
+      return;
+    }
     const pages = contextPages.current;
     const load = async () => {
       const rows: StringEntry[] = [];
-      for (let offset = 0; active; offset += REVIEW_PAGE_SIZE) {
+      for (let offset = 0; active && gen === loadGenRef.current; offset += REVIEW_PAGE_SIZE) {
         const key = JSON.stringify([current.file_path, offset]);
         let page = pages.get(key);
         if (!page) {
@@ -257,18 +270,24 @@ export default function Review() {
           void page.catch(() => { pages.delete(key); });
         }
         const result = await page;
-        if (!active) return;
+        if (!active || gen !== loadGenRef.current) return;
         // Lexical API pages can split numeric neighbors; collect the entire file.
         rows.push(...result.entries);
         const exhausted = !result.entries.length || offset + result.entries.length >= result.total;
         if (exhausted) {
-          setContext({ id: current.id, rows: reviewContext(current, rows), error: false });
+          const index = buildReviewContextIndex(rows);
+          indexes.set(current.file_path, index);
+          if (indexes.size > 4) {
+            const oldest = indexes.keys().next().value;
+            if (oldest !== undefined) indexes.delete(oldest);
+          }
+          setContext({ id: current.id, rows: index.lookup(current), error: false });
           return;
         }
       }
     };
     void load().catch(() => {
-      if (active) setContext({ id: current.id, rows: [current], error: true });
+      if (active && gen === loadGenRef.current) setContext({ id: current.id, rows: [current], error: true });
     });
     return () => { active = false; };
   }, [entry?.id, entry?.file_path, projectPath, databasePath, format]);
