@@ -138,9 +138,16 @@ export default function DetailPanel({
 			if (!(await handleSave()) || currentEntryId.current !== id || !isCurrentProject()) return;
 			// Saving a dirty translation can change status before this second write.
 			const previous = latestEntry.current.saved;
-			const saved = await patchString(id, { status });
-			if (currentEntryId.current === id) latestEntry.current.saved = saved;
-			if (isCurrentProject()) onRefetch(saved, previous);
+			// Reuse the draft conflict lifecycle even when only status is changing.
+			if (!useDraftStore.getState().drafts[draftKey]) {
+				editDraft(draftKey, previous.translation ?? "", previous.translation);
+			}
+			await saveDraft(draftKey, previous.translation ?? "", async () => {
+				if (!isCurrentProject()) throw new Error(t("detail.projectChanged"));
+				const saved = await patchString(id, { status, expected_translation: previous.translation });
+				if (currentEntryId.current === id) latestEntry.current.saved = saved;
+				if (isCurrentProject()) onRefetch(saved, previous);
+			}, false, true);
 			setActionError(null);
 		} catch (error) {
 			if (currentEntryId.current === id) setActionError(error instanceof Error ? error.message : String(error));

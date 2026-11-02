@@ -418,9 +418,13 @@ async fn apply_string_patch(
             return Err(locust_core::database::TRANSLATION_CONFLICT_MESSAGE.into());
         }
     } else if let Some(ref status) = data.status {
-        db.update_entry_status(id, status.clone())
+        let outcome = db
+            .update_entry_status_guarded(id, status.clone(), data.expected_translation)
             .await
             .map_err(|e| e.to_string())?;
+        if outcome == locust_core::database::TranslationSaveOutcome::Conflict {
+            return Err(locust_core::database::TRANSLATION_CONFLICT_MESSAGE.into());
+        }
     }
     db.get_entry(id)
         .map_err(|e| e.to_string())?
@@ -1530,6 +1534,94 @@ mod tests {
         let saved = db.get_entry("row").unwrap().unwrap();
         assert_eq!(saved.translation.as_deref(), Some("legacy"));
         assert_eq!(saved.status, StringStatus::Reviewed);
+    }
+
+    async fn assert_review_approval_conflict(edited: bool) {
+        let db = locust_core::database::Database::open_in_memory().unwrap();
+        let mut row = StringEntry::new("approval", "Source", PathBuf::from("story.html"));
+        row.translation = Some("V1".into());
+        db.save_entries(&[row]).unwrap();
+        let loaded = db.get_entry("approval").unwrap().unwrap();
+        db.save_translation_and_status_if_unchanged(
+            "approval",
+            "V2",
+            "other-provider",
+            Some(StringStatus::Reviewed),
+            None,
+        )
+        .await
+        .unwrap();
+        let before = serde_json::to_value(db.get_entry("approval").unwrap().unwrap()).unwrap();
+        let history = serde_json::to_value(db.get_string_history("approval", 50).unwrap()).unwrap();
+        let mut body =
+            serde_json::json!({"status":"approved", "expected_translation":loaded.translation});
+        if edited {
+            body["translation"] = serde_json::json!("V-review");
+        }
+        let error = apply_string_patch(&db, "approval", serde_json::from_value(body).unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(error, locust_core::database::TRANSLATION_CONFLICT_MESSAGE);
+        assert_eq!(
+            serde_json::to_value(db.get_entry("approval").unwrap().unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(before["translation"], "V2");
+        assert_eq!(before["status"], "reviewed");
+        assert_eq!(
+            serde_json::to_value(db.get_string_history("approval", 50).unwrap()).unwrap(),
+            history
+        );
+    }
+
+    #[tokio::test]
+    async fn edited_review_approval_rejects_a_newer_translation() {
+        assert_review_approval_conflict(true).await;
+    }
+
+    #[tokio::test]
+    async fn unchanged_review_approval_rejects_a_newer_translation() {
+        assert_review_approval_conflict(false).await;
+    }
+
+    #[tokio::test]
+    async fn review_status_guards_match_nullable_baselines_and_preserve_attribution() {
+        for translation in [None, Some(""), Some("V1")] {
+            let db = locust_core::database::Database::open_in_memory().unwrap();
+            let mut row = StringEntry::new("approval", "Source", PathBuf::from("story.html"));
+            row.translation = translation.map(str::to_owned);
+            row.provider_used = Some("original-provider".into());
+            row.translated_at = Some(row.created_at);
+            db.save_entries(&[row.clone()]).unwrap();
+            let wrong = if translation.is_none() {
+                serde_json::json!("")
+            } else {
+                serde_json::Value::Null
+            };
+            let body = serde_json::json!({"status":"approved", "expected_translation":wrong});
+            assert_eq!(
+                apply_string_patch(&db, "approval", serde_json::from_value(body).unwrap())
+                    .await
+                    .unwrap_err(),
+                locust_core::database::TRANSLATION_CONFLICT_MESSAGE
+            );
+            let body = serde_json::json!({"status":"approved", "expected_translation":translation});
+            let saved = apply_string_patch(&db, "approval", serde_json::from_value(body).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(saved.translation, row.translation);
+            assert_eq!(saved.provider_used, row.provider_used);
+            assert_eq!(saved.translated_at, row.translated_at);
+            assert_eq!(saved.status, StringStatus::Approved);
+        }
+        let db = locust_core::database::Database::open_in_memory().unwrap();
+        let body = serde_json::json!({"status":"approved", "expected_translation":null});
+        assert_eq!(
+            apply_string_patch(&db, "missing", serde_json::from_value(body).unwrap())
+                .await
+                .unwrap_err(),
+            "Entry not found"
+        );
     }
 
     #[test]

@@ -3375,3 +3375,112 @@ fn guarded_entry_pages_reopen_existing_database_without_schema_changes() {
         assert_eq!(schema_state(&db), before);
     }
 }
+
+#[tokio::test]
+async fn strings_guarded_status_conflict_preserves_row_history_and_revision() {
+    let db = Database::open_in_memory().unwrap();
+    let mut entry = make_entry("approval", "Hello");
+    entry.translation = Some("V1".into());
+    db.save_entries(&[entry]).unwrap();
+    db.save_translation("approval", "V2", "other-provider")
+        .await
+        .unwrap();
+    let before = serde_json::to_value(db.get_entry("approval").unwrap().unwrap()).unwrap();
+    let history = serde_json::to_value(db.get_string_history("approval", 50).unwrap()).unwrap();
+    let revision = db.get_stats().unwrap();
+    for expected in [Some("V1".into()), None, Some(String::new())] {
+        assert_eq!(
+            db.update_entry_status_guarded("approval", StringStatus::Approved, Some(expected))
+                .await
+                .unwrap(),
+            TranslationSaveOutcome::Conflict
+        );
+        assert_eq!(
+            serde_json::to_value(db.get_entry("approval").unwrap().unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(
+            serde_json::to_value(db.get_string_history("approval", 50).unwrap()).unwrap(),
+            history
+        );
+        let after = db.get_stats().unwrap();
+        assert_eq!(after.content_epoch, revision.content_epoch);
+        assert_eq!(after.content_revision, revision.content_revision);
+    }
+}
+
+#[tokio::test]
+async fn strings_guarded_status_matches_null_empty_and_text_without_changing_attribution() {
+    for translation in [None, Some(""), Some("V1")] {
+        let db = Database::open_in_memory().unwrap();
+        let mut entry = make_entry("approval", "Hello");
+        entry.translation = translation.map(str::to_owned);
+        entry.provider_used = Some("original-provider".into());
+        entry.translated_at = Some(entry.created_at);
+        entry.metadata.insert(
+            STALE_TRANSLATION_METADATA_KEY.into(),
+            serde_json::json!({"source":"Old"}),
+        );
+        db.save_entries(&[entry.clone()]).unwrap();
+        let wrong = if translation.is_none() {
+            Some(String::new())
+        } else {
+            None
+        };
+        assert_eq!(
+            db.update_entry_status_guarded("approval", StringStatus::Approved, Some(wrong))
+                .await
+                .unwrap(),
+            TranslationSaveOutcome::Conflict
+        );
+        for status in [StringStatus::Reviewed, StringStatus::Approved] {
+            assert_eq!(
+                db.update_entry_status_guarded(
+                    "approval",
+                    status.clone(),
+                    Some(translation.map(str::to_owned))
+                )
+                .await
+                .unwrap(),
+                TranslationSaveOutcome::Updated
+            );
+            let saved = db.get_entry("approval").unwrap().unwrap();
+            assert_eq!(saved.translation, entry.translation);
+            assert_eq!(saved.status, status);
+            assert_eq!(saved.provider_used, entry.provider_used);
+            assert_eq!(saved.translated_at, entry.translated_at);
+            assert!(saved.reviewed_at.is_some());
+            assert!(!saved.metadata.contains_key(STALE_TRANSLATION_METADATA_KEY));
+        }
+    }
+}
+
+#[tokio::test]
+async fn strings_guarded_status_distinguishes_missing_and_keeps_legacy_updates() {
+    let db = Database::open_in_memory().unwrap();
+    for expected in [None, Some(None), Some(Some("V1".into()))] {
+        assert_eq!(
+            db.update_entry_status_guarded("missing", StringStatus::Approved, expected)
+                .await
+                .unwrap(),
+            TranslationSaveOutcome::Missing
+        );
+    }
+    db.save_entries(&[make_entry("approval", "Hello")]).unwrap();
+    assert_eq!(
+        db.update_entry_status_guarded("approval", StringStatus::Approved, None)
+            .await
+            .unwrap(),
+        TranslationSaveOutcome::Updated
+    );
+    db.update_entry_status("approval", StringStatus::Pending)
+        .await
+        .unwrap();
+    db.update_entry_status("missing", StringStatus::Approved)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_entry("approval").unwrap().unwrap().status,
+        StringStatus::Pending
+    );
+}

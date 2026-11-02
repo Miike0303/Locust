@@ -834,16 +834,42 @@ impl Database {
     }
 
     pub async fn update_entry_status(&self, entry_id: &str, status: StringStatus) -> Result<()> {
+        self.update_entry_status_guarded(entry_id, status, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// Compare the loaded translation and change status in the same write.
+    /// None keeps legacy unconditional behavior; Some(None) requires SQL NULL.
+    pub async fn update_entry_status_guarded(
+        &self,
+        entry_id: &str,
+        status: StringStatus,
+        expected_translation: Option<Option<String>>,
+    ) -> Result<TranslationSaveOutcome> {
         let conn = self.conn.clone();
         let entry_id = entry_id.to_string();
         let status_str = status.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = lock_connection(&conn);
-            conn.execute(
-                "UPDATE strings SET status = ?1, metadata = CASE WHEN ?1 IN ('reviewed', 'approved') THEN json_remove(metadata, '$.locust_stale_translation') ELSE metadata END, reviewed_at = CASE WHEN ?1 IN ('reviewed', 'approved') THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ELSE reviewed_at END WHERE id = ?2",
-                params![status_str, entry_id],
+            let tx = conn.unchecked_transaction()?;
+            let n = tx.execute(
+                "UPDATE strings SET status = ?1, metadata = CASE WHEN ?1 IN ('reviewed', 'approved') THEN json_remove(metadata, '$.locust_stale_translation') ELSE metadata END, reviewed_at = CASE WHEN ?1 IN ('reviewed', 'approved') THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ELSE reviewed_at END WHERE id = ?2 AND (?3 = 0 OR translation IS ?4)",
+                params![status_str, entry_id, expected_translation.is_some(), expected_translation.flatten()],
             )?;
-            Ok(())
+            let outcome = if n > 0 {
+                TranslationSaveOutcome::Updated
+            } else if tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM strings WHERE id = ?1)",
+                [&entry_id],
+                |row| row.get::<_, bool>(0),
+            )? {
+                TranslationSaveOutcome::Conflict
+            } else {
+                TranslationSaveOutcome::Missing
+            };
+            tx.commit()?;
+            Ok(outcome)
         })
         .await
         .unwrap()

@@ -15,12 +15,16 @@ const conflict = "translation changed since it was loaded";
 const h = {
   t, drafts, useProjectStore, useEditorStore,
   states: [] as any[], cursor: 0, columns: [] as any[],
+  status: "translated", afterTranslationSave: null as (() => void) | null,
   server: "V0" as string | null, calls: [] as any[], failRead: false,
   async patchString(_id: string, data: any) {
     h.calls.push(data);
     if ("expected_translation" in data && data.expected_translation !== h.server) throw new ApiError(`409: ${conflict}`);
-    if ("translation" in data) h.server = data.translation;
-    return { translation: h.server };
+    if ("translation" in data) { h.server = data.translation; h.status = "translated"; }
+    if ("status" in data) h.status = data.status;
+    const saved = { ...entry, translation: h.server, status: h.status };
+    if ("translation" in data) h.afterTranslationSave?.();
+    return saved;
   },
   async getString() {
     if (h.failRead) throw new Error("offline");
@@ -68,7 +72,7 @@ function render(kind: string, row = entry) {
   return cell.type(cell.props);
 }
 function reset() {
-  h.states = []; h.calls = []; h.server = "V0"; h.failRead = false;
+  h.states = []; h.calls = []; h.server = "V0"; h.failRead = false; h.status = "translated"; h.afterTranslationSave = null;
   drafts.useDraftStore.setState({ drafts: {}, records: [], persistenceIssue: null, persistenceIssues: {} });
   useProjectStore.setState({ project });
   setLocale("en");
@@ -219,3 +223,55 @@ test("history can restore an empty translation over a null current translation",
   assert.deepEqual(h.calls, [{ translation: "", expected_translation: null }]);
   assert.equal(h.server, "");
 });
+
+for (const baseline of ["V0", null, ""] as const) {
+  test(`detail status-only update sends the saved nullable baseline (${JSON.stringify(baseline)})`, async () => {
+    reset(); h.server = baseline;
+    const tree = render("detail", { ...entry, translation: baseline });
+    await nodes(tree).find(n => n.type === "button" && n.props.children?.props?.status === "approved").props.onClick();
+    assert.deepEqual(h.calls, [{ status: "approved", expected_translation: baseline }]);
+    assert.equal(h.status, "approved");
+  });
+}
+
+test("detail status change uses the just-saved draft as its baseline", async () => {
+  reset();
+  nodes(render("detail")).find(n => n.type === "textarea").props.onChange({ target: { value: "V-review" } });
+  await nodes(render("detail")).find(n => n.type === "button" && n.props.children?.props?.status === "approved").props.onClick();
+  assert.deepEqual(h.calls, [
+    { translation: "V-review", expected_translation: "V0" },
+    { status: "approved", expected_translation: "V-review" },
+  ]);
+  assert.equal(h.server, "V-review");
+  assert.equal(h.status, "approved");
+});
+
+for (const edited of [false, true]) {
+  test(`detail ${edited ? "edited" : "unchanged"} status conflict preserves the draft and reuses stale-save recovery`, async () => {
+    reset();
+    if (edited) {
+      nodes(render("detail")).find(n => n.type === "textarea").props.onChange({ target: { value: "V-review" } });
+      // The competing client saves after our translation write, before our status write.
+      h.afterTranslationSave = () => { h.server = "V2"; h.status = "reviewed"; };
+    } else { h.server = "V2"; h.status = "reviewed"; }
+    await nodes(render("detail")).find(n => n.type === "button" && n.props.children?.props?.status === "approved").props.onClick();
+    assert.equal(h.server, "V2");
+    assert.equal(h.status, "reviewed");
+    assert.deepEqual(h.calls[h.calls.length - 1], { status: "approved", expected_translation: edited ? "V-review" : "V0" });
+    const draft = drafts.useDraftStore.getState().drafts[key];
+    assert.equal(draft.text, edited ? "V-review" : "V0");
+    assert.equal(draft.conflict, true);
+    for (const locale of ["en", "es"] as const) {
+      setLocale(locale);
+      const tree = nodes(render("detail"));
+      assert.ok(tree.some(n => n.props.role === "alert" && n.props.children === t("api.error.translationConflict")));
+      assert.ok(tree.some(n => n.type === "button" && n.props.children === t("detail.loadLatest")));
+      assert.ok(tree.some(n => n.type === "button" && n.props.children === t("detail.overwrite")));
+    }
+    const writes = h.calls.length;
+    await nodes(render("detail")).find(n => n.type === "button" && n.props.children?.props?.status === "approved").props.onClick();
+    assert.equal(h.calls.length, writes, "status retry waits for explicit conflict recovery");
+    await nodes(render("detail")).find(n => n.type === "button" && n.props.children === t("detail.loadLatest")).props.onClick();
+    assert.equal(drafts.useDraftStore.getState().drafts[key].text, "V2");
+  });
+}

@@ -169,11 +169,17 @@ async fn patch_string_owned(
             ));
         }
     } else if let Some(ref status) = req.status {
-        state
+        let outcome = state
             .db
-            .update_entry_status(&id, status.clone())
+            .update_entry_status_guarded(&id, status.clone(), req.expected_translation)
             .await
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        if outcome == locust_core::database::TranslationSaveOutcome::Conflict {
+            return Err(err(
+                StatusCode::CONFLICT,
+                locust_core::database::TRANSLATION_CONFLICT_MESSAGE,
+            ));
+        }
     }
     state
         .db

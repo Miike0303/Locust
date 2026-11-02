@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
 import { after, beforeEach, test } from "node:test";
 import { QueryClient, QueryObserver } from "@tanstack/react-query";
+import { ApiError } from "../lib/apiError.ts";
 import type { StringEntry } from "../lib/api.ts";
 import { draftProjectKey, projectScopedQueryFn } from "../lib/projectScope.ts";
 import { useProjectStore } from "../stores/projectStore.ts";
@@ -14,7 +15,7 @@ const client = new QueryClient({ defaultOptions: { queries: {
   retry: false, staleTime: 30_000, gcTime: Infinity,
 } } });
 
-type Patch = Partial<Pick<StringEntry, "translation" | "status">>;
+type Patch = Partial<Pick<StringEntry, "translation" | "status">> & { expected_translation?: string | null };
 type Effect = { deps?: unknown[]; cleanup?: () => void };
 const row = (id: string): StringEntry => ({
   id, source: `Source ${id}`, translation: `Translation ${id}`, status: "translated",
@@ -88,6 +89,9 @@ const h = {
     const rows = this.rows;
     if (this.waitForSave) await this.waitForSave;
     if (this.failure !== null) throw this.failure;
+    if ("expected_translation" in patch && patch.expected_translation !== rows[id].translation) {
+      throw new ApiError("409: translation changed since it was loaded");
+    }
     rows[id] = { ...rows[id], ...patch };
     this.saved.push(rows[id]);
     return rows[id];
@@ -337,14 +341,51 @@ for (const replacement of [
 }
 
 test("the approval decision preserves approved status and distinguishes cleared text from no change", () => {
-  assert.deepEqual(reviewApprovalPatch(row("A"), "Translation A"), { status: "approved" });
-  assert.deepEqual(reviewApprovalPatch({ ...row("A"), status: "reviewed" }, "Translation A"), { status: "approved" });
+  assert.deepEqual(reviewApprovalPatch(row("A"), "Translation A"), { status: "approved", expected_translation: "Translation A" });
+  assert.deepEqual(reviewApprovalPatch({ ...row("A"), status: "reviewed" }, "Translation A"), { status: "approved", expected_translation: "Translation A" });
   const approved = { ...row("A"), status: "approved" as const };
   assert.equal(reviewApprovalPatch(approved, "Translation A"), null);
-  assert.deepEqual(reviewApprovalPatch(approved, "Revised A"), { translation: "Revised A", status: "approved" });
-  assert.deepEqual(reviewApprovalPatch(approved, ""), { translation: "", status: "approved" });
+  assert.deepEqual(reviewApprovalPatch(approved, "Revised A"), { translation: "Revised A", status: "approved", expected_translation: "Translation A" });
+  assert.deepEqual(reviewApprovalPatch(approved, ""), { translation: "", status: "approved", expected_translation: "Translation A" });
   assert.equal(reviewApprovalPatch({ ...approved, translation: null }, ""), null);
 });
+
+for (const locale of ["en", "es"] as const) {
+  for (const edited of [false, true]) {
+    test(`${locale}: ${edited ? "edited" : "unchanged"} approval guards the shown baseline and retains the draft on conflict`, async () => {
+      setLocale(locale);
+      const draft = edited ? "V-review" : "Translation A";
+      if (edited) edit(draft);
+      h.rows.A = { ...h.rows.A, translation: "V2", status: "reviewed" };
+      const before = { ...h.rows.A };
+      const invalidations = h.invalidations;
+      await approve();
+      assert.deepEqual(h.writes, [{ id: "A", patch: {
+        ...(edited ? { translation: draft } : {}), status: "approved", expected_translation: "Translation A",
+      } }]);
+      assert.deepEqual(h.rows.A, before);
+      assert.equal(textarea().props.value, draft);
+      progress(1, 0);
+      assert.ok(nodes(render()).some(node => node.props.role === "alert" && text(node) === t("api.error.translationConflict")));
+      assert.equal(h.invalidations, invalidations, "conflicts must not invalidate Editor data");
+    });
+  }
+}
+
+test("unchanged approval sends only status and baseline and preserves provider attribution", async () => {
+  await startWith([{ ...row("A"), provider_used: "original-provider" }, row("B")]);
+  await approve();
+  assert.deepEqual(h.writes[0].patch, { status: "approved", expected_translation: "Translation A" });
+  assert.equal(h.rows.A.provider_used, "original-provider");
+});
+
+for (const baseline of [null, ""] as const) {
+  test(`approval preserves the nullable loaded baseline: ${JSON.stringify(baseline)}`, async () => {
+    await startWith([{ ...row("A"), translation: baseline }, row("B")]);
+    await approve();
+    assert.deepEqual(h.writes[0].patch, { status: "approved", expected_translation: baseline });
+  });
+}
 
 test("approve A, previous, edit and approve persists the revision and counts A once", async () => {
   await approve();

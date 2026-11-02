@@ -34,12 +34,12 @@ import {
 export function reviewApprovalPatch(
   current: Pick<StringEntry, "translation" | "status">,
   translation: string,
-): { translation?: string; status: "approved" } | null {
+): { translation?: string; status: "approved"; expected_translation: string | null } | null {
   // Saving a translation can reset its status, including on a repeat approval.
   if (translation !== (current.translation ?? "")) {
-    return { translation, status: "approved" };
+    return { translation, status: "approved", expected_translation: current.translation };
   }
-  return current.status === "approved" ? null : { status: "approved" };
+  return current.status === "approved" ? null : { status: "approved", expected_translation: current.translation };
 }
 
 export default function Review() {
