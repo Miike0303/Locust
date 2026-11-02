@@ -2287,8 +2287,8 @@ fn parse_rpa_pickle(data: &[u8], key: i64, file: &str) -> Result<Vec<(String, u6
     // Python 2 pickle protocol 2 tokens we care about:
     // \x80\x02 = proto 2
     // } = EMPTY_DICT
-    // q/r = SHORT_BINPUT/LONG_BINPUT (memo)
-    // X = SHORT_BINUNICODE (4-byte len + utf8)
+    // q/r = BINPUT/LONG_BINPUT (memo)
+    // X = BINUNICODE (4-byte len + utf8)
     // ] = EMPTY_LIST
     // ( = MARK
     // J = BININT (4 bytes little-endian signed)
@@ -2302,237 +2302,148 @@ fn parse_rpa_pickle(data: &[u8], key: i64, file: &str) -> Result<Vec<(String, u6
     // s = SETITEM
     // . = STOP
 
+    // All operands, including fixed-width headers, go through one checked read.
+    // Truncation is a parse error even if an earlier SETITEMS yielded members.
+    let read_bytes = |pos: &mut usize, count: usize| -> Result<&[u8]> {
+        let start = *pos;
+        let end = start
+            .checked_add(count)
+            .filter(|&end| end <= len)
+            .ok_or_else(|| locust_core::error::LocustError::ParseError {
+                file: file.to_string(),
+                message: format!(
+                    "truncated pickle argument at index byte offset {start}: \
+                     requested {count} bytes, only {} remain",
+                    len.saturating_sub(start)
+                ),
+            })?;
+        *pos = end;
+        Ok(&data[start..end])
+    };
+    // Even a sparse memo must not allocate more slots than input bytes. Check
+    // before looking at the stack so a missing top cannot hide an invalid index.
+    let check_memo_index = |idx: usize, offset: usize| -> Result<()> {
+        if idx >= len {
+            return Err(locust_core::error::LocustError::ParseError {
+                file: file.to_string(),
+                message: format!(
+                    "pickle memo index {idx} at index byte offset {offset} \
+                     exceeds input bound {len}"
+                ),
+            });
+        }
+        Ok(())
+    };
+
     let mut stack: Vec<PickleVal> = Vec::new();
     let mut mark_stack: Vec<usize> = Vec::new();
     let mut memo: Vec<PickleVal> = Vec::new();
     let mut current_key: Option<String> = None;
 
     while pos < len {
+        let op_offset = pos;
         let op = data[pos];
         pos += 1;
         match op {
             0x80 => {
-                pos += 1;
+                read_bytes(&mut pos, 1)?;
             } // PROTO
             0x95 => {
-                pos += 8;
+                read_bytes(&mut pos, 8)?;
             } // FRAME (protocol 4+) — skip 8-byte frame length
             0x94 => {
                 // MEMOIZE (protocol 4+) — store stack top in memo
                 if let Some(top) = stack.last() {
+                    check_memo_index(memo.len(), op_offset)?;
                     memo.push(top.clone());
                 }
             }
             0x7d => stack.push(PickleVal::Dict), // EMPTY_DICT
             0x5d => stack.push(PickleVal::List(Vec::new())), // EMPTY_LIST
             0x28 => mark_stack.push(stack.len()), // MARK
-            0x71 => {
-                // SHORT_BINPUT (memo)
-                if pos >= len {
-                    break;
-                }
-                let idx = data[pos] as usize;
-                pos += 1;
+            0x71 | 0x72 => {
+                // BINPUT / LONG_BINPUT
+                let idx = if op == 0x71 {
+                    read_bytes(&mut pos, 1)?[0] as usize
+                } else {
+                    let bytes = read_bytes(&mut pos, 4)?;
+                    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize
+                };
+                check_memo_index(idx, op_offset)?;
                 if let Some(top) = stack.last() {
-                    while memo.len() <= idx {
-                        memo.push(PickleVal::None);
+                    if memo.len() <= idx {
+                        // idx < len guarantees this addition cannot overflow.
+                        memo.resize(idx + 1, PickleVal::None);
                     }
                     memo[idx] = top.clone();
                 }
             }
-            0x72 => {
-                // LONG_BINPUT
-                if pos + 4 > len {
-                    break;
-                }
-                let idx =
-                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
-                        as usize;
-                pos += 4;
-                if let Some(top) = stack.last() {
-                    while memo.len() <= idx {
-                        memo.push(PickleVal::None);
+            0x68 | 0x6a => {
+                // BINGET / LONG_BINGET
+                let idx = if op == 0x68 {
+                    read_bytes(&mut pos, 1)?[0] as usize
+                } else {
+                    let bytes = read_bytes(&mut pos, 4)?;
+                    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize
+                };
+                check_memo_index(idx, op_offset)?;
+                let val = memo.get(idx).cloned().unwrap_or(PickleVal::None);
+                stack.push(val);
+            }
+            0x43 | 0x42 | 0x44 | 0x8e | 0x58 | 0x8d | 0x8c | 0x55 | 0x54 => {
+                // Bytes, Unicode and Python 2 strings share the same payload
+                // bounds. Retain the legacy 0x44 bytes arm as well as BINBYTES
+                // (0x42), and handle the 8-byte BINUNICODE8/BINBYTES8 lengths.
+                let slen = match op {
+                    0x43 | 0x8c | 0x55 => read_bytes(&mut pos, 1)?[0] as u64,
+                    0x42 | 0x44 | 0x58 | 0x54 => {
+                        let bytes = read_bytes(&mut pos, 4)?;
+                        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64
                     }
-                    memo[idx] = top.clone();
-                }
-            }
-            0x68 => {
-                // SHORT_BINGET
-                if pos >= len {
-                    break;
-                }
-                let idx = data[pos] as usize;
-                pos += 1;
-                let val = memo.get(idx).cloned().unwrap_or(PickleVal::None);
-                stack.push(val);
-            }
-            0x6a => {
-                // LONG_BINGET
-                if pos + 4 > len {
-                    break;
-                }
-                let idx =
-                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
-                        as usize;
-                pos += 4;
-                let val = memo.get(idx).cloned().unwrap_or(PickleVal::None);
-                stack.push(val);
-            }
-            0x43 => {
-                // SHORT_BINBYTES
-                if pos >= len {
-                    break;
-                }
-                let slen = data[pos] as usize;
-                pos += 1;
-                if pos + slen > len {
-                    break;
-                }
-                let s = String::from_utf8_lossy(&data[pos..pos + slen]).to_string();
-                pos += slen;
-                stack.push(PickleVal::Str(s));
-            }
-            0x44 => {
-                // BINBYTES (4-byte len)
-                if pos + 4 > len {
-                    break;
-                }
-                let slen =
-                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
-                        as usize;
-                pos += 4;
-                if pos + slen > len {
-                    break;
-                }
-                let s = String::from_utf8_lossy(&data[pos..pos + slen]).to_string();
-                pos += slen;
-                stack.push(PickleVal::Str(s));
-            }
-            0x8e => {
-                // BINBYTES8 (8-byte len, protocol 4+)
-                if pos + 8 > len {
-                    break;
-                }
-                let slen = u64::from_le_bytes([
-                    data[pos],
-                    data[pos + 1],
-                    data[pos + 2],
-                    data[pos + 3],
-                    data[pos + 4],
-                    data[pos + 5],
-                    data[pos + 6],
-                    data[pos + 7],
-                ]) as usize;
-                pos += 8;
-                if pos + slen > len {
-                    break;
-                }
-                let s = String::from_utf8_lossy(&data[pos..pos + slen]).to_string();
-                pos += slen;
-                stack.push(PickleVal::Str(s));
-            }
-            0x58 => {
-                // BINUNICODE (4-byte length + utf8) — how real RPA indexes encode filenames
-                if pos + 4 > len {
-                    break;
-                }
-                let slen =
-                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
-                        as usize;
-                pos += 4;
-                if pos + slen > len {
-                    break;
-                }
-                let s = String::from_utf8_lossy(&data[pos..pos + slen]).to_string();
-                pos += slen;
-                stack.push(PickleVal::Str(s));
-            }
-            0x8c => {
-                // SHORT_BINUNICODE (protocol 4+) — 1-byte length
-                if pos >= len {
-                    break;
-                }
-                let slen = data[pos] as usize;
-                pos += 1;
-                if pos + slen > len {
-                    break;
-                }
-                let s = String::from_utf8_lossy(&data[pos..pos + slen]).to_string();
-                pos += slen;
-                stack.push(PickleVal::Str(s));
-            }
-            0x55 => {
-                // SHORT_BINSTRING
-                if pos >= len {
-                    break;
-                }
-                let slen = data[pos] as usize;
-                pos += 1;
-                if pos + slen > len {
-                    break;
-                }
-                let s = String::from_utf8_lossy(&data[pos..pos + slen]).to_string();
-                pos += slen;
-                stack.push(PickleVal::Str(s));
-            }
-            0x54 => {
-                // BINSTRING (4-byte len)
-                if pos + 4 > len {
-                    break;
-                }
-                let slen =
-                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
-                        as usize;
-                pos += 4;
-                if pos + slen > len {
-                    break;
-                }
-                let s = String::from_utf8_lossy(&data[pos..pos + slen]).to_string();
-                pos += slen;
+                    _ => {
+                        let bytes = read_bytes(&mut pos, 8)?;
+                        u64::from_le_bytes([
+                            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                            bytes[7],
+                        ])
+                    }
+                };
+                let slen = usize::try_from(slen).map_err(|_| {
+                    locust_core::error::LocustError::ParseError {
+                        file: file.to_string(),
+                        message: format!(
+                            "truncated pickle argument at index byte offset {pos}: \
+                             length {slen} exceeds addressable input size"
+                        ),
+                    }
+                })?;
+                let s = String::from_utf8_lossy(read_bytes(&mut pos, slen)?).to_string();
                 stack.push(PickleVal::Str(s));
             }
             0x4a => {
                 // BININT
-                if pos + 4 > len {
-                    break;
-                }
-                let v = i32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
-                    as i64;
-                pos += 4;
+                let bytes = read_bytes(&mut pos, 4)?;
+                let v = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i64;
                 stack.push(PickleVal::Int(v));
             }
             0x4b => {
                 // BININT1
-                if pos >= len {
-                    break;
-                }
-                stack.push(PickleVal::Int(data[pos] as i64));
-                pos += 1;
+                stack.push(PickleVal::Int(read_bytes(&mut pos, 1)?[0] as i64));
             }
             0x4d => {
                 // BININT2
-                if pos + 2 > len {
-                    break;
-                }
-                let v = u16::from_le_bytes([data[pos], data[pos + 1]]) as i64;
-                pos += 2;
+                let bytes = read_bytes(&mut pos, 2)?;
+                let v = u16::from_le_bytes([bytes[0], bytes[1]]) as i64;
                 stack.push(PickleVal::Int(v));
             }
             0x8a => {
                 // LONG1
-                if pos >= len {
-                    break;
-                }
-                let nbytes = data[pos] as usize;
-                pos += 1;
-                if pos + nbytes > len {
-                    break;
-                }
+                let nbytes = read_bytes(&mut pos, 1)?[0] as usize;
+                let bytes = read_bytes(&mut pos, nbytes)?;
                 let mut v: i64 = 0;
-                for i in 0..nbytes.min(8) {
-                    v |= (data[pos + i] as i64) << (i * 8);
+                for (i, byte) in bytes.iter().take(8).enumerate() {
+                    v |= (*byte as i64) << (i * 8);
                 }
-                pos += nbytes;
                 stack.push(PickleVal::Int(v));
             }
             0x74 => {
@@ -2615,10 +2526,9 @@ fn parse_rpa_pickle(data: &[u8], key: i64, file: &str) -> Result<Vec<(String, u6
                 let mark = mark_stack.pop().unwrap_or(0).min(stack.len());
                 let items: Vec<PickleVal> = stack.drain(mark..).collect();
                 // Items come in pairs: key, val, key, val, ...
-                let mut i = 0;
-                while i + 1 < items.len() {
-                    let k = &items[i];
-                    let v = &items[i + 1];
+                for pair in items.chunks_exact(2) {
+                    let k = &pair[0];
+                    let v = &pair[1];
                     if let PickleVal::Str(ref filename) = k {
                         if let PickleVal::List(ref entries) = v {
                             for entry in entries {
@@ -2645,13 +2555,12 @@ fn parse_rpa_pickle(data: &[u8], key: i64, file: &str) -> Result<Vec<(String, u6
                             }
                         }
                     }
-                    i += 2;
                 }
             }
             0x4e => stack.push(PickleVal::None),   // NONE
             0x88 => stack.push(PickleVal::Int(1)), // NEWTRUE
             0x89 => stack.push(PickleVal::Int(0)), // NEWFALSE
-            0x2e => break,                         // STOP
+            0x2e => return Ok(result),             // STOP
             op => {
                 // Every no-argument opcode a real index emits has an explicit
                 // arm above. Anything else carries an argument of unknown
@@ -2670,14 +2579,17 @@ fn parse_rpa_pickle(data: &[u8], key: i64, file: &str) -> Result<Vec<(String, u6
                         "unsupported pickle opcode {op:#04x} at index byte offset {} — \
                          refusing to skip it: its argument width is unknown, so the \
                          stream cannot be re-synchronized",
-                        pos - 1
+                        op_offset
                     ),
                 });
             }
         }
     }
 
-    Ok(result)
+    Err(locust_core::error::LocustError::ParseError {
+        file: file.to_string(),
+        message: format!("pickle index ended without STOP at index byte offset {pos}"),
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -4735,6 +4647,211 @@ mod tests {
         file.seek(SeekFrom::Start(index_offset)).unwrap();
         file.write_all(&miniz_oxide::deflate::compress_to_vec_zlib(pickle, 6))
             .unwrap();
+    }
+
+    /// Check both public extraction paths, including corruption after a harvested batch.
+    fn assert_rpa_pickle_bounds_error(pickle: &[u8], reason: &str) {
+        let root = tempfile::tempdir().unwrap();
+        let game = root.path().join("game");
+        fs::create_dir(&game).unwrap();
+        let archive = game.join("scripts.rpa");
+        let mut prefix = rpa_range_index(&[("valid.rpy", 34, 16)]);
+        assert_eq!(prefix.pop(), Some(b'.'));
+        for prefix in [Vec::new(), prefix] {
+            let mut index = prefix;
+            index.extend_from_slice(pickle);
+            // The empty-prefix BINBYTES8 case is the reported archive verbatim:
+            // offset 0x22, key zero, and a zlib stream containing 8e ff..ff.
+            let mut bytes = b"RPA-3.0 0000000000000022 00000000\n".to_vec();
+            assert_eq!(bytes.len(), 0x22);
+            bytes.extend_from_slice(&miniz_oxide::deflate::compress_to_vec_zlib(&index, 6));
+            fs::write(&archive, bytes).unwrap();
+
+            let result =
+                std::panic::catch_unwind(|| RenPyPlugin::new().extract_with_diagnostics(&archive))
+                    .expect("malformed RPA pickle must not panic during direct extraction");
+            let error = result.expect_err("malformed index must fail extraction");
+            match error {
+                locust_core::error::LocustError::ParseError { file, message } => {
+                    assert_eq!(file, archive.display().to_string());
+                    assert!(message.contains(reason), "{message}");
+                    assert!(message.contains("offset"), "{message}");
+                }
+                error => panic!("expected archive parse error, got {error}"),
+            }
+
+            let extraction = std::panic::catch_unwind(|| {
+                RenPyPlugin::new().extract_with_diagnostics(root.path())
+            })
+            .expect("malformed RPA pickle must not panic during directory extraction")
+            .unwrap();
+            assert!(extraction.entries.is_empty());
+            assert!(!extraction.complete);
+            assert_eq!(extraction.warnings.len(), 1);
+            let warning = &extraction.warnings[0];
+            assert!(
+                warning.contains(&archive.display().to_string()),
+                "{warning}"
+            );
+            assert!(warning.contains(reason), "{warning}");
+        }
+    }
+
+    fn assert_rpa_pickle_oversized_length(op: u8, length: &[u8]) {
+        let mut pickle = vec![op];
+        pickle.extend_from_slice(length);
+        assert_rpa_pickle_bounds_error(&pickle, "truncated pickle argument");
+    }
+
+    #[test]
+    fn rpa_pickle_bounds_short_binbytes() {
+        assert_rpa_pickle_oversized_length(0x43, &[u8::MAX]);
+    }
+
+    #[test]
+    fn rpa_pickle_bounds_binbytes() {
+        assert_rpa_pickle_oversized_length(0x42, &u32::MAX.to_le_bytes());
+    }
+
+    #[test]
+    fn rpa_pickle_bounds_legacy_binbytes() {
+        assert_rpa_pickle_oversized_length(0x44, &u32::MAX.to_le_bytes());
+    }
+
+    #[test]
+    fn rpa_pickle_bounds_binbytes8_overflow() {
+        assert_rpa_pickle_oversized_length(0x8e, &u64::MAX.to_le_bytes());
+    }
+
+    #[test]
+    fn rpa_pickle_bounds_binunicode() {
+        assert_rpa_pickle_oversized_length(0x58, &u32::MAX.to_le_bytes());
+    }
+
+    #[test]
+    fn rpa_pickle_bounds_binunicode8_overflow() {
+        assert_rpa_pickle_oversized_length(0x8d, &u64::MAX.to_le_bytes());
+    }
+
+    #[test]
+    fn rpa_pickle_bounds_short_binunicode() {
+        assert_rpa_pickle_oversized_length(0x8c, &[u8::MAX]);
+    }
+
+    #[test]
+    fn rpa_pickle_bounds_short_binstring() {
+        assert_rpa_pickle_oversized_length(0x55, &[u8::MAX]);
+    }
+
+    #[test]
+    fn rpa_pickle_bounds_binstring() {
+        assert_rpa_pickle_oversized_length(0x54, &u32::MAX.to_le_bytes());
+    }
+
+    #[test]
+    fn rpa_pickle_bounds_long1() {
+        assert_rpa_pickle_oversized_length(0x8a, &[u8::MAX]);
+    }
+
+    #[test]
+    fn rpa_pickle_bounds_binput() {
+        assert_rpa_pickle_bounds_error(&[b'}', b'q', u8::MAX, b'.'], "memo index");
+    }
+
+    #[test]
+    fn rpa_pickle_bounds_long_binput() {
+        // Large enough to expose unbounded growth in RED without risking OOM.
+        let mut pickle = vec![b'}', b'r'];
+        pickle.extend_from_slice(&1_000_000u32.to_le_bytes());
+        pickle.push(b'.');
+        assert_rpa_pickle_bounds_error(&pickle, "memo index");
+        pickle[2..6].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_rpa_pickle_bounds_error(&pickle, "memo index");
+        // Also reject the full file-controlled range with an empty stack.
+        assert_rpa_pickle_bounds_error(&[b'r', 0xff, 0xff, 0xff, 0xff, b'.'], "memo index");
+    }
+
+    #[test]
+    fn rpa_pickle_bounds_truncated_operands() {
+        for (op, width) in [
+            (0x80, 1),
+            (0x95, 8),
+            (b'q', 1),
+            (b'r', 4),
+            (b'h', 1),
+            (b'j', 4),
+            (0x43, 1),
+            (0x42, 4),
+            (0x44, 4),
+            (0x8e, 8),
+            (0x58, 4),
+            (0x8d, 8),
+            (0x8c, 1),
+            (0x55, 1),
+            (0x54, 4),
+            (b'J', 4),
+            (b'K', 1),
+            (b'M', 2),
+            (0x8a, 1),
+        ] {
+            for available in 0..width {
+                let mut pickle = vec![op];
+                pickle.resize(1 + available, 0);
+                assert_rpa_pickle_bounds_error(&pickle, "truncated pickle argument");
+            }
+        }
+    }
+
+    #[test]
+    fn rpa_pickle_bounds_missing_stop() {
+        assert_rpa_pickle_bounds_error(&[], "without STOP");
+    }
+
+    #[test]
+    fn rpa_pickle_valid_length_encodings_and_memo_references() {
+        let root = tempfile::tempdir().unwrap();
+        let game = root.path().join("game");
+        fs::create_dir(&game).unwrap();
+        let archive = game.join("scripts.rpa");
+        for (op, width) in [
+            (0x43, 1),
+            (0x42, 4),
+            (0x44, 4),
+            (0x8e, 8),
+            (0x58, 4),
+            (0x8d, 8),
+            (0x8c, 1),
+            (0x55, 1),
+            (0x54, 4),
+        ] {
+            let mut index = vec![0x80, 4, 0x95]; // PROTO, FRAME
+            index.extend_from_slice(&0u64.to_le_bytes());
+            index.extend_from_slice(&[b'}', b'(', op]);
+            let name = "valid.rpy";
+            index.extend_from_slice(&(name.len() as u64).to_le_bytes()[..width]);
+            index.extend_from_slice(name.as_bytes());
+            index.extend_from_slice(&[b'q', 0, b'r', 0, 0, 0, 0]); // memo slot reuse
+            index.extend_from_slice(&[b']', 0x94]); // MEMOIZE
+            index.extend_from_slice(&[b'K', 34, b'K', 16, 0x86, b'a', b'u']);
+            // The first SETITEMS consumed the key/list: read both back from memo.
+            index.extend_from_slice(&[b'(', b'h', 0, b'j', 1, 0, 0, 0]);
+            index.extend_from_slice(&[b'K', 34, b'K', 16, 0x86, b'a', b'u', b'.']);
+            let frame_len = (index.len() - 11) as u64;
+            index[3..11].copy_from_slice(&frame_len.to_le_bytes());
+            write_rpa_index_at(&archive, 64, &index);
+            for path in [archive.as_path(), root.path()] {
+                let extraction =
+                    std::panic::catch_unwind(|| RenPyPlugin::new().extract_with_diagnostics(path))
+                        .expect("valid RPA pickle must not panic")
+                        .unwrap();
+                assert!(extraction.complete && extraction.warnings.is_empty());
+                assert_eq!(extraction.entries.len(), 2, "opcode {op:#04x}");
+                for entry in extraction.entries {
+                    assert_eq!(entry.source, "Valid sibling");
+                    assert_eq!(entry.file_path, archive);
+                }
+            }
+        }
     }
 
     /// Exercise the public boundary for both a selected archive and a game root.
