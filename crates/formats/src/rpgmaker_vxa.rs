@@ -971,6 +971,31 @@ const ITEM_FIELDS: &[(&str, &str)] = &[
 
 pub struct RpgMakerVxaPlugin;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Message101Role {
+    FirstLine,
+    FaceHeader,
+}
+
+impl Message101Role {
+    // XP (.rxdata) puts the first line in 101. VX/VX Ace (.rvdata/.rvdata2)
+    // always use a header, retaining the empty-face ids anchored at the first 401.
+    fn for_file(filename: &str) -> Self {
+        if Path::new(filename)
+            .extension()
+            .is_some_and(|ext| ext == "rxdata")
+        {
+            Self::FirstLine
+        } else {
+            Self::FaceHeader
+        }
+    }
+
+    fn carries_text(self, code: i64) -> bool {
+        code == 401 || (code == 101 && self == Self::FirstLine)
+    }
+}
+
 impl RpgMakerVxaPlugin {
     pub fn new() -> Self {
         Self
@@ -1033,6 +1058,7 @@ impl RpgMakerVxaPlugin {
 
     fn extract_map_file(filename: &str, root: &MarshalValue, file_path: &Path) -> Vec<StringEntry> {
         let mut entries = Vec::new();
+        let message_101_role = Message101Role::for_file(filename);
         let events = match root.get_ivar("@events") {
             Some(v) => v,
             None => return entries,
@@ -1072,18 +1098,17 @@ impl RpgMakerVxaPlugin {
                     };
                     match code {
                         // Message text. XP carries the FIRST line inside the
-                        // Show Text command (101); VX Ace keeps 101 as a
-                        // face/position header and puts all lines in 401s.
+                        // Show Text command (101); VX/VX Ace keep 101 as a
+                        // face/position header and put all lines in 401s.
                         // Either way the whole box merges into one #msg entry.
-                        101 | 401 => {
+                        101 | 401 if message_101_role.carries_text(code) => {
                             let mut lines: Vec<String> = Vec::new();
                             match params.first().and_then(MarshalValue::as_str) {
                                 Some(text) if code == 401 || !text.trim().is_empty() => {
                                     lines.push(text.to_string());
                                 }
-                                // VX Ace header, or XP Show Text with an empty
-                                // first line: the 401 run that follows anchors
-                                // its own block instead.
+                                // XP Show Text with an empty first line: the
+                                // following 401 run anchors its own block.
                                 _ => continue,
                             }
                             let mut end = cmd_idx + 1;
@@ -1144,6 +1169,7 @@ impl RpgMakerVxaPlugin {
         file_path: &Path,
     ) -> Vec<StringEntry> {
         let mut entries = Vec::new();
+        let message_101_role = Message101Role::for_file(filename);
         let arr = match root.as_array() {
             Some(a) => a,
             None => return entries,
@@ -1169,7 +1195,7 @@ impl RpgMakerVxaPlugin {
                     Some(MarshalValue::Array(a)) => a,
                     _ => continue,
                 };
-                if code == 101 || code == 401 {
+                if message_101_role.carries_text(code) {
                     let mut lines: Vec<String> = Vec::new();
                     match params.first().and_then(MarshalValue::as_str) {
                         Some(text) if code == 401 || !text.trim().is_empty() => {
@@ -1293,7 +1319,13 @@ impl RpgMakerVxaPlugin {
                     _ => continue,
                 };
                 let prefix = format!("{}#0#event_{}#page_{}", filename, ev_id, page_idx);
-                Self::apply_list_translations(list, lookup, &prefix, next_object_id);
+                Self::apply_list_translations(
+                    list,
+                    lookup,
+                    &prefix,
+                    Message101Role::for_file(filename),
+                    next_object_id,
+                );
             }
         }
     }
@@ -1317,7 +1349,13 @@ impl RpgMakerVxaPlugin {
                 _ => continue,
             };
             let prefix = format!("{}#{}", filename, ev_idx);
-            Self::apply_list_translations(list, lookup, &prefix, next_object_id);
+            Self::apply_list_translations(
+                list,
+                lookup,
+                &prefix,
+                Message101Role::for_file(filename),
+                next_object_id,
+            );
         }
     }
 
@@ -1328,6 +1366,7 @@ impl RpgMakerVxaPlugin {
         list: &mut Vec<MarshalValue>,
         lookup: &HashMap<&str, &str>,
         prefix: &str,
+        message_101_role: Message101Role,
         next_object_id: &mut usize,
     ) {
         enum Op<'a> {
@@ -1362,10 +1401,16 @@ impl RpgMakerVxaPlugin {
 
         for (idx, op) in ops {
             match op {
-                Op::Msg(t) => Self::apply_message_block(list, idx, t, next_object_id),
+                Op::Msg(t) => {
+                    Self::apply_message_block(list, idx, t, message_101_role, next_object_id)
+                }
                 Op::Line(t) => {
                     if let Some(cmd) = list.get_mut(idx) {
-                        set_cmd_text(cmd, t);
+                        if cmd_code(cmd) != Some(101)
+                            || message_101_role == Message101Role::FirstLine
+                        {
+                            set_cmd_text(cmd, t);
+                        }
                     }
                 }
                 Op::Choice(ci, t) => {
@@ -1388,21 +1433,22 @@ impl RpgMakerVxaPlugin {
     }
 
     /// Replace a message block anchored at `cmd_idx` (XP: a 101 carrying the
-    /// first line; VX Ace: the first 401 of a run) with the translation
+    /// first line; VX/VX Ace: the first 401 of a run) with the translation
     /// re-wrapped to the original line width. Continuation 401s are spliced,
     /// so the run may grow or shrink.
     fn apply_message_block(
         list: &mut Vec<MarshalValue>,
         cmd_idx: usize,
         translation: &str,
+        message_101_role: Message101Role,
         next_object_id: &mut usize,
     ) {
         let anchor_code = match list.get(cmd_idx).and_then(cmd_code) {
-            Some(c @ (101 | 401)) => c,
+            Some(code) if message_101_role.carries_text(code) => code,
             _ => return,
         };
         if anchor_code == 101 && cmd_first_str(&list[cmd_idx]).is_none() {
-            // VX Ace header without text — blocks are anchored at 401s there
+            // Malformed XP command without a first text parameter.
             return;
         }
 
@@ -1848,6 +1894,355 @@ mod tests {
                 m.insert("@parameters".to_string(), MarshalValue::Array(params));
                 m
             },
+        }
+    }
+
+    fn create_event_fixture(filename: &str, commands: Vec<MarshalValue>) -> tempfile::TempDir {
+        let object = |class: &str, field: &str, value| MarshalValue::Object {
+            class: class.into(),
+            ivars: HashMap::from([(field.into(), value)]),
+        };
+        let list = MarshalValue::Array(commands);
+        let root = if filename.starts_with("Map") {
+            let page = object("RPG::Event::Page", "@list", list);
+            let event = object("RPG::Event", "@pages", MarshalValue::Array(vec![page]));
+            object(
+                "RPG::Map",
+                "@events",
+                MarshalValue::Hash(vec![(MarshalValue::Int(1), event)]),
+            )
+        } else {
+            MarshalValue::Array(vec![
+                MarshalValue::Nil,
+                object("RPG::CommonEvent", "@list", list),
+            ])
+        };
+        let dir = tempdir();
+        fs::create_dir(dir.path().join("Data")).unwrap();
+        fs::write(
+            dir.path().join("Data").join(filename),
+            root.try_serialize().unwrap(),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn fixture_event_list(root: &MarshalValue) -> &[MarshalValue] {
+        let event = if let Some(MarshalValue::Hash(events)) = root.get_ivar("@events") {
+            &events[0].1
+        } else {
+            &root.as_array().unwrap()[1]
+        };
+        let page = event
+            .get_ivar("@pages")
+            .and_then(MarshalValue::as_array)
+            .map_or(event, |pages| &pages[0]);
+        page.get_ivar("@list").unwrap().as_array().unwrap()
+    }
+
+    fn fixture_message_id(filename: &str, index: usize) -> String {
+        if filename.starts_with("Map") {
+            format!("{filename}#0#event_1#page_0#cmd_{index}#msg")
+        } else {
+            format!("{filename}#1#cmd_{index}#msg")
+        }
+    }
+
+    fn face_header(face: &str) -> MarshalValue {
+        make_cmd(
+            101,
+            vec![
+                MarshalValue::Str(face.into()),
+                MarshalValue::Int(3),
+                MarshalValue::Int(1),
+                MarshalValue::Int(2),
+            ],
+        )
+    }
+
+    fn assert_face_header_extraction(ext: &str, stem: &str) {
+        let filename = format!("{stem}.{ext}");
+        for face in ["Actor1", "", "   "] {
+            for lines in [vec!["Hello"], vec!["Hello", "Second line"]] {
+                let mut list = vec![face_header(face)];
+                list.extend(
+                    lines
+                        .iter()
+                        .map(|line| make_cmd(401, vec![MarshalValue::Str((*line).into())])),
+                );
+                // A header with no dialogue must never become a row either.
+                list.extend([face_header("UnusedFace"), make_cmd(0, vec![])]);
+                let dir = create_event_fixture(&filename, list);
+                let entries = RpgMakerVxaPlugin::new().extract(dir.path()).unwrap();
+                assert_eq!(entries[0].source, lines.join("\n"));
+                assert_eq!(entries.len(), 1, "{filename}, face {face:?}");
+                // Preserve the existing empty-face scheme: first 401, not 101.
+                assert_eq!(entries[0].id, fixture_message_id(&filename, 1));
+            }
+        }
+    }
+
+    fn assert_face_header_injection(ext: &str, stem: &str) {
+        let filename = format!("{stem}.{ext}");
+        let plugin = RpgMakerVxaPlugin::new();
+        for face in ["Actor1", ""] {
+            for lines in [vec!["Hello"], vec!["Hello", "Second line"]] {
+                for translation in [
+                    "Hola",
+                    "Una traducción bastante larga para ocupar varias líneas y comprobar que se conserva la cara del personaje.",
+                ] {
+                    let mut list = vec![face_header(face)];
+                    list.extend(
+                        lines
+                            .iter()
+                            .map(|line| make_cmd(401, vec![MarshalValue::Str((*line).into())])),
+                    );
+                    let choice_index = list.len();
+                    list.extend([
+                        make_cmd(
+                            102,
+                            vec![MarshalValue::Array(vec![MarshalValue::Str("Yes".into())])],
+                        ),
+                        make_cmd(402, vec![MarshalValue::Int(0), MarshalValue::Str("Yes".into())]),
+                        face_header("A_very_long_face_asset_name_that_must_not_set_the_message_width"),
+                        make_cmd(401, vec![MarshalValue::Str("Later".into())]),
+                        make_cmd(0, vec![]),
+                    ]);
+                    let dir = create_event_fixture(&filename, list);
+                    let path = dir.path().join("Data").join(&filename);
+                    let before = MarshalValue::parse(&fs::read(&path).unwrap()).unwrap();
+                    let headers = |root: &MarshalValue| {
+                        fixture_event_list(root)
+                            .iter()
+                            .filter(|cmd| cmd_code(cmd) == Some(101))
+                            .map(|cmd| cmd.get_ivar("@parameters").unwrap().try_serialize().unwrap())
+                            .collect::<Vec<_>>()
+                    };
+                    let mut first = StringEntry::new(
+                        fixture_message_id(&filename, 1),
+                        lines.join("\n"),
+                        path.clone(),
+                    );
+                    first.translation = Some(translation.into());
+                    let mut later = StringEntry::new(
+                        fixture_message_id(&filename, choice_index + 3),
+                        "Later",
+                        path.clone(),
+                    );
+                    later.translation = Some(translation.into());
+                    let mut entries = vec![first, later];
+                    if stem.starts_with("Map") {
+                        let mut choice = StringEntry::new(
+                            format!("{filename}#0#event_1#page_0#cmd_{choice_index}#choice_0"),
+                            "Yes",
+                            path.clone(),
+                        );
+                        choice.translation = Some("Sí".into());
+                        entries.push(choice);
+                    }
+                    let report = plugin.inject(dir.path(), &entries).unwrap();
+                    assert_eq!(report.strings_skipped, 0, "{filename}: {report:?}");
+                    assert_eq!(report.strings_written, entries.len());
+                    let after = MarshalValue::parse(&fs::read(&path).unwrap()).unwrap();
+                    // Compare all four parameters as Marshal bytes, not just face text.
+                    assert_eq!(headers(&before), headers(&after));
+                    let expected = crate::rpgmaker_mv::wrap_message(translation, 40);
+                    let list = fixture_event_list(&after);
+                    assert_eq!(list.len(), expected.len() * 2 + 5);
+                    assert_eq!(cmd_code(&list[0]), Some(101));
+                    for (index, line) in expected.iter().enumerate() {
+                        assert_eq!(cmd_code(&list[index + 1]), Some(401));
+                        assert_eq!(cmd_first_str(&list[index + 1]).as_ref(), Some(line));
+                    }
+                    let branch = list.iter().find(|cmd| cmd_code(cmd) == Some(402)).unwrap();
+                    let old_branch = fixture_event_list(&before)
+                        .iter()
+                        .find(|cmd| cmd_code(cmd) == Some(402))
+                        .unwrap();
+                    assert_eq!(
+                        branch.get_ivar("@parameters").unwrap().try_serialize().unwrap(),
+                        old_branch.get_ivar("@parameters").unwrap().try_serialize().unwrap()
+                    );
+                    let reextracted = plugin.extract(dir.path()).unwrap();
+                    let messages: Vec<_> = reextracted.iter().filter(|e| e.id.ends_with("#msg")).collect();
+                    assert_eq!(messages.len(), 2);
+                    assert_eq!(messages[0].id, fixture_message_id(&filename, 1));
+                    for message in messages {
+                        assert_eq!(message.source, expected.join("\n"));
+                    }
+                    if stem.starts_with("Map") {
+                        assert!(reextracted.iter().any(|e| e.source == "Sí"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_vx_face_header_map_extraction() {
+        assert_face_header_extraction("rvdata", "Map001");
+    }
+
+    #[test]
+    fn test_vxa_face_header_map_extraction() {
+        assert_face_header_extraction("rvdata2", "Map001");
+    }
+
+    #[test]
+    fn test_vx_face_header_common_events_extraction() {
+        assert_face_header_extraction("rvdata", "CommonEvents");
+    }
+
+    #[test]
+    fn test_vxa_face_header_common_events_extraction() {
+        assert_face_header_extraction("rvdata2", "CommonEvents");
+    }
+
+    #[test]
+    fn test_vx_face_header_map_injection() {
+        assert_face_header_injection("rvdata", "Map001");
+    }
+
+    #[test]
+    fn test_vxa_face_header_map_injection() {
+        assert_face_header_injection("rvdata2", "Map001");
+    }
+
+    #[test]
+    fn test_vx_face_header_common_events_injection() {
+        assert_face_header_injection("rvdata", "CommonEvents");
+    }
+
+    #[test]
+    fn test_vxa_face_header_common_events_injection() {
+        assert_face_header_injection("rvdata2", "CommonEvents");
+    }
+
+    #[test]
+    fn test_face_header_legacy_ids_cannot_overwrite_101() {
+        for ext in ["rvdata", "rvdata2"] {
+            for stem in ["Map001", "CommonEvents"] {
+                let filename = format!("{stem}.{ext}");
+                let dir = create_event_fixture(
+                    &filename,
+                    vec![
+                        face_header("Actor1"),
+                        make_cmd(401, vec![MarshalValue::Str("Hello".into())]),
+                    ],
+                );
+                let path = dir.path().join("Data").join(&filename);
+                let bytes = fs::read(&path).unwrap();
+                let mut old = StringEntry::new(
+                    fixture_message_id(&filename, 0),
+                    "Actor1\nHello",
+                    path.clone(),
+                );
+                old.translation = Some("Hola".into());
+                let plugin = RpgMakerVxaPlugin::new();
+                let report = plugin.inject(dir.path(), &[old.clone()]).unwrap();
+                assert_eq!(report.strings_written, 0);
+                assert_eq!(report.skip_reasons.get("missing_target"), Some(&1));
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+
+                // Even internal/legacy per-line operations must respect the engine.
+                for id in [old.id.clone(), old.id.trim_end_matches("#msg").to_string()] {
+                    let mut root = MarshalValue::parse(&bytes).unwrap();
+                    let mut entry = old.clone();
+                    entry.id = id;
+                    RpgMakerVxaPlugin::apply_translations(&mut root, &filename, &[entry]);
+                    assert_eq!(root.try_serialize().unwrap(), bytes);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_face_header_id_change_merge_impact() {
+        use locust_core::database::Database;
+
+        let filename = "Map001.rvdata2";
+        let dir = create_event_fixture(
+            filename,
+            vec![
+                face_header("Actor1"),
+                make_cmd(401, vec![MarshalValue::Str("Hello".into())]),
+            ],
+        );
+        let path = dir.path().join("Data").join(filename);
+        let mut old = StringEntry::new(fixture_message_id(filename, 0), "Actor1\nHello", path);
+        old.translation = Some("Hola".into());
+        let current = RpgMakerVxaPlugin::new().extract(dir.path()).unwrap();
+        for partial in [false, true] {
+            let db = Database::open_in_memory().unwrap();
+            db.save_entries(&[old.clone()]).unwrap();
+            let stats = if partial {
+                db.merge_entries_preserving_missing(&current).unwrap()
+            } else {
+                db.merge_entries(&current).unwrap()
+            };
+            assert_eq!(stats.added, 1);
+            assert_eq!(stats.removed, usize::from(!partial));
+            assert_eq!(stats.stale_source_reset, 0);
+            assert_eq!(stats.preserved_translations, 0);
+            assert_eq!(stats.lost_translations, usize::from(!partial));
+            let new = db
+                .get_entry(&fixture_message_id(filename, 1))
+                .unwrap()
+                .unwrap();
+            assert_eq!(new.source, "Hello");
+            assert_eq!(new.translation, None);
+            let saved_old = db.get_entry(&old.id).unwrap();
+            assert_eq!(saved_old.is_some(), partial);
+            if let Some(saved_old) = saved_old {
+                assert_eq!(saved_old.translation.as_deref(), Some("Hola"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_xp_101_text_and_empty_line_ids_stay_stable() {
+        for stem in ["Map001", "CommonEvents"] {
+            for first in ["First line", ""] {
+                let filename = format!("{stem}.rxdata");
+                let dir = create_event_fixture(
+                    &filename,
+                    vec![
+                        make_cmd(101, vec![MarshalValue::Str(first.into())]),
+                        make_cmd(401, vec![MarshalValue::Str("Continuation".into())]),
+                        make_cmd(0, vec![]),
+                    ],
+                );
+                let plugin = RpgMakerVxaPlugin::new();
+                let mut entries = plugin.extract(dir.path()).unwrap();
+                assert_eq!(entries.len(), 1);
+                let anchor = usize::from(first.is_empty());
+                assert_eq!(entries[0].id, fixture_message_id(&filename, anchor));
+                assert_eq!(
+                    entries[0].source,
+                    if first.is_empty() {
+                        "Continuation"
+                    } else {
+                        "First line\nContinuation"
+                    }
+                );
+                entries[0].translation = Some("Hola".into());
+                assert_eq!(
+                    plugin.inject(dir.path(), &entries).unwrap().strings_written,
+                    1
+                );
+                let bytes = fs::read(dir.path().join("Data").join(&filename)).unwrap();
+                let root = MarshalValue::parse(&bytes).unwrap();
+                let list = fixture_event_list(&root);
+                assert_eq!(cmd_code(&list[0]), Some(101));
+                assert_eq!(
+                    cmd_first_str(&list[0]).as_deref(),
+                    Some(if first.is_empty() { "" } else { "Hola" })
+                );
+                assert_eq!(list.len(), anchor + 2);
+                let after = plugin.extract(dir.path()).unwrap();
+                assert_eq!(after[0].id, entries[0].id);
+                assert_eq!(after[0].source, "Hola");
+            }
         }
     }
 
