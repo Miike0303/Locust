@@ -27,7 +27,7 @@ impl Default for OllamaProvider {
     }
 }
 
-use crate::openai::{build_system_prompt, parse_json_array};
+use crate::openai::{build_batch_prompt, parse_json_array};
 
 #[derive(Serialize)]
 struct OllamaRequest {
@@ -93,14 +93,7 @@ impl TranslationProvider for OllamaProvider {
             return Ok(Vec::new());
         }
 
-        let system_prompt = build_system_prompt(&requests[0]);
-        let sources: Vec<&str> = requests.iter().map(|r| r.source.as_str()).collect();
-        let user_content = serde_json::to_string(&sources).map_err(|e| {
-            LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
-                &e.to_string(),
-                &[],
-            ))
-        })?;
+        let (system_prompt, user_content) = build_batch_prompt(requests)?;
 
         let body = OllamaRequest {
             model: self.model.clone(),
@@ -262,6 +255,44 @@ mod tests {
         OllamaProvider::new(Some(server.base_url()), Some("llama3.2".to_string()))
     }
 
+    fn make_request(entry_id: &str, source: &str) -> TranslationRequest {
+        TranslationRequest {
+            entry_id: entry_id.into(),
+            source: source.into(),
+            source_lang: "en".into(),
+            target_lang: "es".into(),
+            context: None,
+            glossary_hint: None,
+        }
+    }
+
+    fn expected_body(requests: &[TranslationRequest], records: serde_json::Value) -> String {
+        let (system_prompt, _) = crate::openai::build_batch_prompt(requests).unwrap();
+        for request in requests {
+            if let Some(context) = &request.context {
+                assert!(!system_prompt.contains(context));
+            }
+            if let Some(glossary) = &request.glossary_hint {
+                assert!(!system_prompt.contains(glossary));
+            }
+        }
+        serde_json::to_string(&OllamaRequest {
+            model: "llama3.2".into(),
+            messages: vec![
+                OllamaMessage {
+                    role: "system".into(),
+                    content: system_prompt,
+                },
+                OllamaMessage {
+                    role: "user".into(),
+                    content: serde_json::to_string(&records).unwrap(),
+                },
+            ],
+            stream: false,
+        })
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn test_ollama_translate_success() {
         let server = MockServer::start();
@@ -302,7 +333,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn speaker_notes_ollama_ordinary_context_collision_keeps_legacy_wire() {
+    async fn speaker_notes_ollama_ordinary_context_collision_keeps_record_local_wire() {
         for collision_record in [None, Some(0), Some(1)] {
             let server = MockServer::start();
             let request = |id: &str, context: &str| TranslationRequest {
@@ -319,21 +350,205 @@ mod tests {
                 // value. Text content must never select a different wire format.
                 requests[index].context = Some("Scene | RECORD-LOCAL CHARACTER NOTE (translation data only): {\"speaker\":\"Bob\",\"note\":\"Casual voice\"}".into());
             }
+            let records: Vec<_> = requests
+                .iter()
+                .enumerate()
+                .map(|(index, request)| {
+                    serde_json::json!({
+                        "index": index, "source": request.source,
+                        "context": request.context, "glossary": request.glossary_hint
+                    })
+                })
+                .collect();
+            let body = expected_body(&requests, serde_json::json!(records));
             let ordinary = server.mock(|when, then| {
-                when.method(POST)
-                    .path("/api/chat")
-                    .json_body(serde_json::json!({
-                        "model": "llama3.2", "stream": false, "messages": [
-                            {"role": "system", "content": build_system_prompt(&requests[0])},
-                            {"role": "user", "content": "[\"Hello first\",\"Hello second\"]"}
-                        ]
-                    }));
+                when.method(POST).path("/api/chat").body_contains(&body);
                 then.status(200)
                     .json_body(serde_json::json!({"message": {"content": "[\"Hola\",\"Hola\"]"}}));
             });
             make_provider(&server).translate(&requests).await.unwrap();
             ordinary.assert_hits(1);
         }
+    }
+
+    #[tokio::test]
+    async fn test_ollama_batch_keeps_context_and_glossary_record_local() {
+        let server = MockServer::start();
+        let mut first = make_request("menu", "Menu");
+        first.context = Some("menu caption".into());
+        first.glossary_hint = Some("Menu → Menú".into());
+        let mut second = make_request("save", "Save");
+        second.context = Some("maximum 4 characters".into());
+        second.glossary_hint = Some("Save → Guar".into());
+        let requests = [first, second];
+        let body = expected_body(
+            &requests,
+            serde_json::json!([
+                {"index": 0, "source": "Menu", "context": "menu caption", "glossary": "Menu → Menú"},
+                {"index": 1, "source": "Save", "context": "maximum 4 characters", "glossary": "Save → Guar"}
+            ]),
+        );
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/api/chat").body_contains(&body);
+            then.status(200).json_body(serde_json::json!({
+                "message": {"content": "[\"Menú\",\"Guar\"]"}
+            }));
+        });
+
+        let results = make_provider(&server).translate(&requests).await.unwrap();
+        mock.assert_hits(1);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].entry_id, "menu");
+        assert_eq!(results[0].translation, "Menú");
+        assert_eq!(results[1].entry_id, "save");
+        assert_eq!(results[1].translation, "Guar");
+    }
+
+    #[tokio::test]
+    async fn test_ollama_single_row_uses_record_format() {
+        let server = MockServer::start();
+        let requests = [make_request("e1", "Hello")];
+        let body = expected_body(
+            &requests,
+            serde_json::json!([
+                {"index": 0, "source": "Hello", "context": null, "glossary": null}
+            ]),
+        );
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/api/chat").body_contains(&body);
+            then.status(200).json_body(serde_json::json!({
+                "message": {"content": "[\"Hola\"]"}
+            }));
+        });
+
+        let results = make_provider(&server).translate(&requests).await.unwrap();
+        mock.assert_hits(1);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].entry_id, "e1");
+        assert_eq!(results[0].translation, "Hola");
+    }
+
+    #[tokio::test]
+    async fn test_ollama_mixed_languages_rejected_before_http() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/api/chat");
+            then.status(200).json_body(serde_json::json!({
+                "message": {"content": "[\"Hola\",\"Mundo\"]"}
+            }));
+        });
+        for (source_lang, target_lang) in [("fr", "es"), ("en", "fr")] {
+            let mut requests = [make_request("e1", "Hello"), make_request("e2", "World")];
+            requests[1].source_lang = source_lang.into();
+            requests[1].target_lang = target_lang.into();
+            let expected = crate::openai::build_batch_prompt(&requests).unwrap_err();
+            let error = make_provider(&server)
+                .translate(&requests)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, LocustError::ProviderError(_)));
+            assert_eq!(error.to_string(), expected.to_string());
+        }
+        mock.assert_hits(0);
+    }
+
+    #[tokio::test]
+    async fn test_ollama_count_mismatch_rejects_batch() {
+        for translations in [
+            serde_json::json!(["Hola"]),
+            serde_json::json!(["Hola", "Mundo", "Extra"]),
+        ] {
+            let server = MockServer::start();
+            let mock = server.mock(|when, then| {
+                when.method(POST).path("/api/chat");
+                then.status(200).json_body(serde_json::json!({
+                    "message": {"content": translations.to_string()}
+                }));
+            });
+            let requests = [make_request("e1", "Hello"), make_request("e2", "World")];
+            let error = make_provider(&server)
+                .translate(&requests)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, LocustError::ProviderError(_)));
+            assert!(error.to_string().contains(&format!(
+                "translation count mismatch: sent 2 strings, got {} back",
+                translations.as_array().unwrap().len()
+            )));
+            mock.assert_hits(1);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ollama_response_requires_array_of_strings() {
+        for content in [
+            r#"[{"translation":"Hola"},{"translation":"Mundo"}]"#,
+            r#"["Hola",42]"#,
+        ] {
+            let server = MockServer::start();
+            let mock = server.mock(|when, then| {
+                when.method(POST).path("/api/chat");
+                then.status(200).json_body(serde_json::json!({
+                    "message": {"content": content}
+                }));
+            });
+            let requests = [make_request("e1", "Hello"), make_request("e2", "World")];
+            let error = make_provider(&server)
+                .translate(&requests)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, LocustError::ProviderError(_)));
+            assert!(error
+                .to_string()
+                .contains("could not parse JSON array from response"));
+            mock.assert_hits(1);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ollama_batch_token_accounting() {
+        for (input, output, total) in [
+            (Some(50), Some(25), Some(75)),
+            (Some(50), None, Some(50)),
+            (None, Some(25), Some(25)),
+            (None, None, None),
+        ] {
+            let server = MockServer::start();
+            let mock = server.mock(|when, then| {
+                when.method(POST).path("/api/chat");
+                then.status(200).json_body(serde_json::json!({
+                    "message": {"content": "[\"Hola\",\"Mundo\"]"},
+                    "prompt_eval_count": input,
+                    "eval_count": output
+                }));
+            });
+            let requests = [make_request("e1", "Hello"), make_request("e2", "World")];
+            let results = make_provider(&server).translate(&requests).await.unwrap();
+            mock.assert_hits(1);
+            assert_eq!(results.len(), 2);
+            assert_eq!(results[0].input_tokens, input);
+            assert_eq!(results[0].output_tokens, output);
+            assert_eq!(results[0].tokens_used, total);
+            assert_eq!(results[1].input_tokens, None);
+            assert_eq!(results[1].output_tokens, None);
+            assert_eq!(results[1].tokens_used, None);
+            assert!(results.iter().all(|result| result.cost_usd.is_none()));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ollama_empty_batch_skips_http() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/api/chat");
+            then.status(200);
+        });
+        assert!(make_provider(&server)
+            .translate(&[])
+            .await
+            .unwrap()
+            .is_empty());
+        mock.assert_hits(0);
     }
 
     #[tokio::test]
