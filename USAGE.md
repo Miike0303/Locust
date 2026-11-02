@@ -28,9 +28,9 @@ The desktop menus themselves can be **English or Spanish**. That is the app's in
    - If not detected, choose the format manually from the dropdown.
 4. Click **Open Project**. Extraction runs automatically (usually 1–10 seconds).
 
-**Stable**: RPG Maker MV/MZ, RPG Maker XP/VX Ace, Ren'Py.
+**Stable**: RPG Maker MV/MZ, RPG Maker XP/VX/VX Ace, Ren'Py.
 
-**Experimental** (working extract → inject → patch; still evolving): Unity, Unreal, Wolf RPG, HTML / Twine (SugarCube), QSP, TyranoBuilder, KiriKiri, YU-RIS, NScripter, VNTextPatch JSON.
+**Experimental** (working extract → inject → patch; still evolving): Unity, Unreal, Wolf RPG, HTML / Twine (SugarCube), QSP, TyranoBuilder, KiriKiri, YU-RIS, NScripter, VNTextPatch JSON, Godot/Dialogic (selected standalone PCK archives).
 
 Nothing on that list is “coming soon.” Experimental means it works and you can open it; treat the result as something to playtest, not a finished localization pipeline.
 
@@ -46,7 +46,7 @@ Each game gets its **own** database file. Reopening the same folder **keeps** yo
    - **OpenAI / Claude / DeepL** — paid, higher quality. Set API keys in Settings first.
    - **Ollama** — free, runs offline. Needs [Ollama](https://ollama.com) installed locally.
 3. Pick **Source** (or leave on *Auto-detect*) and **Target** language.
-   Default: source = Auto, target = Español.
+   Defaults use detected project text, saved choices and settings. Confirm both languages before starting.
    This target is the **game's** language, not the Locust interface language (that lives under Settings → Appearance).
 4. Optional: add **Game context** (e.g. "dark fantasy RPG, medieval") — helps the AI pick the right tone.
 5. Click **Start Translation**.
@@ -56,7 +56,7 @@ You can close the modal. Translations continue in the background. Progress shows
 ### Translation tips
 
 - **Start with a small batch** (set *Batch size* = 10) to check the output quality before committing to a full run.
-- **Set a cost limit** if using paid providers — Locust stops before exceeding it.
+- **Set a cost limit** if using paid providers. Limits use estimates and observed usage; unknown cost stops further limited calls. They cannot guarantee the provider's final bill.
 - **Use glossary** to keep character names and proper nouns consistent.
 - **Use memory** to reuse translations from previous projects (saves cost).
 
@@ -70,7 +70,7 @@ If you open the game again after an update:
 
 - Existing translations, statuses, and which provider wrote them are kept.
 - Lines whose *original* text changed are kept but marked **Pending**, so a stale translation cannot ship as approved.
-- Strings that no longer exist in the game are removed.
+- Strings that no longer exist in the game are removed after complete extraction. Incomplete extraction preserves absent saved rows and reports warnings.
 
 In the Editor:
 
@@ -86,7 +86,7 @@ In the Editor:
 When you're ready to play the translated game:
 
 1. Click the **Inject** button.
-2. Pick one or more target languages (checkboxes).
+2. Select the single target language represented by this project database. Use a separate project database for each target language.
 3. Pick a mode — only modes that engine supports are shown:
 
 ### Mode: Add
@@ -98,14 +98,14 @@ Available for **Ren'Py** and **RPG Maker MV/MZ**. Adds a language pack beside th
 
 ### Mode: Replace
 
-- Copies the game to a new folder, e.g. `<game>-es/`, with translations applied.
+- Default for engines that do not support Add. Copies the game to a new folder, e.g. `<game>-es/`, with translations applied (Godot/Dialogic produces an archive-only copy).
 - Use when you want a standalone translated build. Keep a pristine original.
 
 ### Mode: Direct
 
 - Writes into the game folder itself. A backup is created first.
-- Default for engines that do not support Add (Unity, Unreal, KiriKiri, and others). Work on a **copy** of the game when you can.
-- Direct inject is what Patch → Pack records from when you later build a shareable zip.
+- Must be chosen explicitly. Work on a **copy** of the game when you can.
+- Patch → Pack uses recorded injection output from Add, Replace or Direct; Direct is not required.
 
 Injection is fast (seconds even for large games). Then launch the game — translations should appear.
 
@@ -126,7 +126,7 @@ Repeat until happy. The project file keeps all your work.
 
 ## 7. Applying a patch
 
-Translators can pack a patch zip from the desktop (**Patch**, Ctrl+Shift+P) after a Direct inject.
+Translators can pack a patch zip from the desktop (**Patch**, Ctrl+Shift+P) using recorded injection output from Add, Replace or Direct. For Replace, pack from the translated output; Direct is not required.
 
 Players who only want to apply that zip do not need the desktop app:
 

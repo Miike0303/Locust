@@ -12,7 +12,7 @@ archive; review warnings and translations before installing it.
   rebuilds preserve each original serialized spelling, member order, version,
   flags and reserved words.
 - Dialogic `.dtl` timelines using the supported stock syntax.
-- `.dch` file stems identify speakers; character display names are not translated.
+- `.dch` file stems identify speakers; literal character display names can be translated while character identities remain separate.
 
 Select the **`.pck` file**, not its folder or the game executable. Folder selection
 is refused before backup or copying; this format never adopts the parent folder.
@@ -64,7 +64,7 @@ Review the injection report for skipped rows and warnings.
 | Choices | Visible choice text is translated. |
 | Speakers, commands, indentation, `#id:` | Preserved. |
 | `[bbcode]` tags and `{variables}` | Shown literally in sources and preserved. |
-| Character display names | Not translated. |
+| Character display names | Literal names are translated; character identities and resource paths are preserved. |
 
 A translation must keep **every protected token verbatim and in order**, retain
 the same continuation segment count, and introduce no new speaker prefix, command

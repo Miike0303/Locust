@@ -3181,7 +3181,7 @@ dependencies = [
 
 [[package]]
 name = "locust-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3208,7 +3208,7 @@ dependencies = [
 
 [[package]]
 name = "locust-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3238,7 +3238,7 @@ dependencies = [
 
 [[package]]
 name = "locust-desktop"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "human-panic",
@@ -3264,7 +3264,7 @@ dependencies = [
 
 [[package]]
 name = "locust-formats"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -3293,7 +3293,7 @@ dependencies = [
 
 [[package]]
 name = "locust-providers"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3310,7 +3310,7 @@ dependencies = [
 
 [[package]]
 name = "locust-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -63,7 +63,7 @@ saved rows absent from that incomplete extraction.
 | **KiriKiri / KAG**        | `.ks`, `.xp3`    | Loose + XP3; FE FE 0/1/2 (zlib); patch.xp3 write; no cxdec |
 | **YU-RIS**                | `.ybn`, `.ypf`   | Loose YSTB + YPF unpack/repack (common versions); synthetic + real-game YSTB |
 | **NScripter / ONScripter**| `0.txt`, `nscr_sec.dat`, `nscript.dat` | Shift-JIS; rot5 / XOR 0x84; synthetic; no NSA / nscript.___ |
-| **Godot / Dialogic**      | `.pck`           | Selected standalone Godot 4.0–4.4 PCK v2 with supported stock Dialogic timelines; archive-only Replace. Godot 4.4 support is proven on synthetic fixtures only; no real 4.4 game has been verified. See [support limits](docs/GODOT-DIALOGIC.md). |
+| **Godot / Dialogic**      | `.pck`           | Selected standalone Godot 4.0–4.4 PCK v2 and Godot 4.5+ PCK v3 with supported stock Dialogic timelines; archive-only Replace. Experimental; Godot 4.4/v3 profiles have synthetic-fixture coverage only, with no verified real game or engine launch. See [support limits](docs/GODOT-DIALOGIC.md). |
 
 Not seeing your engine? [Open an issue](https://github.com/Miike0303/Locust/issues).
 
@@ -145,7 +145,7 @@ Context windows opt each provider pass into an **approximate input allowance**: 
 
 Batching estimates UTF-8 source/context/glossary bytes divided by three (rounded up), plus 128 per record. Complete requests include character notes, protected-control, glossary and binary-capacity hints; they can split an initial batch further. Individually oversized requests, including correction requests, are refused before dispatch to that provider, preserving the rejected rows. Already-dispatched calls still contribute observed usage/cost. Without a context window, existing batching and ordinary oversized-single dispatch are unchanged.
 
-This reserve and byte estimator are **not an exact tokenizer or a guarantee of service prompt/output fit**. Configured windows and prices are user assumptions, not verified service limits or charges. `POST /api/translate/estimate` accepts a registered `provider_id` and the same `options` as translation start, for the current open project. It temporarily reserves the project, but creates no job and writes no rows or configuration. It returns the effective model, lossless decimal-string-or-null window/allowance/effective batch cap, resolved batch size, eligible pending entry count, source UTF-8 bytes, and an `approximate: true` marker. `estimated_cost_usd` is finite nonnegative or null (`cost_known: false`); unknown is not zero. This source-only estimate calls the provider's existing estimator, excludes TM/glossary/notes/fallback/retries, and is neither exact final batching nor observed spend. A zero allowance is reported as `"0"`, not a dispatch guarantee. The typed frontend wrapper uses HTTP in both browser and embedded desktop; no Settings editor or estimate UI is added here.
+This reserve and byte estimator are **not an exact tokenizer or a guarantee of service prompt/output fit**. Configured windows and prices are user assumptions, not verified service limits or charges. `POST /api/translate/estimate` accepts a registered `provider_id` and the same `options` as translation start, for the current open project. It temporarily reserves the project, but creates no job and writes no rows or configuration. It returns the effective model, lossless decimal-string-or-null window/allowance/effective batch cap, resolved batch size, eligible pending entry count, source UTF-8 bytes, and an `approximate: true` marker. `estimated_cost_usd` is finite nonnegative or null (`cost_known: false`); unknown is not zero. This source-only estimate calls the provider's existing estimator, excludes TM/glossary/notes/fallback/retries, and is neither exact final batching nor observed spend. A zero allowance is reported as `"0"`, not a dispatch guarantee. The typed frontend wrapper uses HTTP in both browser and embedded desktop.
 
 ---
 
@@ -205,7 +205,7 @@ cargo build --release -p locust-desktop
 6. Edit in the desktop editor as needed:
    - **Validate** (Ctrl+Shift+V) — placeholders + binary inject-slot length (Unity/Unreal/Wolf).
    - **Search & replace** (Ctrl+Shift+F) — bulk edit translations only (one DB batch).
-   - **Export / Import** (Ctrl+E) — PO or XLIFF for external CAT tools (ids survive round-trip).
+   - **Export / Import** (Ctrl+E) — PO, XLIFF or restricted TMX project catalogs for external review (ids survive round-trip).
 7. Click **Inject**, select the single target language translated in this database, and choose:
    - **Add mode** *(where supported, e.g. Ren'Py)* — language packs beside the original tree.
    - **Replace mode** — writes into a work copy (always keep a pristine original).
@@ -233,8 +233,9 @@ locust patch-rollback "<clean_copy>"   # restores .locust/backup
 
 After a new Direct injection, `patch` can omit `--pristine`: it retrieves the exact recorded backup and verifies its original hashes, including after restart or switching between CLI and desktop profiles. Repeating an injection that writes nothing keeps the previous association. A missing or modified recorded backup stops packaging; supply an intact `--pristine` copy to recover. Older records without backup provenance retain the legacy fallback behavior. The backup belongs to that injection generation, which may start from an already translated working copy.
 
-### CLI-only TMX project catalogs
+### TMX project catalogs
 
+TMX project catalogs are available through CLI, desktop Export / Import and HTTP.
 Export a restricted bilingual catalog, review it, then preview before importing:
 
 ```bash
@@ -245,7 +246,7 @@ locust import project.locust.db -f tmx --source-lang en -l es -i project-es.tmx 
 
 TMX requires explicit, distinct source/target language tags and exact project IDs
 and source text. It supports only the [Locust plaintext TMX profile](docs/TMX-CATALOGS.md),
-not arbitrary CAT-tool files, global translation-memory import or desktop TMX UI.
+not arbitrary CAT-tool files or global translation-memory import.
 Stale/empty targets are skipped; imported text is not automatically approved.
 The existing PO/XLIFF workflows are unchanged.
 
@@ -340,7 +341,7 @@ You can close Locust and reopen the same project later — your progress persist
 
 Recognized identities are explicit `speaker` / `speaker_name` / `character` string metadata (conflicts remain unassigned), Ren'Py `.rpy` dialogue context with Ren'Py format evidence, and version-1 Godot/Dialogic structured text locators. Names/layout tags and arbitrary context are not inferred as speakers. Translation runs prefer explicit row `format_id`; without it, only native `.rpy` dialogue line locators or version-1 Godot/Dialogic text locators qualify. No game files are read to resolve notes.
 
-Translation jobs snapshot notes once (including across fallback providers). A matching nonblank note is appended as record-local translation data without replacing scene/game context, glossary, placeholder or fit hints. Identical sources with different effective contexts remain separate provider records; stored row context is unchanged. Noted rows bypass source-only translation memory reads and writes to avoid cross-character reuse; exact glossary matches still take precedence. OpenAI-compatible, Claude and Antigravity prompts already scope metadata per record. For Ollama, a job with matching nonblank notes uses single-record calls so each note stays with its own source, including during retries and fallback. Ollama's prompt and ordered-source-array wire format are unchanged; jobs without matching notes keep their previous batching even if ordinary context contains note-like text. Providers that do not consume context cannot apply character notes. The speaker workspace UI is a separate follow-up.
+Translation jobs snapshot notes once (including across fallback providers). A matching nonblank note is appended as record-local translation data without replacing scene/game context, glossary, placeholder or fit hints. Identical sources with different effective contexts remain separate provider records; stored row context is unchanged. Noted rows bypass source-only translation memory reads and writes to avoid cross-character reuse; exact glossary matches still take precedence. OpenAI-compatible, Claude and Antigravity prompts already scope metadata per record. For Ollama, a job with matching nonblank notes uses single-record calls so each note stays with its own source, including during retries and fallback. Ollama sends context and glossary with each input record and returns an ordered array of translated strings; jobs without matching notes keep their previous batching even if ordinary context contains note-like text. Providers that do not consume context cannot apply character notes.
 
 ### Where Locust keeps data
 

@@ -13,8 +13,8 @@ manifest job is **not** proof that every desktop or CLI platform shipped.
   `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` GitHub Actions secrets, with the public key
   configured in `tauri.conf.json`. **Owner prerequisite:** the private key and
   password must be usable together and match that configured public key. The
-  v0.2.0 attempt failed all five desktop signing steps because the configured
-  credentials could not be decoded; see
+  v0.2.0 release was never published: all five desktop signing steps failed
+  because the configured credentials could not be decoded; see
   [`odd/tasks/release-v0.2.0.md`, L15–L17](odd/tasks/release-v0.2.0.md).
   The owner must repair the existing secrets before another delivery attempt.
   Do not print/read secrets, rotate the identity or disable signing as part of
@@ -37,6 +37,17 @@ manifest job is **not** proof that every desktop or CLI platform shipped.
 - [ ] Keep `CHANGELOG.md`'s Unreleased heading; add the dated release with honest
   user-facing changes and unresolved support/verification limits. Exclude private
   game contents, local game paths, credentials and internal raw logs.
+  An undated `## [0.3.0]` heading is accepted by `scripts/release-gate.py` while
+  the release date is unknown. Set it to `## [0.3.0] - YYYY-MM-DD` with the actual
+  date in the release commit right before tagging.
+  Because v0.2.0 was never published, the 0.3.0 section includes its user-facing
+  highlights as well as subsequent changes. Keep the historical 0.2.0 section;
+  the gate extracts only the matching 0.3.0 section for the release body, so the
+  new release notes must stand on their own.
+- [ ] Check the intended tag and extract its notes offline before delivery:
+  `python -X utf8 scripts/release-gate.py prepare --ref refs/tags/v0.3.0`.
+  Use the intended release tag; UTF-8 mode supports Unicode notes when Windows
+  redirects Python output through a legacy code page.
 - [ ] Review the complete diff and stage **only explicitly reviewed paths**.
   Keep unrelated work and private evidence out of the release commit.
 - [ ] Record the candidate commit SHA, publish the work branch non-forcibly and

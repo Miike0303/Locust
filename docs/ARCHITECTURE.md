@@ -8,7 +8,7 @@ A game-translation tool: **extract** strings from a game into a per-game SQLite 
 
 ## Workspace
 
-Six Cargo members (`Cargo.toml:2-9`), workspace package version **0.2.0** (`Cargo.toml:13`):
+Six Cargo members (`Cargo.toml:2-9`), workspace package version **0.3.0** (`Cargo.toml:13`):
 
 | Crate | Role | Entry |
 |---|---|---|
@@ -41,7 +41,11 @@ locust CLI ───────────────────────
 Patch ZIPs contain `locust-patch.json` (schema version 1): patch metadata and file hashes, plus an optional `game` block with lowercase store keys, uppercase DLsite codes, a game version, and up to three pristine file fingerprints (smallest original size first, then path). `locust patch` accepts `--rj`, repeatable `--store-id`, and `--game-version`; it detects DLsite codes from the nearest game-path component unless `--no-detect-id` is set. `--astro` includes the identity and the written ZIP's size/hash in its catalog stub. Existing manifests without `game` remain compatible with apply/verify.
 CLI and desktop share core identity resolution and release-entry rendering/writing. The desktop's copyable publish command targets PowerShell with single-quoted literal paths (embedded apostrophes are doubled), not portable shell syntax; uploads remain in the separate Rule95 site publisher. `POST /api/patch/pack` accepts `rj_code`, `store_ids`, `game_version`, `detect_id` (default true), and `entry_path`, while `GET /api/patch/identity` detects a code from the path string without opening a project.
 
-Per-game project DB at `<game-parent>/<game-name>.locust.db`, with a fallback under the config dir (`resolve_project_db_path`, see `CLAUDE.md` "Project database"). Opening an existing project merges into it and never wipes it. `init_schema` (`crates/core/src/database.rs:658`) sets WAL + foreign keys (`:682-684`) and creates the tables `project_metadata`, `textasset_originals`, `strings` (13 columns), `glossary`, `translation_memory`, `validation_issues`, `translation_runs`, `injected_files` (`:686-763`). Migrations are ad hoc (`PRAGMA table_info` + `ALTER`, `:766-817`) with no `user_version`. Global translation memory lives in `global_memory.db`, which uses the same schema (`:2875-2891`).
+Per-game project DB at `<game-parent>/<game-name>.locust.db`, with a fallback under the config dir (`resolve_project_db_path`, see `CLAUDE.md` "Project database"). Opening an existing project merges into it and preserves saved translations.
+
+`init_schema` (`crates/core/src/database/schema.rs:8`) configures WAL, normal synchronization and foreign keys before running schema creation and migrations in one immediate transaction (`:14`, commit at `:233`); errors roll back. It creates `project_metadata`, `textasset_originals`, `strings`, `glossary`, `translation_memory`, `validation_issues`, `translation_runs` and `injected_files`, and adds missing columns for older databases. Incompatible legacy injection recordings are replaced; the next injection rebuilds them (`:15-35`).
+
+`string_revisions` and triggers retain up to 50 text/status revisions per row (`:151-189`). `project_content_revision` and triggers track a database identity and monotonic content token across writers (`:190-232`). Global translation memory lives in `global_memory.db` and opens through the same `Database` schema (`crates/core/src/database/global_memory.rs:13-27`, `crates/core/src/database/connection.rs:8-19`).
 
 Config: `config_dir()/config.json`. `LOCUST_DATA_DIR` overrides the root (`crates/core/src/config.rs:180-208`). API keys live in `config.providers[id].api_key` and are never read from env (`crates/providers/src/lib.rs:19`, `:131`). Other env vars: `LOCUST_CONFIG` (`crates/cli/src/main.rs:75`), `LOCUST_BACKUP_ROOT` (`crates/cli/src/main.rs:635-649`).
 
