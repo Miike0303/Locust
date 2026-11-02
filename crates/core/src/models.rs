@@ -567,6 +567,11 @@ pub enum ValidationKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         common: Option<String>,
     },
+    /// Advisory only: standalone visible integer inventories differ.
+    NumberMismatch {
+        missing: Vec<String>,
+        extra: Vec<String>,
+    },
     InvalidInjectionProvenance {
         /// Display detail only; excluded from the ignored-issue identity.
         #[serde(

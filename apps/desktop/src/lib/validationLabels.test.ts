@@ -262,3 +262,44 @@ for (const [locale, catalog, expectedIndex] of [["en", en, 1], ["es", es, 2]] as
         : `Los metadatos de inserción «${common}» no son válidos. Extrae esta entrada de nuevo antes de insertarla.`);
   });
 }
+
+// The parent adds these catalog entries; keep the lane tests independent of that merge.
+const numericCatalogs = {
+  en: {
+    "validate.kind.numberMismatchLabel": "Changed numbers",
+    "validate.kind.numberMismatchHint": "Visible integers differ from the source. Review the numbers; this warning does not block injection.",
+    "validate.message.numberMismatch": "Visible integers differ. Missing: {missing}. Extra: {extra}.",
+    "validate.message.numberMismatchNone": "none",
+  },
+  es: {
+    "validate.kind.numberMismatchLabel": "Cifras distintas",
+    "validate.kind.numberMismatchHint": "Las cifras enteras visibles difieren del original. Revísalas; este aviso no impide la inserción.",
+    "validate.message.numberMismatch": "Las cifras enteras visibles difieren. Faltan: {missing}. Sobran: {extra}.",
+    "validate.message.numberMismatchNone": "ninguna",
+  },
+};
+for (const locale of ["en", "es"] as const) {
+  test(`numeric QA uses localized labels, hints and structured data (${locale})`, async () => {
+    const { validationBadgeLabel, validationKindHint, validationMessage } = await import("./validationLabels.ts");
+    const catalog = numericCatalogs[locale];
+    const t = (key: any, vars?: any) => translate(catalog, locale, key, vars);
+    assert.equal(validationBadgeLabel("NumberMismatch", t), catalog["validate.kind.numberMismatchLabel"]);
+    assert.equal(validationKindHint("NumberMismatch", t), catalog["validate.kind.numberMismatchHint"]);
+    for (const [missing, extra] of [[["12", "12"], ["2"]], [[], ["2"]], [["12"], []]]) {
+      const kind = { NumberMismatch: { missing, extra } } as ValidationKind;
+      const expected = translate(catalog, locale, "validate.message.numberMismatch", {
+        missing: missing.join(", ") || catalog["validate.message.numberMismatchNone"],
+        extra: extra.join(", ") || catalog["validate.message.numberMismatchNone"],
+      });
+      for (const issue of [{ kind, message: "unrelated raw diagnostic" },
+        { kind: "NumberMismatch", kind_data: kind, message: "unrelated raw diagnostic" }]) {
+        assert.equal(validationMessage(issue, t), expected);
+      }
+    }
+    for (const kind of ["NumberMismatch", { NumberMismatch: {} },
+      { NumberMismatch: { missing: ["12"], extra: null } },
+      { NumberMismatch: { missing: [12], extra: [] } }]) {
+      assert.equal(validationMessage({ kind: kind as ValidationKind, message: "legacy diagnostic" }, t), "legacy diagnostic");
+    }
+  });
+}

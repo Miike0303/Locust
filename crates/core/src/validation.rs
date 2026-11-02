@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -489,6 +489,125 @@ fn invalid_provenance_issue(entry: &StringEntry, error: &LocustError) -> Validat
     }
 }
 
+/// Inspect only text left by the existing control/placeholder scanners. Remove
+/// their minted tokens too, without introducing word boundaries that could
+/// turn a formatted HP50 into a standalone visible integer.
+fn visible_integers(text: &str) -> (BTreeMap<String, usize>, BTreeSet<String>) {
+    let (masked, placeholders) = crate::placeholder::PlaceholderProcessor::extract(text);
+    let mut visible = String::new();
+    let mut tail = masked.as_str();
+    for placeholder in &placeholders {
+        let (before, after) = tail
+            .split_once(&placeholder.token)
+            .expect("extracted placeholders retain their minted order");
+        visible.push_str(before);
+        tail = after;
+    }
+    visible.push_str(tail);
+    let chars: Vec<_> = visible
+        .chars()
+        .map(|c| match c {
+            '０'..='９' => char::from(b'0' + (c as u32 - '０' as u32) as u8),
+            _ => c,
+        })
+        .collect();
+    let mut spans = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        if !chars[index].is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < chars.len() && chars[index].is_ascii_digit() {
+            index += 1;
+        }
+        spans.push((start, index));
+    }
+
+    let mut ambiguous = vec![false; spans.len()];
+    for (i, &(start, end)) in spans.iter().enumerate() {
+        let word_char = |c: &char| c.is_alphanumeric() || *c == '_';
+        ambiguous[i] = start.checked_sub(1).is_some_and(|p| word_char(&chars[p]))
+            || chars.get(end).is_some_and(word_char)
+            // A leading decimal point/comma (including .5) is ambiguous too.
+            || start
+                .checked_sub(1)
+                .is_some_and(|p| matches!(chars[p], '.' | ',' | '．' | '，'));
+        if i > 0 {
+            let previous_end = spans[i - 1].1;
+            let gap = &chars[previous_end..start];
+            let horizontal_space = |c: &char| c.is_whitespace() && !matches!(c, '\r' | '\n');
+            let grouping = end - start == 3 && !gap.is_empty() && gap.iter().all(horizontal_space);
+            let punctuation = |c: &char| {
+                matches!(
+                    c,
+                    '.' | ','
+                        | '．'
+                        | '，'
+                        | '-'
+                        | '–'
+                        | '—'
+                        | '−'
+                        | '…'
+                        | '~'
+                        | '～'
+                        | '〜'
+                        | '/'
+                        | ':'
+                )
+            };
+            let connected = gap.iter().any(punctuation)
+                && gap.iter().all(|c| horizontal_space(c) || punctuation(c));
+            if grouping || connected {
+                ambiguous[i - 1] = true;
+                ambiguous[i] = true;
+            }
+        }
+    }
+    let mut counts = BTreeMap::new();
+    let mut uncertain = BTreeSet::new();
+    for ((start, end), skip) in spans.into_iter().zip(ambiguous) {
+        let number = chars[start..end].iter().collect();
+        if skip {
+            uncertain.insert(number);
+        } else {
+            *counts.entry(number).or_default() += 1;
+        }
+    }
+    (counts, uncertain)
+}
+
+fn number_mismatch(source: &str, translation: &str) -> Option<(Vec<String>, Vec<String>)> {
+    if source.trim().is_empty() || translation.trim().is_empty() {
+        return None;
+    }
+    let (mut source, mut uncertain) = visible_integers(source);
+    let (mut translation, target_uncertain) = visible_integers(translation);
+    // A skipped token must not reappear as a spurious extra/missing value when
+    // the other language separates it from letters (e.g. 好感度１４以上 / Affection 14).
+    // Exclude matching uncertain digit runs on both sides without interpreting
+    // their value or discarding comparisons of other, unambiguous integers.
+    uncertain.extend(target_uncertain);
+    source.retain(|number, _| !uncertain.contains(number));
+    translation.retain(|number, _| !uncertain.contains(number));
+    // Sorted multiset differences keep persisted ignored-issue JSON stable
+    // across number reordering, without imposing a machine integer size limit.
+    let difference = |left: &BTreeMap<String, usize>, right: &BTreeMap<String, usize>| {
+        left.iter()
+            .flat_map(|(number, count)| {
+                std::iter::repeat_n(
+                    number.clone(),
+                    count.saturating_sub(*right.get(number).unwrap_or(&0)),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let missing = difference(&source, &translation);
+    let extra = difference(&translation, &source);
+    (!missing.is_empty() || !extra.is_empty()).then_some((missing, extra))
+}
+
 impl Validator {
     pub fn validate_entry(entry: &StringEntry) -> Vec<ValidationIssue> {
         let mut issues = Vec::new();
@@ -530,6 +649,20 @@ impl Validator {
                 entry_id: entry.id.clone(),
                 kind: ValidationKind::IdenticalToSource,
                 message: "translation is identical to source".to_string(),
+                source: None,
+            });
+        }
+
+        // Advisory only; injection safety checks do not use this inventory.
+        if let Some((missing, extra)) = number_mismatch(&entry.source, translation) {
+            issues.push(ValidationIssue {
+                entry_id: entry.id.clone(),
+                message: format!(
+                    "visible integers differ; missing: {}; extra: {}",
+                    missing.join(", "),
+                    extra.join(", ")
+                ),
+                kind: ValidationKind::NumberMismatch { missing, extra },
                 source: None,
             });
         }
@@ -657,6 +790,7 @@ impl Validator {
                 ValidationKind::EmptyTranslation => "EmptyTranslation",
                 ValidationKind::IdenticalToSource => "IdenticalToSource",
                 ValidationKind::InconsistentTranslation { .. } => "InconsistentTranslation",
+                ValidationKind::NumberMismatch { .. } => "NumberMismatch",
                 ValidationKind::InvalidInjectionProvenance { .. } => "InvalidInjectionProvenance",
                 ValidationKind::StaleTranslation => "StaleTranslation",
             };

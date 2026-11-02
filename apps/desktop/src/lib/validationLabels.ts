@@ -14,6 +14,7 @@ const BADGE_LABEL_KEYS = {
   EmptyTranslation: "validate.kind.emptyLabel",
   IdenticalToSource: "validate.kind.identicalLabel",
   InconsistentTranslation: "validate.kind.inconsistentLabel",
+  NumberMismatch: "validate.kind.numberMismatchLabel",
   StaleTranslation: "validate.kind.staleLabel",
   InvalidInjectionProvenance: "validate.kind.provenanceLabel",
 } as const satisfies Record<ValidationKindName, MessageKey>;
@@ -113,6 +114,15 @@ export function validationMessage(issue: MessageIssue, t: TranslateFn): string {
     case "UnencodableTranslation":
       if (typeof data.encoding === "string") return t("validate.kind.unencodable", { encoding: data.encoding });
       break;
+    case "NumberMismatch":
+      if (Array.isArray(data.missing) && data.missing.every((n: unknown) => typeof n === "string") &&
+          Array.isArray(data.extra) && data.extra.every((n: unknown) => typeof n === "string")) {
+        return t("validate.message.numberMismatch", {
+          missing: data.missing.join(", ") || t("validate.message.numberMismatchNone"),
+          extra: data.extra.join(", ") || t("validate.message.numberMismatchNone"),
+        });
+      }
+      break;
     case "InconsistentTranslation":
       if (isCount(data.variants) && typeof data.common === "string") {
         return t("validate.message.inconsistent", { n: data.variants, text: data.common });
@@ -133,5 +143,6 @@ export function validationBadgeLabel(kind: string, t: TranslateFn): string {
 
 /** Optional guidance for advisory kinds, shown on QA badges and filter chips. */
 export function validationKindHint(kind: string, t: TranslateFn): string | undefined {
+  if (kind === "NumberMismatch") return t("validate.kind.numberMismatchHint");
   return kind === "InconsistentTranslation" ? t("validate.kind.inconsistentHint") : undefined;
 }

@@ -5,7 +5,7 @@ export const QA_PAGE_SIZE = 50;
 export const qaLastRunKey = (projectKey: string) => ["validation-last-run", projectKey] as const;
 
 export function qaIsAdvisoryKind(kind: string): boolean {
-  return kind === "IdenticalToSource" || kind === "InconsistentTranslation";
+  return kind === "IdenticalToSource" || kind === "InconsistentTranslation" || kind === "NumberMismatch";
 }
 
 export function qaKindBadgeClass(kind: string): string {

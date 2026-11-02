@@ -67,3 +67,11 @@ test("QA completed-run keys isolate project databases", () => {
   assert.deepEqual(qaLastRunKey("project-a"), ["validation-last-run", "project-a"]);
   assert.notDeepEqual(qaLastRunKey("project-a"), qaLastRunKey("project-b"));
 });
+
+test("number mismatches are advisory in badges, summaries and filters", () => {
+  assert.equal(qaIsAdvisoryKind("NumberMismatch"), true);
+  assert.equal(qaKindBadgeClass("NumberMismatch"), "bg-warning-muted text-warning");
+  assert.deepEqual(buildQaSummary({ NumberMismatch: { open: 2, ignored: 1 } }), {
+    open: 2, kinds: [{ kind: "NumberMismatch", open: 2, ignored: 1 }],
+  });
+});

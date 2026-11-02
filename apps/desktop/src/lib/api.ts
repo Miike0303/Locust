@@ -364,6 +364,7 @@ export type ValidationKind =
   | { ExceedsBinarySlot: { encoding: string; limit: number; actual: number } }
   | { UnencodableTranslation: { encoding: string } }
   | { InconsistentTranslation: { variants: number; common?: string | null } }
+  | { NumberMismatch: { missing: string[]; extra: string[] } }
   | { InvalidInjectionProvenance: { reason?: InjectionProvenanceReason | null } }
   | "EmptyTranslation"
   | "InvalidInjectionProvenance"
