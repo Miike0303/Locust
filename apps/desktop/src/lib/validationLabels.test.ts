@@ -27,6 +27,14 @@ registerHooks({
     if (context.parentURL?.endsWith("/components/ValidationResultsModal.tsx") && specifier === "../lib/i18n") {
       return { url: "test:badge-i18n", shortCircuit: true };
     }
+    // The modal is called as a plain function here; give its page state a
+    // stateless stand-in (first page, no effects) instead of a React renderer.
+    if (context.parentURL?.endsWith("/components/ValidationResultsModal.tsx") && specifier === "react") {
+      return {
+        url: `data:text/javascript,${encodeURIComponent("export const useState=i=>[typeof i==='function'?i():i,()=>{}];export const useEffect=()=>{};export const useMemo=fn=>fn();")}`,
+        shortCircuit: true,
+      };
+    }
     return nextResolve(specifier, context);
   },
   load(url, context, nextLoad) {
