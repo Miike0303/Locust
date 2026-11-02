@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Loader, Plus, Search, Trash2 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { Loader, Pencil, Plus, Search, Trash2 } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { SETTINGS_INPUT_CLASS } from "../../components/BufferedSetting";
 import ConfirmDialog from "../../components/ConfirmDialog";
 import type { GlossaryEntry } from "../../lib/api";
@@ -32,7 +32,15 @@ export default function GlossarySection() {
   const [filter, setFilter] = useState("");
   const [term, setTerm] = useState("");
   const [translation, setTranslation] = useState("");
+  const [caseSensitive, setCaseSensitive] = useState(false);
+  const [note, setNote] = useState("");
   const [saving, setSaving] = useState(false);
+  const [entryToEdit, setEntryToEdit] = useState<{
+    entry: GlossaryEntry;
+    projectScope: string | null;
+  } | null>(null);
+  const [editSaving, setEditSaving] = useState(false);
+  const editRequest = useRef<object | null>(null);
   const [entryToDelete, setEntryToDelete] = useState<{
     entry: GlossaryEntry;
     projectScope: string | null;
@@ -42,8 +50,16 @@ export default function GlossarySection() {
     setEntryToDelete(null);
     setTerm("");
     setTranslation("");
+    setCaseSensitive(false);
+    setNote("");
     setSaving(false);
   }, [projectScope]);
+
+  useEffect(() => {
+    setEntryToEdit(null);
+    setEditSaving(false);
+    editRequest.current = null;
+  }, [projectScope, activePair]);
 
   const isCurrentProject = (scope: string | null) => {
     const current = useProjectStore.getState().project;
@@ -94,19 +110,59 @@ export default function GlossarySection() {
         term: termText,
         translation: tr,
         lang_pair: activePair.trim(),
-        context: null,
-        case_sensitive: false,
+        context: note.trim() || null,
+        case_sensitive: caseSensitive,
       };
       await addGlossaryEntry(entry);
       if (isCurrentProject(projectScope)) {
         setTerm("");
         setTranslation("");
+        setCaseSensitive(false);
+        setNote("");
       }
       invalidateGlossary(projectScope);
     } catch (e: any) {
       addToast("error", t("settings.glossary.toast.addFailed", { error: e.message }));
     } finally {
       if (isCurrentProject(projectScope)) setSaving(false);
+    }
+  };
+
+  const changeEdit = (patch: Partial<Pick<GlossaryEntry, "translation" | "case_sensitive" | "context">>) => {
+    if (editRequest.current) return;
+    setEntryToEdit((current) => current && ({ ...current, entry: { ...current.entry, ...patch } }));
+  };
+
+  const handleSaveEdit = async () => {
+    if (!entryToEdit || editRequest.current) return;
+    const pending = entryToEdit;
+    if (!canSubmit(pending.projectScope)) return;
+    const tr = pending.entry.translation.trim();
+    if (!tr) {
+      addToast("error", t("settings.glossary.toast.termRequired"));
+      return;
+    }
+    const request = {};
+    editRequest.current = request;
+    setEditSaving(true);
+    try {
+      await addGlossaryEntry({
+        ...pending.entry,
+        translation: tr,
+        context: pending.entry.context?.trim() ? pending.entry.context : null,
+      });
+      if (editRequest.current === request && isCurrentProject(pending.projectScope)) {
+        setEntryToEdit((current) => current === pending ? null : current);
+      }
+      invalidateGlossary(pending.projectScope);
+    } catch (e: any) {
+      addToast("error", t("settings.glossary.toast.saveFailed", { error: e.message }));
+    } finally {
+      // A late response must not close or unlock another project's/pair's edit.
+      if (editRequest.current === request) {
+        editRequest.current = null;
+        setEditSaving(false);
+      }
     }
   };
 
@@ -157,8 +213,9 @@ export default function GlossarySection() {
         <h3 className="text-section font-semibold">{t("settings.glossary.addEntry")}</h3>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <div>
-            <label className="text-body text-text-muted">{t("settings.glossary.term")}</label>
+            <label htmlFor="glossary-term" className="text-body text-text-muted">{t("settings.glossary.term")}</label>
             <input
+              id="glossary-term"
               value={term}
               onChange={(e) => setTerm(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && handleAdd()}
@@ -167,8 +224,9 @@ export default function GlossarySection() {
             />
           </div>
           <div>
-            <label className="text-body text-text-muted">{t("settings.glossary.translation")}</label>
+            <label htmlFor="glossary-translation" className="text-body text-text-muted">{t("settings.glossary.translation")}</label>
             <input
+              id="glossary-translation"
               value={translation}
               onChange={(e) => setTranslation(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && handleAdd()}
@@ -176,10 +234,32 @@ export default function GlossarySection() {
               className={`mt-1 ${SETTINGS_INPUT_CLASS}`}
             />
           </div>
+          <div className="sm:col-span-2">
+            <label htmlFor="glossary-note" className="text-body text-text-muted">{t("settings.glossary.note")}</label>
+            <input
+              id="glossary-note"
+              aria-label={t("settings.glossary.note")}
+              value={note}
+              onChange={(e) => setNote(e.target.value)}
+              placeholder={t("common.optional")}
+              className={`mt-1 ${SETTINGS_INPUT_CLASS}`}
+            />
+          </div>
+          <label className="flex items-center gap-2 text-body">
+            <input
+              type="checkbox"
+              aria-label={t("settings.glossary.caseSensitive")}
+              checked={caseSensitive}
+              onChange={(e) => setCaseSensitive(e.target.checked)}
+              className="size-4 accent-accent"
+            />
+            {t("settings.glossary.caseSensitive")}
+          </label>
         </div>
         <button
           onClick={handleAdd}
-          disabled={saving || projectScope === null}
+          aria-label={t("settings.glossary.addEntry")}
+          disabled={saving || editSaving || projectScope === null}
           className="flex items-center gap-1.5 px-3 py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 text-white rounded-md text-body font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
         >
           <Plus size={14} /> {saving ? t("settings.glossary.adding") : t("settings.glossary.addEntry")}
@@ -210,39 +290,122 @@ export default function GlossarySection() {
           </p>
         ) : (
           <div className="overflow-x-auto border border-border bg-surface rounded-xl">
-          <table className="w-full min-w-[36rem] text-body">
+          <table className="w-full min-w-[52rem] text-body">
             <thead>
               <tr className="bg-surface-muted text-left text-text-muted text-caption uppercase tracking-wide">
                 <th className="px-3 py-2">{t("settings.glossary.col.term")}</th>
                 <th className="px-3 py-2">{t("settings.glossary.col.translation")}</th>
                 <th className="px-3 py-2 w-24">{t("settings.glossary.col.pair")}</th>
-                <th className="px-3 py-2 w-12"></th>
+                <th className="px-3 py-2">{t("settings.glossary.caseSensitive")}</th>
+                <th className="px-3 py-2">{t("settings.glossary.note")}</th>
+                <th className="px-3 py-2 w-40"></th>
               </tr>
             </thead>
             <tbody>
-              {filtered.map((e) => (
+              {filtered.map((e) => {
+                const edit = entryToEdit?.projectScope === projectScope
+                  && entryToEdit.entry.term === e.term && entryToEdit.entry.lang_pair === e.lang_pair
+                  ? entryToEdit.entry : null;
+                return (
                 <tr
                   key={`${e.lang_pair}:${e.term}`}
                   className="border-t border-border hover:bg-surface-muted"
                 >
                   <td className="px-3 py-2 font-medium break-words">{e.term}</td>
-                  <td className="px-3 py-2 break-words">{e.translation}</td>
+                  <td className="px-3 py-2 break-words">
+                    {edit ? (
+                      <input
+                        aria-label={t("settings.glossary.translation")}
+                        value={edit.translation}
+                        onChange={(event) => changeEdit({ translation: event.target.value })}
+                        disabled={editSaving}
+                        autoFocus
+                        className={SETTINGS_INPUT_CLASS}
+                      />
+                    ) : e.translation}
+                  </td>
                   <td className="px-3 py-2">
                     <span className="px-2 py-0.5 bg-accent-muted text-accent-fg rounded text-caption whitespace-nowrap">
                       {e.lang_pair}
                     </span>
                   </td>
                   <td className="px-3 py-2">
-                    <button
-                      onClick={() => setEntryToDelete({ entry: e, projectScope })}
-                      className="inline-flex items-center justify-center rounded-md p-2 text-danger hover:bg-danger-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-danger"
-                      title={t("settings.glossary.deleteTitle")}
-                    >
-                      <Trash2 size={14} />
-                    </button>
+                    {edit ? (
+                      <input
+                        type="checkbox"
+                        aria-label={t("settings.glossary.caseSensitive")}
+                        checked={edit.case_sensitive}
+                        onChange={(event) => changeEdit({ case_sensitive: event.target.checked })}
+                        disabled={editSaving}
+                        className="size-4 accent-accent"
+                      />
+                    ) : e.case_sensitive ? (
+                      <span className="px-2 py-0.5 bg-accent-muted text-accent-fg rounded text-caption whitespace-nowrap">
+                        {t("settings.glossary.caseSensitive")}
+                      </span>
+                    ) : null}
+                  </td>
+                  <td className="px-3 py-2">
+                    {edit ? (
+                      <input
+                        aria-label={t("settings.glossary.note")}
+                        value={edit.context ?? ""}
+                        onChange={(event) => changeEdit({ context: event.target.value })}
+                        disabled={editSaving}
+                        placeholder={t("common.optional")}
+                        className={SETTINGS_INPUT_CLASS}
+                      />
+                    ) : e.context ? (
+                      <span className="block max-w-xs truncate text-text-muted" title={e.context}>{e.context}</span>
+                    ) : null}
+                  </td>
+                  <td className="px-3 py-2">
+                    <div className="flex items-center gap-1">
+                      {edit ? (
+                        <>
+                          <button
+                            onClick={handleSaveEdit}
+                            disabled={editSaving}
+                            aria-label={t("settings.glossary.save")}
+                            className="rounded-md px-2 py-1.5 text-accent-fg hover:bg-accent-muted disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg"
+                          >
+                            {editSaving ? t("settings.field.saving") : t("settings.glossary.save")}
+                          </button>
+                          <button
+                            onClick={() => { if (!editRequest.current) setEntryToEdit(null); }}
+                            disabled={editSaving}
+                            className="rounded-md px-2 py-1.5 hover:bg-surface-muted disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg"
+                          >
+                            {t("common.cancel")}
+                          </button>
+                        </>
+                      ) : (
+                        <>
+                          <button
+                            onClick={() => setEntryToEdit({ entry: { ...e }, projectScope })}
+                            disabled={entryToEdit !== null || saving || editSaving}
+                            aria-label={t("settings.glossary.editTitle")}
+                            title={t("settings.glossary.editTitle")}
+                            className="inline-flex items-center justify-center rounded-md p-2 text-accent-fg hover:bg-accent-muted disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg"
+                          >
+                            <Pencil size={14} />
+                          </button>
+                          <button
+                            onClick={() => setEntryToDelete({ entry: e, projectScope })}
+                            disabled={editSaving}
+                            className="inline-flex items-center justify-center rounded-md p-2 text-danger hover:bg-danger-muted disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-danger"
+                            aria-label={t("settings.glossary.deleteTitle")}
+                            title={t("settings.glossary.deleteTitle")}
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        </>
+                      )}
+                    </div>
                   </td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
           </div>
