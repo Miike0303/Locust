@@ -348,9 +348,16 @@ pub async fn device_login() -> Result<TokenStore> {
 }
 
 async fn refresh(tokens: &TokenStore) -> Result<TokenStore> {
-    let client = reqwest::Client::new();
+    refresh_with_endpoint(tokens, TOKEN_URL, &reqwest::Client::new()).await
+}
+
+async fn refresh_with_endpoint(
+    tokens: &TokenStore,
+    url: &str,
+    client: &reqwest::Client,
+) -> Result<TokenStore> {
     let resp = client
-        .post(TOKEN_URL)
+        .post(url)
         .timeout(Duration::from_secs(30))
         .form(&[
             ("grant_type", "refresh_token"),
@@ -366,10 +373,32 @@ async fn refresh(tokens: &TokenStore) -> Result<TokenStore> {
             ))
         })?;
 
-    if !resp.status().is_success() {
-        return Err(LocustError::ProviderError(
-            "xAI session expired — run `locust auth grok` to log in again".to_string(),
-        ));
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        // Match the core retry classifier, including HTTP 425.
+        let transient = status.is_server_error() || matches!(status.as_u16(), 408 | 425 | 429);
+        if matches!(status.as_u16(), 401 | 403)
+            || (status.is_client_error() && !transient && body.contains("invalid_grant"))
+        {
+            return Err(LocustError::ProviderError(
+                "xAI session expired — run `locust auth grok` to log in again".to_string(),
+            ));
+        }
+
+        // Redact before truncating so echoed tokens crossing the excerpt boundary
+        // cannot leak a prefix. Keep the status envelope ahead of untrusted text
+        // so the retry classifier uses the actual HTTP status.
+        let excerpt: String = crate::error_sanitizer::sanitize_provider_error(
+            &body,
+            &[&tokens.access_token, &tokens.refresh_token],
+        )
+        .chars()
+        .take(200)
+        .collect();
+        return Err(LocustError::ProviderError(format!(
+            "xAI token refresh returned status {status}: {excerpt}"
+        )));
     }
 
     let tr: TokenResponse = resp.json().await.map_err(|e| {
@@ -663,5 +692,245 @@ mod tests {
         let loaded = load_tokens().expect("tokens persisted");
         assert_eq!(loaded.access_token, "access-xyz");
         set_token_path_override(None);
+    }
+
+    struct RefreshFixture {
+        tokens: TokenStore,
+        path: PathBuf,
+        _directory: tempfile::TempDir,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl RefreshFixture {
+        fn new() -> Self {
+            let lock = token_store_test_lock();
+            let directory = tempfile::Builder::new()
+                .prefix("locust_xai_refresh_test_")
+                .tempdir()
+                .unwrap();
+            let path = directory.path().join("fixture.json");
+            set_token_path_override(Some(path.clone()));
+            let fixture = Self {
+                tokens: TokenStore {
+                    access_token: "access-sentinel-keep-secret".to_string(),
+                    refresh_token: "refresh-sentinel-keep-secret".to_string(),
+                    expires_at: now_secs().saturating_sub(60),
+                },
+                path,
+                _directory: directory,
+                _lock: lock,
+            };
+            save_tokens(&fixture.tokens).unwrap();
+            fixture
+        }
+    }
+
+    impl Drop for RefreshFixture {
+        fn drop(&mut self) {
+            set_token_path_override(None);
+        }
+    }
+
+    async fn assert_refresh_failure(
+        status: u16,
+        body: &str,
+        retryable: bool,
+        requires_login: bool,
+    ) -> String {
+        let fixture = RefreshFixture::new();
+        let original = std::fs::read(&fixture.path).unwrap();
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/oauth2/token")
+                .body_contains("grant_type=refresh_token")
+                .body_contains(format!("refresh_token={}", fixture.tokens.refresh_token))
+                .body_contains(format!("client_id={CLIENT_ID}"));
+            then.status(status).body(body);
+        });
+        let error = refresh_with_endpoint(
+            &fixture.tokens,
+            &server.url("/oauth2/token"),
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap_err();
+        mock.assert();
+        assert_eq!(std::fs::read(&fixture.path).unwrap(), original);
+        let LocustError::ProviderError(message) = &error else {
+            panic!("expected provider error, got {error:?}");
+        };
+        assert_eq!(
+            locust_core::translation::is_retryable(&error),
+            retryable,
+            "status {status}: {message}"
+        );
+        for token in [&fixture.tokens.access_token, &fixture.tokens.refresh_token] {
+            assert!(!message.contains(token), "{message}");
+        }
+        assert_eq!(
+            message.contains("locust auth grok"),
+            requires_login,
+            "{message}"
+        );
+        if requires_login {
+            assert!(message.contains("xAI session expired"), "{message}");
+        } else {
+            assert!(
+                message.contains(&format!("token refresh returned status {status}")),
+                "{message}"
+            );
+            assert!(!message.contains("log in again"), "{message}");
+        }
+        message.clone()
+    }
+
+    #[tokio::test]
+    async fn refresh_transient_statuses_preserve_tokens_and_are_retryable() {
+        for status in [503, 500, 502, 504, 429, 408, 425, 501, 599] {
+            for body in [
+                "upstream unavailable; unauthorized 401; returned status 400",
+                r#"{"error":"invalid_grant"}"#,
+            ] {
+                assert_refresh_failure(status, body, true, false).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_auth_failures_require_login_and_are_not_retryable() {
+        for (status, body) in [
+            (400, r#"{"error":"invalid_grant"}"#),
+            (401, "timeout; returned status 503"),
+            (403, "rate limit 429"),
+        ] {
+            assert_refresh_failure(status, body, false, true).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_other_client_errors_are_permanent_without_login_guidance() {
+        for status in [400, 404, 405, 409, 422, 451] {
+            assert_refresh_failure(
+                status,
+                "invalid_request: max_tokens <= 500; network timeout; returned status 503",
+                false,
+                false,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_invalid_grant_in_other_client_error_requires_login() {
+        // The auth marker is outside the diagnostic excerpt.
+        let body = format!("{} invalid_grant", "x".repeat(600));
+        assert_refresh_failure(422, &body, false, true).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_error_body_redacts_both_tokens_and_caps_unicode_excerpt() {
+        let body = format!(
+            "echo access-sentinel-keep-secret refresh-sentinel-keep-secret {} tail-marker",
+            "界".repeat(600)
+        );
+        for status in [503, 400] {
+            let message = assert_refresh_failure(status, &body, status == 503, false).await;
+            let excerpt = message.split_once(": ").unwrap().1;
+            assert_eq!(message.matches("[REDACTED]").count(), 2, "{message}");
+            assert!(excerpt.contains('界'), "{message}");
+            assert_eq!(excerpt.chars().count(), 200, "{message}");
+            assert!(!message.contains("tail-marker"), "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_redacts_tokens_crossing_excerpt_boundary() {
+        for secret in [
+            "access-sentinel-keep-secret",
+            "refresh-sentinel-keep-secret",
+        ] {
+            let padding = "x".repeat(190);
+            let body = format!("{padding}{secret}{}", "z".repeat(400));
+            let message = assert_refresh_failure(503, &body, true, false).await;
+            let excerpt = message.split_once(": ").unwrap().1;
+            assert_eq!(excerpt, format!("{padding}[REDACTED]"));
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn refresh_recovers_after_503_and_persists_rotated_tokens() {
+        let fixture = RefreshFixture::new();
+        let original = std::fs::read(&fixture.path).unwrap();
+        let server = MockServer::start();
+        let mut unavailable = server.mock(|when, then| {
+            when.method(POST).path("/oauth2/token");
+            then.status(503).body("temporarily unavailable");
+        });
+        let client = reqwest::Client::new();
+        let url = server.url("/oauth2/token");
+        let error = refresh_with_endpoint(&fixture.tokens, &url, &client)
+            .await
+            .unwrap_err();
+        unavailable.assert();
+        assert_eq!(std::fs::read(&fixture.path).unwrap(), original);
+        assert!(locust_core::translation::is_retryable(&error), "{error}");
+        unavailable.delete();
+
+        let success = server.mock(|when, then| {
+            when.method(POST)
+                .path("/oauth2/token")
+                .body_contains(format!("refresh_token={}", fixture.tokens.refresh_token));
+            then.status(200).json_body(serde_json::json!({
+                "access_token": "new-access-sentinel",
+                "refresh_token": "new-refresh-sentinel",
+                "expires_in": 7200
+            }));
+        });
+        let before = now_secs();
+        let refreshed = refresh_with_endpoint(&fixture.tokens, &url, &client)
+            .await
+            .unwrap();
+        success.assert();
+        assert_eq!(refreshed.access_token, "new-access-sentinel");
+        assert_eq!(refreshed.refresh_token, "new-refresh-sentinel");
+        assert!((before + 7200..=now_secs() + 7200).contains(&refreshed.expires_at));
+        let saved = load_tokens().expect("refreshed tokens persisted");
+        assert_eq!(saved.access_token, refreshed.access_token);
+        assert_eq!(saved.refresh_token, refreshed.refresh_token);
+        assert_eq!(saved.expires_at, refreshed.expires_at);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn refresh_keeps_existing_refresh_token_when_not_rotated() {
+        let fixture = RefreshFixture::new();
+        let server = MockServer::start();
+        let success = server.mock(|when, then| {
+            when.method(POST).path("/oauth2/token");
+            then.status(200).json_body(serde_json::json!({
+                "access_token": "new-access-sentinel"
+            }));
+        });
+        let before = now_secs();
+        let refreshed = refresh_with_endpoint(
+            &fixture.tokens,
+            &server.url("/oauth2/token"),
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap();
+        success.assert();
+        assert_eq!(refreshed.access_token, "new-access-sentinel");
+        assert_eq!(refreshed.refresh_token, fixture.tokens.refresh_token);
+        assert!(
+            (before + default_expires()..=now_secs() + default_expires())
+                .contains(&refreshed.expires_at)
+        );
+        let saved = load_tokens().expect("refreshed tokens persisted");
+        assert_eq!(saved.access_token, refreshed.access_token);
+        assert_eq!(saved.refresh_token, fixture.tokens.refresh_token);
+        assert_eq!(saved.expires_at, refreshed.expires_at);
     }
 }
