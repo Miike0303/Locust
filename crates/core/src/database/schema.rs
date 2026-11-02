@@ -8,7 +8,20 @@ use crate::error::Result;
 pub(super) fn init_schema(conn: &Connection) -> Result<()> {
     // These connection settings cannot be changed inside a transaction.
     enable_wal(conn)?;
-    conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;")?;
+    // Use SQLite's resolved filename, including URI opens. In-memory and
+    // temporary scratch databases have an empty filename and keep NORMAL;
+    // persistent projects must sync each acknowledged WAL commit.
+    let persistent: bool = conn.query_row(
+        "SELECT file <> '' FROM pragma_database_list WHERE name = 'main'",
+        [],
+        |row| row.get(0),
+    )?;
+    conn.pragma_update(
+        None,
+        "synchronous",
+        if persistent { "FULL" } else { "NORMAL" },
+    )?;
+    conn.pragma_update(None, "foreign_keys", true)?;
     // Acquire the write lock before inspecting the schema. Concurrent openers
     // wait using the connection's existing busy timeout; failures roll back.
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
