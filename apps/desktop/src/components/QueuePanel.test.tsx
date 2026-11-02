@@ -13,6 +13,7 @@ const item: QueueItem = { id: "error", projectName: "Game", projectPath: "/game"
   progress: { completed: 3, total: 5, costSoFar: 9, costIsComplete: false, startedAt: null } };
 const state = {
   items: [item, { ...item, id: "cancelled", status: "cancelled", error: null }], isPanelOpen: true, isRunning: false,
+  disconnected: false, reconnectJob() {}, cancelQueue() {},
   translationParams: null,
   history: [{ id: "history", projectName: "Previous game", projectPath: "/previous", status: "done",
     finishedAt: "2026-10-19T12:00:00.000Z", completed: 3, total: 5, costSoFar: 9, costIsComplete: false, validationIssues: 2 }],
@@ -61,5 +62,25 @@ for (const locale of ["en", "es"] as const) {
     assert.equal(retries.length, 3);
     assert.ok(retries.every(button => button.includes('disabled=""')));
     state.isRunning = false;
+  });
+}
+
+for (const locale of ["en", "es"] as const) {
+  test(`QueuePanel keeps Reconnect and Cancel enabled while disconnected in ${locale}`, () => {
+    setLocale(locale); state.isRunning = true; state.disconnected = true;
+    try {
+      const html = render();
+      assert.ok(html.includes(locale === "en" ? "Connection lost" : "Conexión perdida"));
+      assert.ok(html.includes(t("queue.connectionLostHint")));
+      const buttons = html.match(/<button\b[^>]*>[\s\S]*?<\/button>/g) ?? [];
+      for (const label of [locale === "en" ? "Reconnect" : "Reconectar", t("queue.cancel")]) {
+        const button = buttons.find(button => button.includes(label));
+        assert.ok(button, `expected ${label} action`);
+        assert.ok(!button.includes('disabled=""'));
+      }
+      assert.ok(!buttons.some(button => button.includes(t("queue.start", { count: 0 }))));
+      state.disconnected = false;
+      assert.ok(!render().includes(t("queue.connectionLostHint")));
+    } finally { state.isRunning = false; state.disconnected = false; }
   });
 }

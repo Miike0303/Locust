@@ -14,6 +14,7 @@ import type { ProjectOpenPreflight, TranslationStartParams } from "../lib/api.ts
 const h = {
   calls: [] as string[], toasts: [] as unknown[][],
   logs: [] as unknown[][], jobError: null as string | null,
+  manualSockets: false, cancelledIds: [] as string[], cancelError: null as Error | null,
   batchErrors: [] as string[], translated: 1, progressTotal: 100, onJob: () => {},
   openedPaths: [] as string[], onOpen: async (_path: string) => {},
   preflight: { kind: "resume_available", database_path: "/fixture/game.locust.db", project_path: "/fixture/game", format_id: "renpy" } as ProjectOpenPreflight,
@@ -28,7 +29,7 @@ registerHooks({
         export async function openProject(path){h.calls.push('extract');h.openedPaths.push(path);await h.onOpen(path);return {...result,project_path:path,database_path:path+'.locust.db'};}
         export async function resumeProject(){h.calls.push('resume');return result;}
         export async function startTranslation(){h.calls.push('translate');return {job_id:'job'};}
-        export async function cancelTranslation(){h.calls.push('cancelTranslation');}
+        export async function cancelTranslation(id){h.calls.push('cancelTranslation');h.cancelledIds.push(id);if(h.cancelError)throw h.cancelError;}
         export async function getWsUrl(){return 'ws://fixture/translation';}
         export async function validate(){h.calls.push('validate');return {validation:{issues_found:0}};}`,
       "/src/stores/logStore.ts": `export function addLog(...args){globalThis.__resumeQueue.logs.push(args);}`,
@@ -42,10 +43,15 @@ registerHooks({
 // Exercise real waitForJob and WS dispatch so dropped batch events cannot hide
 // behind a mock that already knows the expected queue result.
 class JobSocket {
+  static instances: JobSocket[] = [];
+  onopen: (() => void) | null = null;
+  onerror: (() => void) | null = null;
   closed = false;
   onmessage: ((event: { data: string }) => void) | null = null;
   onclose: (() => void) | null = null;
   constructor() {
+    JobSocket.instances.push(this);
+    if (h.manualSockets) return;
     queueMicrotask(() => {
       for (const error of h.batchErrors) this.emit({ type: "batch_failed", error });
       this.emit({ type: "batch_completed", completed: 99, total: h.progressTotal, cost_so_far: 1 });
@@ -83,6 +89,7 @@ else Reflect.deleteProperty(globalThis, "localStorage");
 const { useProjectStore: project } = await import("./projectStore.ts");
 const { useEditorStore: editor } = await import("./editorStore.ts");
 const { setLocale, t } = await import("../lib/i18n/index.ts");
+const { ApiError } = await import("../lib/apiError.ts");
 const originalProject = { path: "/other", format_id: "renpy", name: "Other" };
 beforeEach(() => {
   const pending = getProjectOpenChoice();
@@ -90,6 +97,7 @@ beforeEach(() => {
   queue.setState({ items: [], history: [], isRunning: false, cancelRequested: false, globalProgress: null, translationParams: params });
   editor.setState({ isTranslating: false });
   project.getState().setProject(originalProject);
+  h.manualSockets = false; h.cancelledIds = []; h.cancelError = null; JobSocket.instances = [];
   h.calls = []; h.toasts = []; h.logs = []; h.jobError = null; h.openedPaths = [];
   h.batchErrors = []; h.translated = 1; h.progressTotal = 100; h.onJob = () => {};
   h.onOpen = async () => {};
@@ -400,6 +408,7 @@ test("queue startup restores durable work while all runtime state stays idle", (
   assert.deepEqual(initial.history, []);
   assert.equal(initial.isRunning, false); assert.equal(initial.isPanelOpen, false);
   assert.equal(initial.cancelRequested, false); assert.equal(initial.globalProgress, null);
+  assert.equal(initial.activeJobId, null); assert.equal(initial.disconnected, false);
 });
 
 test("queue persists every durable change including run history, but skips runtime-only updates", async () => {
@@ -417,6 +426,7 @@ test("queue persists every durable change including run history, but skips runti
     assert.equal(snapshot().translationParams.provider_id, "other");
     const count = writes.length;
     queue.getState().setPanelOpen(true); queue.getState().setGlobalProgress(null);
+    queue.setState({ activeJobId: "runtime-only", disconnected: true });
     assert.equal(writes.length, count);
     h.preflight = { kind: "extract" };
     await queue.getState().startQueue();
@@ -680,3 +690,172 @@ test("live scoped observers cannot read A while B open is pending, and reopening
     focusManager.setFocused(undefined);
   }
 });
+
+async function flushQueue() {
+  for (let i = 0; i < 20; i++) await new Promise<void>(resolve => setImmediate(resolve));
+}
+const firstBatch = { type: "batch_completed", seq: 2, completed: 1, total: 3, cost_so_far: 0.1 };
+const terminal = { type: "completed", seq: 3, total_translated: 3, total_cost: 0.3, cost_is_complete: true };
+function startSocketQueue() {
+  h.preflight = { kind: "extract" }; h.manualSockets = true;
+  queue.getState().addItem("/fixture/game"); queue.getState().addItem("/fixture/next");
+  return queue.getState().startQueue();
+}
+
+test("queue reconnect replay keeps ownership and starts the next item only after the real terminal", async ctx => {
+  ctx.mock.timers.enable({ apis: ["setTimeout"] });
+  const running = startSocketQueue(); await flushQueue();
+  const original = JobSocket.instances[0];
+  original.emit({ type: "started", seq: 1, total: 3 }); original.emit(firstBatch); original.close();
+  await flushQueue();
+  assert.equal(queue.getState().activeJobId, "job");
+  assert.equal(queue.getState().isRunning, true);
+  assert.deepEqual(queue.getState().items.map(i => i.status), ["translating", "pending"]);
+  assert.deepEqual(queue.getState().history, []);
+  assert.deepEqual(h.openedPaths, ["/fixture/game"]);
+  ctx.mock.timers.tick(1000); await flushQueue();
+  const replay = JobSocket.instances[1]; assert.ok(replay);
+  replay.emit({ type: "started", seq: 1, total: 3 }); replay.emit(firstBatch);
+  replay.emit({ ...firstBatch, completed: 99, cost_so_far: 99 });
+  assert.equal(queue.getState().items[0].progress.completed, 1);
+  assert.equal(queue.getState().items[0].progress.costSoFar, 0.1);
+  assert.equal(h.calls.filter(c => c === "translate").length, 1);
+  assert.ok(!h.calls.includes("validate"));
+  replay.emit(terminal); replay.emit(terminal); original.emit(terminal); await flushQueue();
+  assert.deepEqual(h.openedPaths, ["/fixture/game", "/fixture/next"]);
+  assert.equal(queue.getState().history.length, 1);
+  assert.equal(queue.getState().history[0].costSoFar, 0.3);
+  assert.equal(h.calls.filter(c => c === "validate").length, 1);
+  assert.equal(h.calls.filter(c => c === "translate").length, 2);
+  JobSocket.instances[2].emit(terminal); await running;
+  assert.deepEqual(queue.getState().items.map(i => i.status), ["done", "done"]);
+  assert.equal(queue.getState().history.length, 2);
+  assert.equal(queue.getState().activeJobId, null);
+  assert.equal(queue.getState().disconnected, false);
+});
+
+for (const action of ["reconnect", "cancel"] as const) {
+  test(`exhausted queue retries keep ownership and permit ${action} without starting another job`, async ctx => {
+    ctx.mock.timers.enable({ apis: ["setTimeout"] });
+    const running = startSocketQueue(); await flushQueue();
+    JobSocket.instances[0].emit(firstBatch); JobSocket.instances[0].close();
+    for (const delay of [1000, 2000, 4000]) {
+      ctx.mock.timers.tick(delay); await flushQueue();
+      const socket = JobSocket.instances[JobSocket.instances.length - 1];
+      socket.onopen?.(); socket.emit(firstBatch); socket.close(); socket.onclose?.();
+    }
+    ctx.mock.timers.tick(60_000); await flushQueue();
+    assert.equal(JobSocket.instances.length, 4);
+    assert.equal(queue.getState().activeJobId, "job");
+    assert.equal(queue.getState().disconnected, true);
+    assert.equal(queue.getState().items[0].error, null);
+    assert.equal(queue.getState().isRunning, true);
+    assert.deepEqual(queue.getState().history, []);
+    assert.deepEqual(h.openedPaths, ["/fixture/game"]);
+    await queue.getState().startQueue();
+    queue.getState().retryFailed(); queue.getState().clearCompleted();
+    assert.equal(h.calls.filter(c => c === "translate").length, 1);
+    if (action === "cancel") {
+      queue.getState().cancelQueue(); await flushQueue();
+      assert.deepEqual(h.cancelledIds, ["job"]);
+      assert.equal(queue.getState().activeJobId, "job", "HTTP cancellation still awaits a terminal frame");
+      assert.equal(queue.getState().isRunning, true);
+    } else {
+      queue.getState().reconnectJob(); queue.getState().reconnectJob(); await flushQueue();
+    }
+    assert.equal(JobSocket.instances.length, 5);
+    JobSocket.instances[4].emit(action === "cancel" ? { type: "failed", seq: 3, error: "cancelled" } : terminal);
+    if (action === "reconnect") { await flushQueue(); JobSocket.instances[5].emit(terminal); }
+    await running;
+    assert.deepEqual(queue.getState().items.map(i => i.status), action === "cancel" ? ["cancelled", "pending"] : ["done", "done"]);
+    assert.equal(queue.getState().activeJobId, null);
+    assert.equal(queue.getState().disconnected, false);
+    assert.equal(queue.getState().history.length, action === "cancel" ? 1 : 2);
+  });
+}
+
+async function exhaustSocketRetries(timers: { tick: (milliseconds: number) => void }) {
+  JobSocket.instances[0].emit(firstBatch); JobSocket.instances[0].close();
+  for (const delay of [1000, 2000, 4000]) {
+    timers.tick(delay); await flushQueue();
+    JobSocket.instances[JobSocket.instances.length - 1].close();
+  }
+  timers.tick(60_000); await flushQueue();
+  assert.equal(JobSocket.instances.length, 4);
+  assert.equal(queue.getState().activeJobId, "job");
+  assert.equal(queue.getState().disconnected, true);
+}
+
+for (const locale of ["en", "es"] as const) {
+  for (const response of ["http", "bare", "status-only"] as const) {
+    test(`exhausted reconnect then cancel ${response} missing job releases ownership and stops the queue (${locale})`, async ctx => {
+      ctx.mock.timers.enable({ apis: ["setTimeout"] });
+      setLocale(locale);
+      const running = startSocketQueue(); await flushQueue();
+      try {
+        await exhaustSocketRetries(ctx.mock.timers);
+        h.cancelError = response === "bare" ? new Error("job not found")
+          : new ApiError(response === "http" ? "404: job not found" : "404: replay unavailable");
+        queue.getState().cancelQueue(); await flushQueue();
+        assert.deepEqual(h.cancelledIds, ["job"]);
+        assert.equal(queue.getState().activeJobId, null);
+        assert.equal(queue.getState().disconnected, false);
+        assert.equal(queue.getState().isRunning, false);
+        assert.equal(queue.getState().cancelRequested, true);
+        assert.equal(queue.getState().globalProgress, null);
+        assert.deepEqual(queue.getState().items.map(i => i.status), ["error", "pending"]);
+        assert.equal(queue.getState().items[0].error, locale === "en"
+          ? "The server no longer has this job; it may have finished. Review the project before re-running it."
+          : "El servidor ya no tiene este trabajo; es posible que haya terminado. Revise el proyecto antes de volver a ejecutarlo.");
+        assert.deepEqual(queue.getState().history.map(entry => entry.status), ["error"]);
+        assert.equal(queue.getState().history[0].costSoFar, 0.1);
+        assert.deepEqual(h.openedPaths, ["/fixture/game"]);
+        assert.equal(h.calls.filter(call => call === "translate").length, 1);
+        assert.ok(!h.calls.includes("validate"));
+        const finalItem = queue.getState().items[0];
+        JobSocket.instances.forEach(socket => socket.emit(terminal));
+        queue.getState().reconnectJob(); ctx.mock.timers.tick(60_000); await flushQueue();
+        assert.equal(JobSocket.instances.length, 4, "released waits must not reconnect");
+        assert.equal(queue.getState().items[0], finalItem, "late terminal frames cannot replace the unknown outcome");
+        await running;
+      } finally {
+        // Also settle the R1 waiter during the RED run so tests remain isolated.
+        if (queue.getState().activeJobId) {
+          h.cancelError = null; queue.getState().reconnectJob(); await flushQueue();
+          JobSocket.instances[JobSocket.instances.length - 1].emit({ type: "failed", error: "cancelled" });
+        }
+        await running;
+      }
+    });
+  }
+
+  test(`exhausted reconnect then cancel 500 keeps ownership and cancellation available (${locale})`, async ctx => {
+    ctx.mock.timers.enable({ apis: ["setTimeout"] });
+    setLocale(locale);
+    const running = startSocketQueue(); await flushQueue();
+    try {
+      await exhaustSocketRetries(ctx.mock.timers);
+      // A 500 must not release ownership, even if its body mentions the job.
+      h.cancelError = new ApiError("500: job not found");
+      queue.getState().cancelQueue(); await flushQueue();
+      assert.deepEqual(h.cancelledIds, ["job"]);
+      assert.equal(queue.getState().activeJobId, "job");
+      assert.equal(queue.getState().disconnected, true);
+      assert.equal(queue.getState().isRunning, true);
+      assert.equal(queue.getState().cancelRequested, true);
+      assert.deepEqual(queue.getState().items.map(i => i.status), ["translating", "pending"]);
+      assert.equal(queue.getState().items[0].error, null);
+      assert.deepEqual(queue.getState().history, []);
+      assert.deepEqual(h.openedPaths, ["/fixture/game"]);
+      assert.equal(h.calls.filter(call => call === "translate").length, 1);
+      assert.equal(JobSocket.instances.length, 4);
+      assert.ok(h.logs.some(([level, message]) => level === "error" && message === t("activity.queue.cancelFailed")));
+    } finally {
+      h.cancelError = null; queue.getState().cancelQueue(); await flushQueue();
+      assert.deepEqual(h.cancelledIds, ["job", "job"], "Cancel still targets the owned job after a 500");
+      JobSocket.instances[JobSocket.instances.length - 1].emit({ type: "failed", error: "cancelled" });
+      await running;
+    }
+    assert.deepEqual(queue.getState().items.map(i => i.status), ["cancelled", "pending"]);
+  });
+}

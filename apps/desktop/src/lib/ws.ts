@@ -1,3 +1,4 @@
+import { createTranslationJobConnection } from "./translationJobSession";
 import { recordTranslationWrite, translationWriteProjectKey } from "./translationWrites";
 import { getWsUrl, type WsChannel } from "./api";
 import type {
@@ -32,6 +33,7 @@ export interface JobHandlers {
 }
 
 interface WaitOptions {
+  onConnectionChange?: (disconnected: boolean) => void;
   onProgress?: (completed: number, total: number, costSoFar: number, costIsComplete: boolean) => void;
   onBatchFailed?: (e: ProgressEventBatchFailed) => void;
   onCompleted?: (e: ProgressEventCompleted) => void;
@@ -40,26 +42,38 @@ interface WaitOptions {
 /** Catalog key — UI renders via `t()`, tests assert on the code. */
 export const JOB_STREAM_LOST_MESSAGE = "ws.jobStreamLost" as const;
 
-export function waitForJob(jobId: string, opts?: WaitOptions): Promise<void> {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const unsub = subscribeToJob(jobId, {
-      onBatchCompleted: (e) => opts?.onProgress?.(e.completed, e.total, e.cost_so_far, e.cost_is_complete === true),
-      onBatchFailed: (e) => opts?.onBatchFailed?.(e),
-      onCompleted: (e) => settle(() => {
+/** Remains pending across transport loss, including exhausted automatic retries. */
+export interface JobWait extends Promise<void> {
+  reconnect: () => void;
+  /** Release the wait only after the caller confirms the server no longer owns the job. */
+  abandon: (error: Error) => void;
+}
+
+export function waitForJob(jobId: string, opts?: WaitOptions): JobWait {
+  let resolve!: () => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<void>((res, rej) => { resolve = res; reject = rej; });
+  const projectKey = translationWriteProjectKey();
+  const connection = createTranslationJobConnection({
+    subscribe: handlers => subscribeToJob(jobId, handlers, "translate", projectKey),
+    onConnectionChange: disconnected => opts?.onConnectionChange?.(disconnected),
+    handlers: {
+      onBatchCompleted: e => opts?.onProgress?.(e.completed, e.total, e.cost_so_far, e.cost_is_complete === true),
+      onBatchFailed: e => opts?.onBatchFailed?.(e),
+      onCompleted: e => {
         opts?.onCompleted?.(e);
         resolve();
-      }),
-      onFailed: (e) => settle(() => reject(new Error(e.error))),
-      onClosed: () =>
-        settle(() => reject(new Error(JOB_STREAM_LOST_MESSAGE))),
-    });
-    function settle(done: () => void) {
-      if (settled) return;
-      settled = true;
-      unsub();
-      done();
-    }
+      },
+      onFailed: e => reject(new Error(e.error)),
+    },
+  });
+  connection.connect();
+  return Object.assign(promise, {
+    reconnect: connection.reconnect,
+    abandon: (error: Error) => {
+      connection.stop();
+      reject(error);
+    },
   });
 }
 

@@ -16,15 +16,108 @@ import { addLog } from "../stores/logStore";
 import { useQueueStore, type GlobalProgress } from "../stores/queueStore";
 import { addToast } from "../stores/toastStore";
 
-let unsub: (() => void) | null = null;
+let connection: TranslationJobConnection | null = null;
 let subscribedJob: { jobId: string; projectKey: string } | null = null;
 let finished = false;
 let cancelRequested = false;
 let modalOpen = false;
-let retryTimer: ReturnType<typeof setTimeout> | null = null;
-let retrySubscription: (() => void) | null = null;
-let subscriptionVersion = 0;
 const RECONNECT_DELAYS = [1000, 2000, 4000];
+
+export interface TranslationJobConnection {
+  connect: () => void;
+  reconnect: () => void;
+  stop: () => void;
+}
+
+/** Shared translation transport lifecycle; job ownership ends only on a terminal event. */
+export function createTranslationJobConnection(opts: {
+  subscribe: (handlers: JobHandlers) => () => void;
+  handlers: JobHandlers;
+  onConnectionChange: (disconnected: boolean) => void;
+}): TranslationJobConnection {
+  let unsubscribe: (() => void) | null = null;
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
+  let version = 0;
+  let stopped = false;
+  let retryAttempt = 0;
+  let lastSequence = 0;
+  // Older servers have no sequences. Count occurrences so identical, distinct
+  // batch failures still count, while replay does not duplicate their effects.
+  const received = new Map<string, number>();
+  const closeSubscription = () => {
+    version++;
+    if (retryTimer !== null) clearTimeout(retryTimer);
+    retryTimer = null;
+    const close = unsubscribe;
+    unsubscribe = null;
+    close?.();
+  };
+  const stop = () => {
+    stopped = true;
+    closeSubscription();
+  };
+  const connect = () => {
+    if (stopped) return;
+    closeSubscription();
+    const subscriptionVersion = version;
+    const current = () => !stopped && subscriptionVersion === version;
+    let closed = false;
+    const replayed = new Map<string, number>();
+    const receive = <E,>(handler: ((event: E) => void) | undefined, terminal = false) => (event: E) => {
+      if (!current() || (closed && !terminal)) return;
+      opts.onConnectionChange(false);
+      const sequence = (event as { seq?: unknown })?.seq;
+      if (typeof sequence === "number" && Number.isSafeInteger(sequence) && sequence > 0) {
+        if (sequence <= lastSequence) return;
+        lastSequence = sequence;
+      } else {
+        const key = JSON.stringify(event);
+        const count = (replayed.get(key) ?? 0) + 1;
+        replayed.set(key, count);
+        if (count <= (received.get(key) ?? 0)) return;
+        received.set(key, count);
+      }
+      // Opens and old replay never replenish the bounded retry budget.
+      retryAttempt = 0;
+      if (terminal) stop();
+      handler?.(event);
+    };
+    unsubscribe = opts.subscribe({
+      onOpen: () => {
+        if (current() && !closed) opts.onConnectionChange(false);
+      },
+      onStarted: receive(opts.handlers.onStarted),
+      onBatchCompleted: receive(opts.handlers.onBatchCompleted),
+      onStringTranslated: receive(opts.handlers.onStringTranslated),
+      onProviderSwitched: receive(opts.handlers.onProviderSwitched),
+      onBatchFailed: receive(opts.handlers.onBatchFailed),
+      onCompleted: receive(opts.handlers.onCompleted, true),
+      onFailed: receive(opts.handlers.onFailed, true),
+      onClosed: () => {
+        if (!current() || closed) return;
+        closed = true;
+        opts.handlers.onClosed?.();
+        if (!current()) return;
+        // A terminal event already in flight can settle during backoff, until
+        // a replacement subscription takes over and invalidates this version.
+        const close = unsubscribe;
+        unsubscribe = null;
+        close?.();
+        opts.onConnectionChange(true);
+        const delay = RECONNECT_DELAYS[retryAttempt++];
+        if (delay !== undefined) retryTimer = setTimeout(connect, delay);
+      },
+    });
+  };
+  return {
+    connect, stop,
+    reconnect: () => {
+      if (stopped || unsubscribe) return;
+      retryAttempt = 0;
+      connect();
+    },
+  };
+}
 
 export function hasUnresolvedBatchFailures(failedBatches: number, translated: number, total: number): boolean {
   // Fallback providers can recover failed batches; an unknown total cannot prove recovery.
@@ -46,17 +139,12 @@ function patchSnapshot(
 }
 
 function stopSubscription(): void {
-  subscriptionVersion += 1;
-  if (retryTimer !== null) clearTimeout(retryTimer);
-  retryTimer = null;
-  const close = unsub;
-  unsub = null;
-  close?.();
+  connection?.stop();
+  connection = null;
 }
 
 function endJob(): void {
   stopSubscription();
-  retrySubscription = null;
   patchSnapshot({ disconnected: false });
   useEditorStore.getState().setTranslating(false);
   useEditorStore.getState().setJob(null);
@@ -96,12 +184,6 @@ export function attachTranslationJob(opts: {
   finished = false;
   cancelRequested = false;
   let batchFailures = { count: 0, lastReason: "" };
-  let retryAttempt = 0;
-  // The server replays the entire history. Keep occurrence counts across
-  // subscriptions: replay cannot repeat progress, logs or batch failures, but
-  // distinct failures with identical payloads still count separately. String
-  // events only update the preview; server batch/terminal totals own progress.
-  const received = new Map<string, number>();
 
   const editor = useEditorStore.getState();
   editor.setJob(opts.jobId);
@@ -249,66 +331,26 @@ export function attachTranslationJob(opts: {
     },
   };
 
-  const connect = () => {
-    stopSubscription();
-    const version = subscriptionVersion;
-    const current = () => !finished && subscribedJob === jobSession && version === subscriptionVersion;
-    let closed = false;
-    const replayed = new Map<string, number>();
-    const receive = <E,>(handler: (event: E) => void, terminal = false) => (event: E) => {
-      if (!current() || (closed && !terminal)) return;
-      patchSnapshot({ disconnected: false });
-      const key = JSON.stringify(event);
-      const count = (replayed.get(key) ?? 0) + 1;
-      replayed.set(key, count);
-      if (count <= (received.get(key) ?? 0)) return;
-      received.set(key, count);
-      // Only new events replenish the budget. Repeated opens/replays followed
-      // by a close must not create an unbounded reconnect loop.
-      retryAttempt = 0;
-      handler(event);
-    };
-    unsub = subscribeToJob(opts.jobId, {
-      onOpen: () => {
-        if (current() && !closed) patchSnapshot({ disconnected: false });
-      },
-      onStarted: receive(handlers.onStarted!),
-      onBatchCompleted: receive(handlers.onBatchCompleted!),
-      onStringTranslated: receive(handlers.onStringTranslated!),
-      onProviderSwitched: receive(handlers.onProviderSwitched!),
-      onBatchFailed: receive(handlers.onBatchFailed!),
-      onCompleted: receive(handlers.onCompleted!, true),
-      onFailed: receive(handlers.onFailed!, true),
+  connection = createTranslationJobConnection({
+    subscribe: handlers => subscribeToJob(opts.jobId, handlers, "translate", jobSession.projectKey),
+    onConnectionChange: disconnected => patchSnapshot({ disconnected }),
+    handlers: {
+      ...handlers,
       onClosed: () => {
-        if (!current() || closed) return;
-        closed = true;
-        // Preserve the existing close acknowledgement for requested cancels.
+        // Preserve the single-job session's existing cancel acknowledgement.
         if (cancelRequested) {
           finished = true;
           finishCancelledJob();
-          return;
         }
-        // A terminal result already in flight remains authoritative until a
-        // new subscription takes over. Ignore further closes and progress.
-        const close = unsub;
-        unsub = null;
-        close?.();
-        patchSnapshot({ disconnected: true });
-        const delay = RECONNECT_DELAYS[retryAttempt++];
-        if (delay !== undefined) retryTimer = setTimeout(connect, delay);
       },
-    }, "translate", jobSession.projectKey);
-  };
-  retrySubscription = () => {
-    retryAttempt = 0;
-    connect();
-  };
-  connect();
+    },
+  });
+  connection.connect();
 }
 
 export function reconnectTranslationJob(): void {
-  if (finished || unsub || !useEditorStore.getState().jobSnapshot?.disconnected) return;
-  retrySubscription?.();
+  if (finished || !useEditorStore.getState().jobSnapshot?.disconnected) return;
+  connection?.reconnect();
 }
 
 export function markTranslationCancelRequested(): void {

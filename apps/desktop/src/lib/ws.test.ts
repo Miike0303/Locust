@@ -7,6 +7,7 @@
  */
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
+import { test } from "node:test";
 
 globalThis.window ??= {} as any;
 
@@ -140,38 +141,6 @@ async function lastSocket(): Promise<FakeWebSocket> {
 	assert.equal(closed, false);
 }
 
-// 2. A close with no terminal event rejects waitForJob.
-{
-	reset();
-	const job = waitForJob("job-drop");
-	const socket = await lastSocket();
-	socket.emitClose();
-	await assert.rejects(job, (err: unknown) => {
-		assert.ok(err instanceof Error);
-		assert.equal(err.message, JOB_STREAM_LOST_MESSAGE);
-		return true;
-	});
-}
-
-// Socket error takes the same terminal path.
-{
-	reset();
-	const origError = console.error;
-	console.error = () => {};
-	try {
-		const job = waitForJob("job-error");
-		const socket = await lastSocket();
-		socket.emitError(new Error("boom"));
-		await assert.rejects(job, (err: unknown) => {
-			assert.ok(err instanceof Error);
-			assert.equal(err.message, JOB_STREAM_LOST_MESSAGE);
-			return true;
-		});
-	} finally {
-		console.error = origError;
-	}
-}
-
 // 3. A close arriving after completed leaves the resolved promise alone.
 {
 	reset();
@@ -185,25 +154,6 @@ async function lastSocket(): Promise<FakeWebSocket> {
 	});
 	socket.emitClose();
 	await job;
-}
-
-// getWsUrl rejection takes the same terminal path (hang fix).
-{
-	reset();
-	const origError = console.error;
-	console.error = () => {};
-	try {
-		(globalThis as any).__locustGetWsUrl = async () => {
-			throw new Error("port lookup failed");
-		};
-		await assert.rejects(waitForJob("job-url-fail"), (err: unknown) => {
-			assert.ok(err instanceof Error);
-			assert.equal(err.message, JOB_STREAM_LOST_MESSAGE);
-			return true;
-		});
-	} finally {
-		console.error = origError;
-	}
 }
 
 // Patch-apply channel: progress/done/error frames, and a drop without a
@@ -325,7 +275,6 @@ console.log("ws.test.ts: ok");
     unsub();
 }
 
-const { test } = await import("node:test");
 const { queryClient } = await import("./queryClient.ts");
 const { useProjectStore } = await import("../stores/projectStore.ts");
 const { draftProjectKey } = await import("./projectScope.ts");
@@ -426,3 +375,104 @@ for (const reconnect of ["automatic", "manual"] as const) {
     }
   });
 }
+
+test("waitForJob reconnects and ignores seen sequences before one terminal callback", async (ctx) => {
+  ctx.mock.timers.enable({ apis: ["setTimeout"] });
+  reset();
+  const progress: number[] = [];
+  const failures: string[] = [];
+  let terminals = 0;
+  let settled = false;
+  const job = waitForJob("job-replay", {
+    onProgress: n => progress.push(n), onBatchFailed: e => failures.push(e.error),
+    onCompleted: () => { terminals++; },
+  });
+  const result = job.then(() => { settled = true; }, () => { settled = true; });
+  await new Promise<void>(resolve => setImmediate(resolve));
+  const original = FakeWebSocket.instances[0];
+  const batch = { type: "batch_completed", seq: 2, completed: 1, total: 3, cost_so_far: 0.1 };
+  original.emitMessage({ type: "batch_failed", seq: 1, error: "provider unavailable" });
+  original.emitMessage(batch);
+  original.emitClose();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(settled, false, "transport loss must keep the wait pending");
+  ctx.mock.timers.tick(1000);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(FakeWebSocket.instances.length, 2);
+  const replay = FakeWebSocket.instances[1];
+  replay.emitMessage({ type: "batch_failed", seq: 1, error: "provider unavailable" });
+  // Sequence identity must work even if JSON field order or payload differs.
+  replay.emitMessage({ total: 3, cost_so_far: 9, completed: 99, seq: 2, type: "batch_completed" });
+  assert.deepEqual(progress, [1]);
+  assert.deepEqual(failures, ["provider unavailable"]);
+  assert.equal(terminals, 0);
+  const completed = { type: "completed", seq: 3, total_translated: 3, total_cost: 0.3 };
+  replay.emitMessage(completed); replay.emitMessage(completed); replay.emitClose();
+  await result;
+  assert.equal(terminals, 1);
+  ctx.mock.timers.tick(60_000);
+  assert.equal(FakeWebSocket.instances.length, 2);
+});
+
+for (const loss of ["close", "error", "url"] as const) {
+  test(`waitForJob bounds ${loss} retries and resumes the same pending wait manually`, async (ctx) => {
+    ctx.mock.timers.enable({ apis: ["setTimeout"] });
+    ctx.mock.method(console, "error", () => {});
+    reset();
+    let lookups = 0;
+    (globalThis as any).__locustGetWsUrl = async () => {
+      lookups++;
+      if (loss === "url") throw new Error("offline");
+      return "ws://fixture/job-owned";
+    };
+    const connections: boolean[] = [];
+    let settled = false;
+    const job = waitForJob("job-owned", { onConnectionChange: value => connections.push(value) });
+    const result = job.then(() => { settled = true; }, () => { settled = true; });
+    const flush = () => new Promise<void>(resolve => setImmediate(resolve));
+    const drop = () => {
+      const socket = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+      if (loss === "error") socket.emitError();
+      socket?.emitClose();
+    };
+    await flush(); if (loss !== "url") drop();
+    for (const delay of [1000, 2000, 4000]) {
+      ctx.mock.timers.tick(delay); await flush(); if (loss !== "url") drop();
+    }
+    ctx.mock.timers.tick(60_000); await flush();
+    assert.equal(lookups, 4);
+    assert.equal(settled, false);
+    assert.equal(connections[connections.length - 1], true);
+    (globalThis as any).__locustGetWsUrl = async () => { lookups++; return "ws://fixture/job-owned"; };
+    job.reconnect(); job.reconnect(); await flush();
+    assert.equal(lookups, 5, "manual reconnect must not overlap subscriptions");
+    FakeWebSocket.instances[FakeWebSocket.instances.length - 1].emitMessage({ type: "completed", seq: 4, total_translated: 1, total_cost: 0 });
+    await result;
+    assert.equal(connections[connections.length - 1], false);
+  });
+}
+
+test("waitForJob abandons a missing server job and suppresses retries and late events", async ctx => {
+  ctx.mock.timers.enable({ apis: ["setTimeout"] });
+  reset();
+  let terminals = 0;
+  const job = waitForJob("missing-job", { onCompleted: () => { terminals++; } });
+  const result = job.then(() => null, error => error);
+  const flush = () => new Promise<void>(resolve => setImmediate(resolve));
+  await flush();
+  const original = FakeWebSocket.instances[0];
+  original.emitClose();
+  const failure = new Error("job no longer retained");
+  try {
+    job.abandon(failure);
+    assert.equal(await result, failure);
+    job.reconnect(); ctx.mock.timers.tick(60_000); await flush();
+    original.emitMessage({ type: "completed", total_translated: 3, total_cost: 0.3 });
+    assert.equal(FakeWebSocket.instances.length, 1);
+    assert.equal(terminals, 0);
+  } finally {
+    job.reconnect(); await flush();
+    FakeWebSocket.instances[FakeWebSocket.instances.length - 1].emitMessage({ type: "failed", error: failure.message });
+    await result;
+  }
+});

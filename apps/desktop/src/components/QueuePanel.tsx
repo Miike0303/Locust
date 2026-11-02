@@ -123,6 +123,8 @@ export default function QueuePanel() {
 		setParams,
 		startQueue,
 		cancelQueue,
+		disconnected,
+		reconnectJob,
 	} = useQueueStore();
 	const { data: formats } = useQuery({ queryKey: ["formats"], queryFn: getFormats, enabled: isPanelOpen });
 	const { data: providers } = useQuery({
@@ -343,6 +345,16 @@ export default function QueuePanel() {
 				</header>
 
 				<div className={MODAL_BODY_CLASS}>
+					{isRunning && disconnected && (
+						<div role="status" className="m-4 p-3 rounded border border-warning bg-warning-muted text-body text-warning">
+							<p className="font-medium">{t("queue.connectionLost")}</p>
+							<p>{t("queue.connectionLostHint")}</p>
+							<button type="button" onClick={reconnectJob}
+								className="mt-2 px-3 py-1.5 border border-warning rounded font-medium focus:outline-none focus:ring-2 focus:ring-accent-fg">
+								{t("queue.reconnect")}
+							</button>
+						</div>
+					)}
 					{/* Queue list */}
 					{items.length === 0 ? (
 						<EmptyState

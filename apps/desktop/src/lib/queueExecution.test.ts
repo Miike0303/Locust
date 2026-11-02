@@ -8,6 +8,7 @@ import type { TranslationStartParams } from "./api.ts";
 // Keep the actual Zustand stores and session; replace only network and UI sinks.
 const h = {
   calls: [] as string[], toasts: [] as any[], logs: [] as any[], handlers: null as any,
+  waitOptions: null as any, cancelledIds: [] as string[],
   onOpen: () => {}, onWait: () => {},
   start: async () => ({ job_id: "job-1" }),
 };
@@ -38,11 +39,11 @@ registerHooks({
         export async function resumeProject(){throw new Error('plain fixture must not resume');}
         export async function openProject(path){h.calls.push('open');h.onOpen();return {project_path:path,project_name:'Fixture',format_id:'test',total_strings:3,supported_modes:[],database_path:'fixture.db',extraction_warnings:[]};}
         export async function startTranslation(){h.calls.push('start');return h.start();}
-        export async function cancelTranslation(){h.calls.push('cancel');}
+        export async function cancelTranslation(id){h.calls.push('cancel');h.cancelledIds.push(id);}
         export async function validate(){h.calls.push('validate');return {validation:{issues_found:0}};}`,
       "/src/lib/ws.ts": `const h=globalThis.__queueExecution;
         export const JOB_STREAM_LOST_MESSAGE='stream lost';
-        export async function waitForJob(id,options){h.calls.push('wait');options.onProgress(1,3,0.1,true);await h.onWait();}
+        export function waitForJob(id,options){h.calls.push('wait');h.waitOptions=options;options.onProgress(1,3,0.1,true);return Object.assign((async()=>{await h.onWait();})(),{reconnect(){h.calls.push('reconnect');}});}
         export function subscribeToJob(id,handlers){h.handlers=handlers;return()=>{};}`,
       "/src/stores/logStore.ts": `export function addLog(...args){globalThis.__queueExecution.logs.push(args);}`,
       "/src/stores/toastStore.ts": `export function addToast(...args){globalThis.__queueExecution.toasts.push(args);}`,
@@ -73,7 +74,7 @@ beforeEach(() => {
   if (session.subscribedTranslationJobId()) h.handlers.onFailed({ error: "cleanup" });
   queue.setState({ items: [], isRunning: false, cancelRequested: false, globalProgress: null, translationParams: params });
   editor.setState({ isTranslating: false, jobId: null, jobSnapshot: null });
-  h.calls = []; h.toasts = []; h.logs = []; h.handlers = null;
+  h.calls = []; h.toasts = []; h.logs = []; h.handlers = null; h.cancelledIds = []; h.waitOptions = null;
   h.onOpen = () => {}; h.onWait = () => {}; h.start = async () => ({ job_id: "job-1" });
   session.setTranslationModalOpen(true);
   setLocale("en");
@@ -264,5 +265,33 @@ for (const locale of ["en", "es"] as const) {
     assert.deepEqual(h.toasts, [["info", t("translate.toast.queueRunning")]]);
     assert.equal(editor.getState(), before);
     assert.equal(queue.getState().globalProgress, queueProgress);
+  });
+}
+
+for (const action of ["reconnect", "cancel"] as const) {
+  test(`disconnected queue blocks single starts and retains its ${action} control`, async () => {
+    const { startSingleTranslation } = await import("./translationStart.ts");
+    let finish!: () => void;
+    h.onWait = () => new Promise<void>(resolve => { finish = resolve; });
+    queue.getState().addItem("/fixture/first"); queue.getState().addItem("/fixture/next");
+    const running = queue.getState().startQueue();
+    for (let i = 0; i < 100 && !h.waitOptions; i++) await new Promise<void>(resolve => setImmediate(resolve));
+    try {
+      h.waitOptions.onConnectionChange(true);
+      assert.equal(queue.getState().activeJobId, "job-1");
+      assert.equal(queue.getState().disconnected, true);
+      assert.equal(await startSingleTranslation(params, opts), null);
+      assert.equal(h.calls.filter(c => c === "start").length, 1);
+      if (action === "cancel") {
+        queue.getState().cancelQueue(); await Promise.resolve();
+        assert.deepEqual(h.cancelledIds, ["job-1"]);
+      } else queue.getState().reconnectJob();
+      assert.equal(h.calls.filter(c => c === "reconnect").length, 1);
+      assert.equal(queue.getState().isRunning, true);
+      assert.equal(queue.getState().activeJobId, "job-1");
+    } finally {
+      queue.getState().cancelQueue(); finish(); await running;
+    }
+    assert.deepEqual(queue.getState().items.map(i => i.status), ["cancelled", "pending"]);
   });
 }

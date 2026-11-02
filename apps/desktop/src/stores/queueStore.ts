@@ -3,7 +3,7 @@ import { startTranslation, cancelTranslation, validate, type TranslationStartPar
 import { completeOpenProject, projectFromOpenResponse } from "../lib/openProjectFlow";
 import { invalidateProjectData, queryClient } from "../lib/queryClient";
 import { draftProjectKey } from "../lib/projectScope";
-import { waitForJob } from "../lib/ws";
+import { waitForJob, type JobWait } from "../lib/ws";
 import { useProjectStore } from "./projectStore";
 import { useEditorStore } from "./editorStore";
 import { canStartQueue } from "../lib/translationJob";
@@ -11,7 +11,7 @@ import { hasUnresolvedBatchFailures } from "../lib/translationJobSession";
 import { addLog } from "./logStore";
 import { addToast } from "./toastStore";
 import { t } from "../lib/i18n";
-import { localizeApiError } from "../lib/apiError";
+import { ApiError, localizeApiError, parseApiError } from "../lib/apiError";
 import { JOB_STREAM_LOST_MESSAGE } from "../lib/ws";
 import { MAX_QUEUE_HISTORY, readQueue, writeQueue, type QueueHistoryEntry } from "../lib/queuePersistence";
 import {
@@ -19,7 +19,10 @@ import {
   validationIssueCount,
 } from "../lib/queueValidation";
 
-let activeJobId: string | null = null;
+// Unlike a transport failure, a missing server job has no terminal replay to await.
+class QueueJobUnavailableError extends Error {}
+
+let activeJobWait: JobWait | null = null;
 let activeOpening: AbortController | null = null;
 
 export type QueueItemStatus = "pending" | "extracting" | "translating" | "validating" | "done" | "error" | "cancelled";
@@ -58,6 +61,8 @@ interface QueueStore {
   globalProgress: GlobalProgress | null;
   translationParams: TranslationStartParams | null;
   cancelRequested: boolean;
+  activeJobId: string | null;
+  disconnected: boolean;
 
   addItem: (path: string) => void;
   removeItem: (id: string) => void;
@@ -71,6 +76,7 @@ interface QueueStore {
   setGlobalProgress: (p: GlobalProgress | null) => void;
   startQueue: () => Promise<void>;
   cancelQueue: () => void;
+  reconnectJob: () => void;
 }
 
 const retryable = (item: QueueItem) => item.status === "error" || item.status === "cancelled";
@@ -85,6 +91,8 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
   isPanelOpen: false,
   globalProgress: null,
   cancelRequested: false,
+  activeJobId: null,
+  disconnected: false,
 
   addItem: (path) => {
     const name = path.split(/[\\/]/).filter(Boolean).pop() ?? path;
@@ -130,13 +138,23 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
   setPanelOpen: (isPanelOpen) => set({ isPanelOpen }),
   setGlobalProgress: (globalProgress) => set({ globalProgress }),
 
+  reconnectJob: () => { activeJobWait?.reconnect(); },
+
   cancelQueue: () => {
     set({ cancelRequested: true });
     activeOpening?.abort();
-    const jobId = activeJobId;
+    const jobId = get().activeJobId;
     if (!jobId) return;
-    void cancelTranslation(jobId).catch((err: any) => {
-      addLog("error", t("activity.queue.cancelFailed"), err.message ?? String(err), "queue");
+    void cancelTranslation(jobId).then(() => {
+      // Keep ownership until the terminal replay acknowledges cancellation.
+      if (get().activeJobId === jobId) get().reconnectJob();
+    }).catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      addLog("error", t("activity.queue.cancelFailed"), message, "queue");
+      const { status, body } = parseApiError(err instanceof ApiError ? err.raw : message);
+      if (get().activeJobId === jobId && (status === 404 || (status === null && body.trim() === "job not found"))) {
+        activeJobWait?.abandon(new QueueJobUnavailableError(t("queue.jobOutcomeUnknown")));
+      }
     });
   },
 
@@ -152,8 +170,7 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
       return;
     }
 
-    set({ isRunning: true, cancelRequested: false });
-    activeJobId = null;
+    set({ isRunning: true, cancelRequested: false, activeJobId: null, disconnected: false });
     const pending = items.filter((i) => i.status === "pending");
     const partialItemIds = new Set<string>();
     addLog("info", t("activity.queue.started", { count: pending.length }), undefined, "queue");
@@ -241,7 +258,7 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
         }));
 
         const job = await startTranslation(translationParams);
-        activeJobId = job.job_id;
+        set({ activeJobId: job.job_id });
         jobProjectKey = draftProjectKey(projectFromOpenResponse(result));
         let failedBatches = 0;
         let lastBatchReason = "";
@@ -257,7 +274,8 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
         try {
           if (get().cancelRequested) get().cancelQueue();
           // Step 3: Wait for completion
-          await waitForJob(job.job_id, {
+          const waiting = waitForJob(job.job_id, {
+            onConnectionChange: disconnected => set({ disconnected }),
             onProgress: updateProgress,
             onBatchFailed: (e) => {
               failedBatches++;
@@ -274,8 +292,11 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
                 e.total_cost, e.cost_is_complete === true);
             },
           });
+          activeJobWait = waiting;
+          await waiting;
         } finally {
-          activeJobId = null;
+          activeJobWait = null;
+          set({ activeJobId: null, disconnected: false });
         }
 
         if (get().cancelRequested) {
@@ -335,7 +356,7 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
           addToast("warning", t("queue.toast.validationFailed", { name: result.project_name }));
         }
       } catch (err: any) {
-        if (get().cancelRequested) {
+        if (get().cancelRequested && !(err instanceof QueueJobUnavailableError)) {
           markCancelled();
         } else {
           const raw = err.message ?? String(err);
