@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 
 use crate::archive_replace::{guard_target, note_backups, replace_files};
 use locust_core::error::{LocustError, Result};
-use locust_core::extraction::{FormatPlugin, InjectionReport};
+use locust_core::extraction::{Extraction, FormatPlugin, InjectionReport};
 use locust_core::models::{
     OutputMode, StringEntry, YURIS_LITERAL_METADATA_KEY, YURIS_QUOTED_LITERAL_V1,
 };
@@ -1625,6 +1625,10 @@ impl FormatPlugin for YurisPlugin {
     }
 
     fn extract(&self, path: &Path) -> Result<Vec<StringEntry>> {
+        Ok(self.extract_with_diagnostics(path)?.entries)
+    }
+
+    fn extract_with_diagnostics(&self, path: &Path) -> Result<Extraction> {
         let root = Self::root_dir(path);
         let ybn_files = Self::find_ybn_files(path);
         let ypf_files = Self::find_ypf_files(path);
@@ -1637,6 +1641,7 @@ impl FormatPlugin for YurisPlugin {
         }
 
         let mut all = Vec::new();
+        let mut warnings = Vec::new();
 
         for fpath in &ybn_files {
             let bytes = std::fs::read(fpath)?;
@@ -1673,6 +1678,7 @@ impl FormatPlugin for YurisPlugin {
                     ypf_parse_errors += 1;
                     last_ypf_err = e.to_string();
                     warn!(archive = %arch_rel, error = %e, "failed to open YPF");
+                    warnings.push(format!("skipped YPF archive {arch_rel}: {e}"));
                     continue;
                 }
             };
@@ -1690,6 +1696,7 @@ impl FormatPlugin for YurisPlugin {
                 .and_then(|b| parse_commands(&b));
             for entry in archive.ybn_entries() {
                 ybn_seen += 1;
+                let rel = format!("{arch_rel}/{}", entry.name.replace('\\', "/"));
                 let payload = match archive.read_entry(entry) {
                     Ok(p) => p,
                     Err(e) => {
@@ -1699,11 +1706,13 @@ impl FormatPlugin for YurisPlugin {
                             error = %e,
                             "YPF .ybn read failed; skipped"
                         );
+                        warnings.push(format!(
+                            "skipped YPF .ybn member {rel}: failed to read member: {e}"
+                        ));
                         ybn_skipped += 1;
                         continue;
                     }
                 };
-                let rel = format!("{arch_rel}/{}", entry.name.replace('\\', "/"));
                 let virtual_path = PathBuf::from(&rel);
                 match entries_with_commands(&payload, &rel, virtual_path, commands.as_ref()) {
                     Ok(entries) => all.extend(entries),
@@ -1714,6 +1723,9 @@ impl FormatPlugin for YurisPlugin {
                             error = %e,
                             "YPF .ybn YSTB parse failed; skipped"
                         );
+                        warnings.push(format!(
+                            "skipped YPF .ybn member {rel}: YSTB parse failed: {e}"
+                        ));
                         ybn_skipped += 1;
                     }
                 }
@@ -1741,7 +1753,11 @@ impl FormatPlugin for YurisPlugin {
             }
         }
 
-        Ok(all)
+        Ok(Extraction {
+            complete: warnings.is_empty(),
+            entries: all,
+            warnings,
+        })
     }
 
     fn inject(&self, path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {

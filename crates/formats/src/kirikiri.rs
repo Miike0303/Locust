@@ -36,7 +36,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use locust_core::error::{LocustError, Result};
-use locust_core::extraction::{FormatPlugin, InjectionReport};
+use locust_core::extraction::{Extraction, FormatPlugin, InjectionReport};
 use locust_core::models::{OutputMode, StringEntry};
 use tracing::warn;
 
@@ -1625,6 +1625,10 @@ impl FormatPlugin for KirikiriPlugin {
     }
 
     fn extract(&self, path: &Path) -> Result<Vec<StringEntry>> {
+        Ok(self.extract_with_diagnostics(path)?.entries)
+    }
+
+    fn extract_with_diagnostics(&self, path: &Path) -> Result<Extraction> {
         let root = Self::root_dir(path);
         let ks_files = Self::find_ks_files(path);
         let xp3_files = Self::find_top_level_xp3(path);
@@ -1651,7 +1655,8 @@ impl FormatPlugin for KirikiriPlugin {
         let mut xp3_parse_errors = 0usize;
         let mut last_xp3_err = String::new();
         let mut xp3_ks_seen = 0usize;
-        let mut xp3_skipped = 0usize;
+        let mut warnings = Vec::new();
+        let mut skipped_scripts = Vec::new();
         // (rel virtual path, archive path, first entry with that name)
         let mut xp3_cands: Vec<(String, PathBuf, Xp3Entry)> = Vec::new();
         let mut open_archives: HashMap<PathBuf, Xp3Archive> = HashMap::new();
@@ -1668,6 +1673,9 @@ impl FormatPlugin for KirikiriPlugin {
                     xp3_parse_errors += 1;
                     last_xp3_err = e.to_string();
                     warn!(archive = %arch_path.display(), error = %e, "failed to open XP3");
+                    // Without a readable index, the lost script keys are unknown;
+                    // another source cannot prove that every member is covered.
+                    warnings.push(format!("skipped XP3 archive {arch_name}: {e}"));
                     continue;
                 }
             };
@@ -1697,7 +1705,7 @@ impl FormatPlugin for KirikiriPlugin {
             let bytes = std::fs::read(fpath)?;
             let decoded = decode_ks_bytes(&bytes, rel)?;
             if !looks_like_readable_ks(&decoded.text) {
-                warn!(script = %rel, "loose .ks decoded to non-script bytes; skipped");
+                skipped_scripts.push((rel.clone(), "decoded to non-script bytes".to_string()));
                 continue;
             }
             readable.push((rel.clone(), fpath.clone(), decoded.text));
@@ -1707,20 +1715,10 @@ impl FormatPlugin for KirikiriPlugin {
             let Some(archive) = open_archives.get(arch_path) else {
                 continue;
             };
-            let arch_name = arch_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("archive.xp3");
             let payload = match archive.read_entry(entry) {
                 Ok(p) => p,
                 Err(e) => {
-                    warn!(
-                        archive = %arch_name,
-                        entry = %entry.name,
-                        error = %e,
-                        "failed to read XP3 .ks entry; skipped"
-                    );
-                    xp3_skipped += 1;
+                    skipped_scripts.push((rel.clone(), format!("failed to read member: {e}")));
                     continue;
                 }
             };
@@ -1730,27 +1728,36 @@ impl FormatPlugin for KirikiriPlugin {
                     readable.push((rel.clone(), virtual_path, decoded.text));
                 }
                 Ok(_) => {
-                    warn!(
-                        archive = %arch_name,
-                        entry = %entry.name,
-                        "XP3 .ks decoded to non-script bytes (cxdec/encrypted?); skipped"
-                    );
-                    xp3_skipped += 1;
+                    skipped_scripts.push((
+                        rel.clone(),
+                        "decoded to non-script bytes (cxdec/encrypted?)".to_string(),
+                    ));
                 }
                 Err(e) => {
-                    warn!(
-                        archive = %arch_name,
-                        entry = %entry.name,
-                        error = %e,
-                        "XP3 .ks payload did not decode as text (cxdec/encrypted?); skipped"
-                    );
-                    xp3_skipped += 1;
+                    skipped_scripts.push((
+                        rel.clone(),
+                        format!("payload did not decode as text (cxdec/encrypted?): {e}"),
+                    ));
                 }
             }
         }
 
         let readable_rels: Vec<String> = readable.iter().map(|(r, _, _)| r.clone()).collect();
         let winners = select_best_script_rels(&readable_rels);
+        // Coverage is by decoded script identity, even when the substitute has
+        // no dialogue. Encrypted copies must not prevent authoritative refreshes
+        // when a plaintext dump or patch supplies the same normalized key.
+        let readable_keys: std::collections::HashSet<_> = readable_rels
+            .iter()
+            .map(|rel| normalize_script_key(rel))
+            .collect();
+        for (rel, reason) in skipped_scripts {
+            if !readable_keys.contains(&normalize_script_key(&rel)) {
+                let message = format!("skipped KiriKiri .ks script {rel}: {reason}");
+                warn!("{message}");
+                warnings.push(message);
+            }
+        }
 
         let mut all = Vec::new();
         for (rel, src_path, text) in &readable {
@@ -1772,15 +1779,13 @@ impl FormatPlugin for KirikiriPlugin {
                     "no .ks scripts found in top-level XP3 archives",
                 ));
             }
-            if xp3_skipped > 0 {
-                warn!(
-                    skipped = xp3_skipped,
-                    "all XP3 .ks entries were skipped (decode/read failures)"
-                );
-            }
         }
 
-        Ok(all)
+        Ok(Extraction {
+            complete: warnings.is_empty(),
+            entries: all,
+            warnings,
+        })
     }
 
     fn inject(&self, path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
