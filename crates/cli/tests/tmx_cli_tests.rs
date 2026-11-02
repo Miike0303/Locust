@@ -101,6 +101,17 @@ fn profile_error(message: &str) -> String {
 }
 
 // Build the complete expected public snapshot independently of the importer.
+fn without_revision(snapshot: &Value) -> Value {
+    // The content epoch is random per database and the revision counts every
+    // write, so synthetic expectations compare content only. Snapshot-to-snapshot
+    // comparisons keep both fields, which also proves refused imports wrote nothing.
+    let mut snapshot = snapshot.clone();
+    let stats = snapshot["stats"].as_object_mut().unwrap();
+    stats.remove("content_epoch");
+    stats.remove("content_revision");
+    snapshot
+}
+
 fn expected_snapshot(rows: &[StringEntry]) -> Value {
     let mut rows = rows.to_vec();
     rows.sort_by(|a, b| a.id.cmp(&b.id));
@@ -155,7 +166,7 @@ fn tmx_public_cli_roundtrip_preserves_exact_identity_and_approved_noop() {
     )];
     let f = Fixture::new(&rows);
     let before = f.snapshot();
-    assert_eq!(before, expected_snapshot(&rows));
+    assert_eq!(without_revision(&before), expected_snapshot(&rows));
     result(
         f.command("export", "tmx")
             .args(["--source-lang", "en", "-o"])
@@ -435,7 +446,7 @@ fn preview_keep_existing_confirmation_and_reimport_match_full_public_snapshots()
         ];
         let f = Fixture::new(&rows);
         let before = f.snapshot();
-        assert_eq!(before, expected_snapshot(&rows));
+        assert_eq!(without_revision(&before), expected_snapshot(&rows));
         f.catalog(&[
             row("blank", "Blank", Some("Blanco")),
             row("confirm", "Current", Some("Anterior")),
@@ -499,7 +510,7 @@ fn preview_keep_existing_confirmation_and_reimport_match_full_public_snapshots()
             entry.translated_at = Some(time);
             entry.metadata.remove(STALE_TRANSLATION_METADATA_KEY);
         }
-        assert_eq!(after, expected_snapshot(&rows));
+        assert_eq!(without_revision(&after), expected_snapshot(&rows));
         result(
             f.import(&extra),
             0,
