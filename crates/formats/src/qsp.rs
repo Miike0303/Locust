@@ -24,7 +24,7 @@
 //! password cracking, full QSP script AST (code fields keep source for inject;
 //! quoted player-visible literals are extracted heuristically).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -420,20 +420,93 @@ fn scan_quoted_literal(chars: &[char], start: usize) -> (String, usize) {
     (buf, i)
 }
 
-/// Pull double-quoted and single-quoted string literals from a QSP code block.
-fn extract_quoted_literals(code: &str) -> Vec<String> {
+fn location_names(game: &QspGame) -> HashSet<String> {
+    game.locations
+        .iter()
+        .map(|location| location.name.to_lowercase())
+        .collect()
+}
+
+/// Retain a slot for every historically player-visible literal. Protected slots
+/// are None, so removing executable references never renumbers later row IDs.
+fn extract_quoted_literals(code: &str, locations: &HashSet<String>) -> Vec<Option<String>> {
     let mut out = Vec::new();
     let chars: Vec<char> = code.chars().collect();
     let mut i = 0;
+    let mut statement_start = true;
+    let mut depth = 0usize;
+    // (parenthesis depth of first argument, protect only simple identifiers).
+    // An outer first argument remains protected across nested calls/commas.
+    let mut first_arguments: Vec<(usize, bool)> = Vec::new();
     while i < chars.len() {
-        let q = chars[i];
-        if q == '"' || q == '\'' {
+        let ch = chars[i];
+        if ch == '"' || ch == '\'' {
             let (buf, end) = scan_quoted_literal(&chars, i);
             i = end;
             if looks_player_visible(&buf) {
-                out.push(buf);
+                let identifier = buf.chars().all(|c| c.is_alphanumeric() || c == '_');
+                let protected = locations.contains(&buf.to_lowercase())
+                    || first_arguments
+                        .iter()
+                        .any(|&(_, identifiers_only)| !identifiers_only || identifier);
+                out.push((!protected).then_some(buf));
             }
+            statement_start = false;
+        } else if ch.is_alphanumeric() || ch == '_' || ch == '$' {
+            let start = i;
+            while i < chars.len()
+                && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '$')
+            {
+                i += 1;
+            }
+            let token: String = chars[start..i].iter().collect();
+            let token = token.to_ascii_lowercase();
+            if token == "else" {
+                first_arguments.clear();
+                statement_start = true;
+                continue;
+            }
+            let next = chars[i..]
+                .iter()
+                .find(|c| !c.is_whitespace() || matches!(c, '\r' | '\n'));
+            let command = statement_start
+                && matches!(
+                    token.as_str(),
+                    "gt" | "goto" | "xgt" | "xgoto" | "gs" | "gosub" | "dynamic"
+                );
+            let function = matches!(token.as_str(), "func" | "$func" | "dyneval" | "$dyneval")
+                && matches!(next, Some('(' | '\'' | '"'));
+            if command || function {
+                let argument_depth = depth + usize::from(next == Some(&'('));
+                // DYNAMIC/DYNEVAL take code, not a location name. Only treat
+                // their simple symbolic literals as identifiers here.
+                let identifiers_only = matches!(token.as_str(), "dynamic" | "dyneval" | "$dyneval");
+                first_arguments.push((argument_depth, identifiers_only));
+            }
+            statement_start = false;
         } else {
+            match ch {
+                '\r' | '\n' | '&' | ':' => {
+                    first_arguments.clear();
+                    depth = 0;
+                    statement_start = true;
+                }
+                '(' => {
+                    depth += 1;
+                    statement_start = false;
+                }
+                ')' => {
+                    first_arguments.retain(|&(argument_depth, _)| argument_depth < depth);
+                    depth = depth.saturating_sub(1);
+                    statement_start = false;
+                }
+                ',' => {
+                    first_arguments.retain(|&(argument_depth, _)| argument_depth < depth);
+                    statement_start = false;
+                }
+                c if c.is_whitespace() => {}
+                _ => statement_start = false,
+            }
             i += 1;
         }
     }
@@ -458,6 +531,7 @@ fn looks_player_visible(s: &str) -> bool {
 
 fn game_to_entries(game: &QspGame, filename: &str, file_path: &Path) -> Vec<StringEntry> {
     let mut entries = Vec::new();
+    let locations = location_names(game);
     for (li, loc) in game.locations.iter().enumerate() {
         if looks_player_visible(&loc.description) {
             let id = format!("{filename}#loc{li}#desc");
@@ -466,7 +540,11 @@ fn game_to_entries(game: &QspGame, filename: &str, file_path: &Path) -> Vec<Stri
             e.context = Some(format!("location:{}", loc.name));
             entries.push(e);
         }
-        for (qi, lit) in extract_quoted_literals(&loc.code).into_iter().enumerate() {
+        for (qi, lit) in extract_quoted_literals(&loc.code, &locations)
+            .into_iter()
+            .enumerate()
+        {
+            let Some(lit) = lit else { continue };
             let id = format!("{filename}#loc{li}#code#str{qi}");
             let mut e = StringEntry::new(id, &lit, file_path.to_path_buf());
             e.tags = vec!["code_string".into()];
@@ -481,7 +559,11 @@ fn game_to_entries(game: &QspGame, filename: &str, file_path: &Path) -> Vec<Stri
                 e.context = Some(format!("location:{} action", loc.name));
                 entries.push(e);
             }
-            for (qi, lit) in extract_quoted_literals(&act.code).into_iter().enumerate() {
+            for (qi, lit) in extract_quoted_literals(&act.code, &locations)
+                .into_iter()
+                .enumerate()
+            {
+                let Some(lit) = lit else { continue };
                 let id = format!("{filename}#loc{li}#act{ai}#code#str{qi}");
                 let mut e = StringEntry::new(id, &lit, file_path.to_path_buf());
                 e.tags = vec!["code_string".into()];
@@ -494,6 +576,7 @@ fn game_to_entries(game: &QspGame, filename: &str, file_path: &Path) -> Vec<Stri
 }
 
 fn apply_translations(game: &mut QspGame, entries: &[&StringEntry]) {
+    let locations = location_names(game);
     let mut by_suffix: HashMap<String, &str> = HashMap::new();
     for e in entries {
         if let Some(t) = e.translation.as_deref() {
@@ -508,9 +591,10 @@ fn apply_translations(game: &mut QspGame, entries: &[&StringEntry]) {
         if let Some(t) = by_suffix.get(&desc_key) {
             loc.description = (*t).to_string();
         }
-        let mut code_lits = extract_quoted_literals(&loc.code);
+        let mut code_lits = extract_quoted_literals(&loc.code, &locations);
         let mut changed = false;
         for (qi, lit) in code_lits.iter_mut().enumerate() {
+            let Some(lit) = lit else { continue };
             let key = format!("loc{li}#code#str{qi}");
             if let Some(t) = by_suffix.get(&key) {
                 *lit = (*t).to_string();
@@ -526,9 +610,10 @@ fn apply_translations(game: &mut QspGame, entries: &[&StringEntry]) {
             if let Some(t) = by_suffix.get(&name_key) {
                 act.name = (*t).to_string();
             }
-            let mut act_lits = extract_quoted_literals(&act.code);
+            let mut act_lits = extract_quoted_literals(&act.code, &locations);
             let mut act_changed = false;
             for (qi, lit) in act_lits.iter_mut().enumerate() {
+                let Some(lit) = lit else { continue };
                 let key = format!("loc{li}#act{ai}#code#str{qi}");
                 if let Some(t) = by_suffix.get(&key) {
                     *lit = (*t).to_string();
@@ -548,13 +633,14 @@ fn validated_translations<'a>(
     entries: &[&'a StringEntry],
     report: &mut InjectionReport,
 ) -> Vec<&'a StringEntry> {
+    let locations = location_names(game);
     let mut seen = std::collections::HashSet::new();
     let mut accepted = Vec::new();
     for entry in entries.iter().rev() {
         let reason = if entry.translation.is_none() {
             "untranslated"
         } else if let Some((_, suffix)) = entry.id.split_once("#loc") {
-            match qsp_locator_target(game, suffix) {
+            match qsp_locator_target(game, suffix, &locations) {
                 Err(reason) => reason,
                 Ok(source) if source != entry.source => "source_changed",
                 Ok(_) if !seen.insert(suffix) => "duplicate",
@@ -572,7 +658,11 @@ fn validated_translations<'a>(
     accepted
 }
 
-fn qsp_locator_target(game: &QspGame, suffix: &str) -> std::result::Result<String, &'static str> {
+fn qsp_locator_target(
+    game: &QspGame,
+    suffix: &str,
+    locations: &HashSet<String>,
+) -> std::result::Result<String, &'static str> {
     fn index(value: &str) -> std::result::Result<usize, &'static str> {
         let index: usize = value.parse().map_err(|_| "invalid_locator")?;
         if index.to_string() != value {
@@ -608,15 +698,16 @@ fn qsp_locator_target(game: &QspGame, suffix: &str) -> std::result::Result<Strin
     };
     let (code, literal) = code.ok_or("invalid_locator")?;
     let literal = index(literal.strip_prefix("str").ok_or("invalid_locator")?)?;
-    extract_quoted_literals(code)
+    extract_quoted_literals(code, locations)
         .get(literal)
         .cloned()
+        .flatten()
         .ok_or("target_missing")
 }
 
 /// Rewrite quoted literals in `code` left-to-right with `replacements`
-/// (same order / filter as [`extract_quoted_literals`]).
-fn replace_quoted_in_order(code: &str, replacements: &[String]) -> String {
+/// (same slots as [`extract_quoted_literals`]); None copies protected text verbatim.
+fn replace_quoted_in_order(code: &str, replacements: &[Option<String>]) -> String {
     let chars: Vec<char> = code.chars().collect();
     let mut out = String::new();
     let mut i = 0;
@@ -627,14 +718,15 @@ fn replace_quoted_in_order(code: &str, replacements: &[String]) -> String {
             let start = i;
             let (buf, end) = scan_quoted_literal(&chars, start);
             i = end;
-            if looks_player_visible(&buf) && rep_i < replacements.len() {
-                if replacements[rep_i] == buf {
+            if looks_player_visible(&buf) {
+                let replacement = replacements.get(rep_i).and_then(Option::as_deref);
+                rep_i += 1;
+                let Some(replacement) = replacement.filter(|text| *text != buf) else {
                     out.extend(chars[start..i].iter());
-                    rep_i += 1;
                     continue;
-                }
+                };
                 out.push(q);
-                for c in replacements[rep_i].chars() {
+                for c in replacement.chars() {
                     if c == q {
                         out.push(q);
                         out.push(q);
@@ -643,7 +735,6 @@ fn replace_quoted_in_order(code: &str, replacements: &[String]) -> String {
                     }
                 }
                 out.push(q);
-                rep_i += 1;
             } else {
                 for ch in &chars[start..i] {
                     out.push(*ch);
@@ -1119,46 +1210,268 @@ mod tests {
         dir.to_path_buf()
     }
 
+    fn create_qsp_reference_fixture(dir: &Path, code: &str, action_code: &str) -> PathBuf {
+        let path = dir.join("game.qsp");
+        let mut records = fixture_records();
+        records[4] = encode_field("Bedroom");
+        records[5] = encode_field("");
+        records[6] = encode_field(code);
+        records[9] = encode_field("");
+        records[10] = encode_field(action_code);
+        fs::write(&path, write_u16le_units(&join_records(&records))).unwrap();
+        path
+    }
+
+    #[test]
+    fn qsp_references_extract_only_display_literals() {
+        let dir = tempdir();
+        let code = concat!(
+            "gt 'Bedroom' & 'You enter the room.'\r\n",
+            "GOTO \"Bedroom\" & *pl \"Hello\"\r\n",
+            "gs 'Shop', 1 & act 'Look around': msg 'Pick a direction.'\r\n",
+            "xgt 'Bedroom' & gosub 'helper'\r\n",
+            "GT 'UpperTarget' & Gt 'MixedTarget' & XGOTO 'RemoteTarget'",
+        );
+        let path = create_qsp_reference_fixture(dir.path(), code, "");
+        let entries = QspPlugin::new().extract(&path).unwrap();
+        let rows: Vec<_> = entries
+            .iter()
+            .map(|e| (e.id.as_str(), e.source.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("game.qsp#loc0#code#str1", "You enter the room."),
+                ("game.qsp#loc0#code#str3", "Hello"),
+                ("game.qsp#loc0#code#str5", "Look around"),
+                ("game.qsp#loc0#code#str6", "Pick a direction."),
+            ]
+        );
+    }
+
+    #[test]
+    fn qsp_references_keep_display_row_ids_after_protected_literals() {
+        let dir = tempdir();
+        let code = "'123' & gt 'Shop' & '' & 'x' & *pl 'After the jump.'";
+        let path = create_qsp_reference_fixture(dir.path(), code, code);
+        let entries = QspPlugin::new().extract(&path).unwrap();
+        let rows: Vec<_> = entries
+            .iter()
+            .map(|e| (e.id.as_str(), e.source.as_str()))
+            .collect();
+        // Only literals passing the historical visibility filter consume IDs.
+        assert_eq!(
+            rows,
+            vec![
+                ("game.qsp#loc0#code#str1", "After the jump."),
+                ("game.qsp#loc0#act0#code#str1", "After the jump."),
+            ]
+        );
+    }
+
+    #[test]
+    fn qsp_references_protect_location_names_in_any_expression() {
+        let dir = tempdir();
+        let code = concat!(
+            "if $curloc = 'bEdRoOm': msg 'You are home.'\r\n",
+            "$destination = \"BEDROOM\" & *pl 'Bedroom'\r\n",
+            "msg 'Bedroom window' & msg 'Your bedroom is quiet.'",
+        );
+        let action_code = "if 'bedROOM' = $CURLOC: *pl 'Action text.'";
+        let path = create_qsp_reference_fixture(dir.path(), code, action_code);
+        let entries = QspPlugin::new().extract(&path).unwrap();
+        let sources: Vec<_> = entries.iter().map(|e| e.source.as_str()).collect();
+        assert_eq!(
+            sources,
+            [
+                "You are home.",
+                "Bedroom window",
+                "Your bedroom is quiet.",
+                "Action text.",
+            ]
+        );
+    }
+
+    #[test]
+    fn qsp_references_only_protect_first_call_argument() {
+        let dir = tempdir();
+        let code = concat!(
+            "gs 'Shop', 'Welcome to the shop.' & gosub('helper', 'Please wait.')\r\n",
+            "$result = FUNC('calculate', 'Visible argument')\r\n",
+            "*pl $FuNc ( 'describe', 'Another argument')\r\n",
+            "dynamic 'helper_id', 'Dynamic argument'\r\n",
+            "$result = $dyneval('helper_id', 'Evaluation argument')\r\n",
+            "msg 'A dynamic story.' & $myfunc = 'Ordinary text.'",
+        );
+        let path = create_qsp_reference_fixture(dir.path(), code, "");
+        let entries = QspPlugin::new().extract(&path).unwrap();
+        let sources: Vec<_> = entries.iter().map(|e| e.source.as_str()).collect();
+        assert_eq!(
+            sources,
+            [
+                "Welcome to the shop.",
+                "Please wait.",
+                "Visible argument",
+                "Another argument",
+                "Dynamic argument",
+                "Evaluation argument",
+                "A dynamic story.",
+                "Ordinary text.",
+            ]
+        );
+    }
+
+    #[test]
+    fn qsp_references_handle_inline_blocks_and_doubled_quotes() {
+        let dir = tempdir();
+        let code = concat!(
+            "if ready: Gt 'Guest''s room' & *pl 'Don''t go & hide.'\r\n",
+            "act \"Look & listen\": XGoTo \"The \"\"annex\"\"\" & msg \"Say \"\"hi\"\"\"\r\n",
+            "if ready: gs 'helper': else: goto 'Fallback' & 'Keep reading.'",
+        );
+        let path = create_qsp_reference_fixture(dir.path(), code, "");
+        let entries = QspPlugin::new().extract(&path).unwrap();
+        let sources: Vec<_> = entries.iter().map(|e| e.source.as_str()).collect();
+        assert_eq!(
+            sources,
+            [
+                "Don't go & hide.",
+                "Look & listen",
+                "Say \"hi\"",
+                "Keep reading."
+            ]
+        );
+    }
+
+    #[test]
+    fn qsp_references_inject_display_and_ignore_legacy_destination_rows() {
+        let dir = tempdir();
+        let code = concat!(
+            "gt 'Bedroom' & 'You enter the room.' & GOTO \"Bedroom\" & *pl \"Hello\"\r\n",
+            "gs 'Shop', 1 & act 'Look around': msg 'Don''t go & hide.'\r\n",
+            "xgt 'Bedroom' & gosub 'helper' & GT 'Guest''s room' & Gt \"The \"\"annex\"\"\"",
+        );
+        let action_code = "xgoto 'Bedroom' & msg 'Action text.'";
+        let path = create_qsp_reference_fixture(dir.path(), code, action_code);
+        let mut entries = Vec::new();
+        // Include old DB rows, with matching sources, for every protected ID.
+        for (suffix, source, translation) in [
+            ("code#str0", "Bedroom", "Dormitorio"),
+            (
+                "code#str1",
+                "You enter the room.",
+                "Entras en la habitación.",
+            ),
+            ("code#str2", "Bedroom", "Dormitorio"),
+            ("code#str3", "Hello", "Hola"),
+            ("code#str4", "Shop", "Tienda"),
+            ("code#str5", "Look around", "Mirar alrededor"),
+            ("code#str6", "Don't go & hide.", "L'ami & reste."),
+            ("code#str7", "Bedroom", "Dormitorio"),
+            ("code#str8", "helper", "ayudante"),
+            ("code#str9", "Guest's room", "Habitación"),
+            ("code#str10", "The \"annex\"", "El anexo"),
+            ("act0#code#str0", "Bedroom", "Dormitorio"),
+            ("act0#code#str1", "Action text.", "Texto de acción."),
+        ] {
+            let mut entry =
+                StringEntry::new(format!("game.qsp#loc0#{suffix}"), source, path.clone());
+            entry.translation = Some(translation.into());
+            entries.push(entry);
+        }
+        let report = QspPlugin::new().inject(&path, &entries).unwrap();
+        assert_eq!((report.files_modified, report.strings_written), (1, 5));
+        assert_eq!(report.strings_skipped, 8);
+        assert_eq!(report.skip_reasons.get("target_missing"), Some(&8));
+        let mut expected = fixture_records();
+        expected[4] = encode_field("Bedroom");
+        expected[5] = encode_field("");
+        expected[6] = encode_field(
+            &code
+                .replace("You enter the room.", "Entras en la habitación.")
+                .replace("Hello", "Hola")
+                .replace("Look around", "Mirar alrededor")
+                .replace("Don''t go & hide.", "L''ami & reste."),
+        );
+        expected[9] = encode_field("");
+        expected[10] = encode_field("xgoto 'Bedroom' & msg 'Texto de acción.'");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            write_u16le_units(&join_records(&expected))
+        );
+    }
+
+    #[test]
+    fn qsp_references_legacy_rows_alone_leave_file_byte_identical() {
+        let dir = tempdir();
+        let code = "gt 'Shop' & if $curloc = 'BEDROOM': gs 'helper'";
+        let path = create_qsp_reference_fixture(dir.path(), code, "goto 'Bedroom'");
+        let before = fs::read(&path).unwrap();
+        let mut entries = Vec::new();
+        for (suffix, source) in [
+            ("code#str0", "Shop"),
+            ("code#str1", "BEDROOM"),
+            ("code#str2", "helper"),
+            ("act0#code#str0", "Bedroom"),
+        ] {
+            let mut entry =
+                StringEntry::new(format!("game.qsp#loc0#{suffix}"), source, path.clone());
+            entry.translation = Some("Never rewrite this".into());
+            entries.push(entry);
+        }
+        let report = QspPlugin::new().inject(&path, &entries).unwrap();
+        assert_eq!((report.files_modified, report.strings_written), (0, 0));
+        assert_eq!(report.strings_skipped, 4);
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
     #[test]
     fn test_extract_doubled_quotes() {
         assert_eq!(
-            extract_quoted_literals("*pl 'Don''t go.'"),
-            vec!["Don't go."]
+            extract_quoted_literals("*pl 'Don''t go.'", &HashSet::new()),
+            vec![Some("Don't go.".into())]
         );
         assert_eq!(
-            extract_quoted_literals(r#"*pl "He said ""hi""""#),
-            vec![r#"He said "hi""#]
+            extract_quoted_literals(r#"*pl "He said ""hi""""#, &HashSet::new()),
+            vec![Some(r#"He said "hi""#.into())]
         );
     }
 
     #[test]
     fn test_quoted_literal_boundaries_and_replacement_order() {
-        assert!(extract_quoted_literals("''").is_empty());
-        assert_eq!(replace_quoted_in_order("''", &["unused".into()]), "''");
+        assert!(extract_quoted_literals("''", &HashSet::new()).is_empty());
         assert_eq!(
-            extract_quoted_literals("*pl 'Unterminated text"),
-            vec!["Unterminated text"]
+            replace_quoted_in_order("''", &[Some("unused".into())]),
+            "''"
+        );
+        assert_eq!(
+            extract_quoted_literals("*pl 'Unterminated text", &HashSet::new()),
+            vec![Some("Unterminated text".into())]
         );
         assert_eq!(
             replace_quoted_in_order("*pl 'Unterminated text", &[]),
             "*pl 'Unterminated text"
         );
         assert_eq!(
-            replace_quoted_in_order("*pl 'Unterminated text", &["Texto traducido".into()]),
+            replace_quoted_in_order("*pl 'Unterminated text", &[Some("Texto traducido".into())]),
             "*pl 'Texto traducido'"
         );
 
         let code = r#"'' & '123' & 'Don''t go.' & "He said ""hi""" & 'img/a.png' & 'Next line'"#;
         assert_eq!(
-            extract_quoted_literals(code),
-            vec!["Don't go.", r#"He said "hi""#, "Next line"]
+            extract_quoted_literals(code, &HashSet::new()),
+            vec![
+                Some("Don't go.".into()),
+                Some(r#"He said "hi""#.into()),
+                Some("Next line".into())
+            ]
         );
         assert_eq!(
-            replace_quoted_in_order(code, &extract_quoted_literals(code)),
+            replace_quoted_in_order(code, &extract_quoted_literals(code, &HashSet::new())),
             code
         );
         assert_eq!(
-            replace_quoted_in_order(code, &["L'ami".into(), "Dijo \"hola\"".into()]),
+            replace_quoted_in_order(code, &[Some("L'ami".into()), Some("Dijo \"hola\"".into())]),
             r#"'' & '123' & 'L''ami' & "Dijo ""hola""" & 'img/a.png' & 'Next line'"#
         );
     }
