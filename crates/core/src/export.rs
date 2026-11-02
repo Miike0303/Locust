@@ -114,15 +114,23 @@ pub fn check_export_destination(output: &Path, project_db: &Path) -> Result<()> 
 
 // ─── PO format ─────────────────────────────────────────────────────────────
 
+// Every physical line must keep its comment prefix, including empty lines.
+fn push_po_comment(lines: &mut Vec<String>, prefix: &str, value: &str) {
+    for line in normalize_line_endings(value).split('\n') {
+        lines.push(format!("{prefix}{line}"));
+    }
+}
+
 pub fn export_po(entries: &[StringEntry], source_lang: &str, target_lang: &str) -> String {
     let mut lines = Vec::new();
 
     // Header
     lines.push("# Project Locust export".to_string());
-    lines.push(format!(
-        "# Source: {}, Target: {}",
-        source_lang, target_lang
-    ));
+    push_po_comment(
+        &mut lines,
+        "# ",
+        &format!("Source: {}, Target: {}", source_lang, target_lang),
+    );
     lines.push(String::new());
     lines.push("msgid \"\"".to_string());
     lines.push("msgstr \"\"".to_string());
@@ -134,11 +142,21 @@ pub fn export_po(entries: &[StringEntry], source_lang: &str, target_lang: &str) 
     // Entries
     for entry in entries {
         if let Some(ref ctx) = entry.context {
-            lines.push(format!("#. {}", ctx));
+            push_po_comment(&mut lines, "#. ", ctx);
         }
         // File location only — Locust ids often contain `#` (e.g. file#idx#key).
         // Putting the id after path# and re-importing with rfind broke multi-# ids.
-        lines.push(format!("#: {}", entry.file_path.display()));
+        // PO reference filenames are whitespace-delimited (GNU gettext,
+        // "PO File Entries"). Replace CR/LF/TAB with visible \r/\n/\t text
+        // for display only, not C-string decoding; msgctxt preserves the id.
+        // Ordinary paths, including Windows backslashes, stay unchanged.
+        let reference = entry
+            .file_path
+            .to_string_lossy()
+            .replace('\r', "\\r")
+            .replace('\n', "\\n")
+            .replace('\t', "\\t");
+        lines.push(format!("#: {reference}"));
         if entry.metadata.contains_key(STALE_TRANSLATION_METADATA_KEY) {
             lines.push("#, fuzzy".to_string());
         }
@@ -1506,6 +1524,139 @@ mod tests {
             po.contains("msgctxt \"e1\""),
             "export must write msgctxt ids"
         );
+    }
+
+    fn assert_po_comment_roundtrip(entries: &[StringEntry], po: &str) {
+        let imported = import_po(po).unwrap();
+        assert_eq!(
+            imported.len(),
+            entries.len(),
+            "comments must not add entries"
+        );
+        for (actual, expected) in imported.iter().zip(entries) {
+            assert_eq!(actual.id.as_deref(), Some(expected.id.as_str()));
+            assert_eq!(actual.source, expected.source);
+            assert_eq!(
+                actual.translation,
+                expected.translation.as_deref().unwrap_or("")
+            );
+            assert_eq!(
+                actual.fuzzy,
+                expected
+                    .metadata
+                    .contains_key(STALE_TRANSLATION_METADATA_KEY)
+            );
+        }
+    }
+
+    #[test]
+    fn test_po_comment_context_line_endings_roundtrip() {
+        for ending in ["\n", "\r\n", "\r"] {
+            let mut entries = make_entries();
+            entries[0].id = "story#0#message".into();
+            entries[0].context = Some(format!("{ending}Speaker{ending}{ending}Scene{ending}"));
+            entries[1].metadata.insert(
+                STALE_TRANSLATION_METADATA_KEY.into(),
+                serde_json::json!("msgid \"stale\"\nmsgstr \"\""),
+            );
+            let po = export_po(&entries, "en", "es");
+            assert_po_comment_roundtrip(&entries, &po);
+            assert!(po.contains("#. \n#. Speaker\n#. \n#. Scene\n#. \n#: test.json\n"));
+            assert!(!po.contains('\r'));
+        }
+    }
+
+    #[test]
+    fn test_po_comment_context_directives_stay_comments() {
+        let mut entries = make_entries();
+        entries[0].context = Some(
+            concat!(
+                "Speaker\nmsgctxt \"injected\"\nmsgid \"x\"\nmsgstr \"ghost\"\n\n",
+                "#: other\nmsgstr \"\"\n#, fuzzy"
+            )
+            .into(),
+        );
+        let po = export_po(&entries, "en", "es");
+        assert_po_comment_roundtrip(&entries, &po);
+        assert!(po.contains(concat!(
+            "#. Speaker\n#. msgctxt \"injected\"\n#. msgid \"x\"\n",
+            "#. msgstr \"ghost\"\n#. \n#. #: other\n#. msgstr \"\"\n#. #, fuzzy\n"
+        )));
+    }
+
+    #[test]
+    fn test_po_comment_context_tab_stays_literal() {
+        let mut entries = make_entries();
+        entries[0].context = Some("Speaker\tScene".into());
+        let po = export_po(&entries, "en", "es");
+        assert_po_comment_roundtrip(&entries, &po);
+        assert!(po.contains("#. Speaker\tScene\n#: test.json\n"));
+    }
+
+    #[test]
+    fn test_po_comment_reference_line_endings_roundtrip() {
+        for (path, reference) in [
+            ("dir\nstory.json", "dir\\nstory.json"),
+            ("dir\r\nstory.json", "dir\\r\\nstory.json"),
+            ("dir\rstory.json", "dir\\rstory.json"),
+            (
+                "dir\nmsgid \"x\"\r\n#: other\rmsgstr \"\"\t.json",
+                "dir\\nmsgid \"x\"\\r\\n#: other\\rmsgstr \"\"\\t.json",
+            ),
+        ] {
+            let mut entries = make_entries();
+            entries[0].file_path = PathBuf::from(path);
+            let po = export_po(&entries, "en", "es");
+            assert_po_comment_roundtrip(&entries, &po);
+            assert_eq!(
+                po.lines().find(|line| line.starts_with("#: ")).unwrap(),
+                format!("#: {reference}")
+            );
+            assert!(!po.contains('\r'));
+        }
+    }
+
+    #[test]
+    fn test_po_comment_reference_tab_is_display_text() {
+        let mut entries = make_entries();
+        entries[0].file_path = PathBuf::from("dir\tstory.json");
+        let po = export_po(&entries, "en", "es");
+        assert_po_comment_roundtrip(&entries, &po);
+        assert!(po.contains("#: dir\\tstory.json\n"));
+        assert!(!po.contains('\t'));
+    }
+
+    #[test]
+    fn test_po_comment_source_header_line_endings_roundtrip() {
+        for ending in ["\n", "\r\n", "\r"] {
+            let entries = make_entries();
+            let source_lang = format!("en{ending}msgid \"x\"{ending}msgstr \"ghost\"");
+            let po = export_po(&entries, &source_lang, "es");
+            assert_po_comment_roundtrip(&entries, &po);
+            assert!(po.starts_with(concat!(
+                "# Project Locust export\n# Source: en\n",
+                "# msgid \"x\"\n# msgstr \"ghost\", Target: es\n\n"
+            )));
+            assert!(!po.contains('\r'));
+        }
+    }
+
+    #[test]
+    fn test_po_comment_single_line_bytes_unchanged() {
+        let entries = make_entries();
+        let expected = concat!(
+            "# Project Locust export\n# Source: en, Target: es\n\n",
+            "msgid \"\"\nmsgstr \"\"\n",
+            "\"Content-Type: text/plain; charset=UTF-8\\n\"\n",
+            "\"Content-Transfer-Encoding: 8bit\\n\"\n\"Language: es\\n\"\n\n",
+            "#. greeting\n#: test.json\nmsgctxt \"e1\"\n",
+            "msgid \"Hello\"\nmsgstr \"Hola\"\n\n",
+            "#: test.json\nmsgctxt \"e2\"\nmsgid \"World\"\nmsgstr \"Mundo\"\n\n",
+            "#: test.json\nmsgctxt \"e3\"\nmsgid \"Untranslated\"\nmsgstr \"\"\n"
+        );
+        let po = export_po(&entries, "en", "es");
+        assert_eq!(po.as_bytes(), expected.as_bytes());
+        assert_po_comment_roundtrip(&entries, &po);
     }
 
     #[test]
