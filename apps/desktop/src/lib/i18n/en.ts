@@ -514,6 +514,7 @@ export const en = {
 
   // ── editor ──────────────────────────────────────────────────────────────
   "editor.noProject": "No project",
+  "fontPatch.projectChanged": "The open project has changed. Close this dialog and reopen it from the intended project before creating the font patch.",
   "fontPatch.title": "Create font patch",
   "fontPatch.description": "Replace an existing loose TTF/OTF font using the translated text in this project. The new font must contain every required character.",
   "fontPatch.combineNote": "To include it with a translation, select its ZIP and a clean game copy. Unity atlases and engine text layout are not changed.",

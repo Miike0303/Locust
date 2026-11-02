@@ -26,6 +26,8 @@ pub(super) struct FontPatchRequest {
     output_path: String,
     #[serde(default)]
     base_patch: Option<String>,
+    #[serde(default)]
+    expected_database: Option<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -66,6 +68,20 @@ pub(super) async fn generate(
             "Open a project before generating a font patch.",
         )
     })?;
+    // Match the published identity AND live connection under the project
+    // reservation, just as export and glossary operations do.
+    if let Some(expected) = request.expected_database.as_deref() {
+        let database = project
+            .database_path
+            .as_deref()
+            .unwrap_or(Path::new(":memory:"));
+        if expected != database || expected != state.db.path() {
+            return Err(err(
+                StatusCode::CONFLICT,
+                "project changed before font patch; retry",
+            ));
+        }
+    }
     let db = state.db.clone();
     // The guard moves into the blocking task so a disconnected HTTP client
     // cannot release DB protection while generation is still running.
@@ -113,7 +129,7 @@ pub(super) async fn generate(
             bytes = combine_font_patch(&game_root, Path::new(base), &bytes, &mut report).map_err(core_error)?;
         }
         // All coverage, baseline and archive checks completed before the first
-        // output write. create_new remains the authoritative collision check.
+        // output write. Atomic publication remains the authoritative collision check.
         let output = write_font_patch(&output, &bytes).map_err(core_error)?;
         Ok(FontPatchResponse { output_path: output.to_string_lossy().into_owned(), report })
     }).await.map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))??;
@@ -227,6 +243,102 @@ mod tests {
             .send()
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn http_font_patch_rejects_stale_project_identity_without_output() {
+        let f = Fixture::new(Some("Hello test")).await;
+        let a = f.temp.path().join("project-a.db");
+        let b = f.temp.path().join("project-b.db");
+        let entries = f.state.db.get_entries(&EntryFilter::default()).unwrap();
+        {
+            let _opening = try_project_operation(&f.state).unwrap();
+            f.state.db.reopen(&a).unwrap();
+            f.state.db.save_entries(&entries).unwrap();
+            f.state
+                .current_project
+                .write()
+                .await
+                .as_mut()
+                .unwrap()
+                .database_path = Some(a.clone());
+        }
+        let mut request = f.request("stale-project.zip");
+        request["expected_database"] = serde_json::json!(a);
+        {
+            let _opening = try_project_operation(&f.state).unwrap();
+            f.state.db.reopen(&b).unwrap();
+            f.state.db.save_entries(&entries).unwrap();
+            f.state
+                .current_project
+                .write()
+                .await
+                .as_mut()
+                .unwrap()
+                .database_path = Some(b.clone());
+        }
+        let (base, server) = start_test_server(f.state.clone()).await;
+        // Reject if either the published project or live connection disagrees.
+        for (published, expected) in [(&b, &a), (&a, &a), (&a, &b)] {
+            f.state
+                .current_project
+                .write()
+                .await
+                .as_mut()
+                .unwrap()
+                .database_path = Some(published.clone());
+            request["expected_database"] = serde_json::json!(expected);
+            let response = post(&base, &request).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                response.text().await.unwrap(),
+                "project changed before font patch; retry"
+            );
+            assert!(!f.temp.path().join("stale-project.zip").exists());
+            assert_eq!(std::fs::read(f.game.join("fonts/body.ttf")).unwrap(), FONT);
+            assert!(try_project_operation(&f.state).is_ok());
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn http_font_patch_matching_project_identity_and_memory_fallback_work() {
+        let f = Fixture::new(Some("Hello test")).await;
+        let (base, server) = start_test_server(f.state.clone()).await;
+        let mut request = f.request("memory.zip");
+        request["expected_database"] = serde_json::json!(":memory:");
+        assert_eq!(post(&base, &request).await.status(), StatusCode::OK);
+        let database = f.temp.path().join("project.db");
+        let entries = f.state.db.get_entries(&EntryFilter::default()).unwrap();
+        {
+            let _opening = try_project_operation(&f.state).unwrap();
+            f.state.db.reopen(&database).unwrap();
+            f.state.db.save_entries(&entries).unwrap();
+            f.state
+                .current_project
+                .write()
+                .await
+                .as_mut()
+                .unwrap()
+                .database_path = Some(database.clone());
+        }
+        let mut request = f.request("matching.zip");
+        request["expected_database"] = serde_json::json!(database);
+        let response = post(&base, &request).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{}",
+            response.text().await.unwrap()
+        );
+        assert_eq!(
+            verify(&f.game, &f.temp.path().join("matching.zip"))
+                .unwrap()
+                .outcome,
+            VerificationOutcome::Clean
+        );
+        assert!(try_project_operation(&f.state).is_ok());
+        server.abort();
     }
 
     #[tokio::test]

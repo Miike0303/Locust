@@ -522,7 +522,7 @@ export const getFormats = (): Promise<PluginInfo[]> =>
 
 export interface FontPatchRequest {
   game_path: string; source_font: string; target_path: string;
-  language: string; output_path: string; base_patch?: string;
+  language: string; output_path: string; base_patch?: string; expected_database?: string;
 }
 export interface FontPatchResponse {
   output_path: string;

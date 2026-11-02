@@ -162,13 +162,92 @@ pub fn build_font_patch(
 
 /// Save without clobbering an existing file (including a source or game font).
 pub fn write_font_patch(output: &Path, bytes: &[u8]) -> Result<PathBuf> {
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(output)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
+    write_font_patch_with(output, bytes, |file, bytes| {
+        file.write_all(bytes)?;
+        file.sync_all()
+    })
+}
+
+fn write_font_patch_with(
+    output: &Path,
+    bytes: &[u8],
+    write_and_sync: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+) -> Result<PathBuf> {
+    // A unique sibling stays on the destination filesystem. Own it only after
+    // exclusive creation succeeds, so cleanup cannot remove somebody else's file.
+    let mut staging = FontPatchStaging {
+        path: output.with_file_name(format!(".locust-font-patch-{}.tmp", uuid::Uuid::new_v4())),
+        owned: false,
+    };
+    let mut file = std::fs::File::create_new(&staging.path)?;
+    staging.owned = true;
+    write_and_sync(&mut file, bytes)?;
+    drop(file);
+    // Publish the fully synced bytes atomically, refusing even a destination
+    // created after generation's advisory preflight.
+    publish_font_patch(&staging.path, output)?;
+    #[cfg(windows)]
+    {
+        staging.owned = false; // The move consumed the staging name.
+    }
     Ok(output.to_path_buf())
+}
+
+#[cfg(not(windows))]
+fn publish_font_patch(staging: &Path, output: &Path) -> std::io::Result<()> {
+    std::fs::hard_link(staging, output)
+}
+
+#[cfg(windows)]
+fn publish_font_patch(staging: &Path, output: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+
+    fn wide_path(path: &Path) -> std::io::Result<Vec<u16>> {
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if wide.contains(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "font patch path contains a NUL character",
+            ));
+        }
+        wide.push(0);
+        Ok(wide)
+    }
+
+    // Canonicalization supplies the extended Windows path prefix for long paths.
+    // Both names refer to the same parent because staging is an output sibling.
+    let existing = staging.canonicalize()?;
+    let name = output.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "output must name a file")
+    })?;
+    let new = wide_path(&existing.with_file_name(name))?;
+    let existing = wide_path(&existing)?;
+    // No REPLACE_EXISTING or COPY_ALLOWED: use a same-filesystem move that refuses
+    // an existing destination, rather than std::fs::rename's replacement semantics.
+    // SAFETY: both pointers remain valid for the call and reference NUL-terminated
+    // UTF-16 paths without interior NULs. The flags request no deferred operation.
+    if unsafe { MoveFileExW(existing.as_ptr(), new.as_ptr(), 0) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+struct FontPatchStaging {
+    path: PathBuf,
+    owned: bool,
+}
+
+impl Drop for FontPatchStaging {
+    fn drop(&mut self) {
+        if self.owned {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 /// Merge into a verified translation patch, keeping its identity and all its
@@ -360,6 +439,98 @@ mod tests {
         let source = dir.path().join("source.ttf");
         std::fs::write(&source, &new).unwrap();
         (dir, source, old, new)
+    }
+
+    fn assert_failed_write_cleans_up_and_retries(sync_failure: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("font.zip");
+        let bytes = b"complete archive bytes";
+        let error = write_font_patch_with(&output, bytes, |file, bytes| {
+            if sync_failure {
+                file.write_all(bytes)?;
+                Err(std::io::Error::other("injected sync failure"))
+            } else {
+                file.write_all(&bytes[..5])?;
+                Err(std::io::Error::other("injected write failure"))
+            }
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("injected"));
+        assert!(!output.exists(), "failed publication left a final artifact");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert_eq!(write_font_patch(&output, bytes).unwrap(), output);
+        assert_eq!(std::fs::read(&output).unwrap(), bytes);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn font_patch_write_failure_cleans_up_and_retries() {
+        assert_failed_write_cleans_up_and_retries(false);
+    }
+
+    #[test]
+    fn font_patch_sync_failure_cleans_up_and_retries() {
+        assert_failed_write_cleans_up_and_retries(true);
+    }
+
+    #[test]
+    fn font_patch_write_refuses_existing_destination_without_changing_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("font.zip");
+        std::fs::write(&output, b"existing destination").unwrap();
+        assert!(write_font_patch(&output, b"replacement").is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), b"existing destination");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn font_patch_write_refuses_racing_destination_and_cleans_only_owned_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("font.zip");
+        let foreign = dir.path().join(".locust-font-patch-other.tmp");
+        std::fs::write(&foreign, b"another operation").unwrap();
+        let result = write_font_patch_with(&output, b"loser", |file, bytes| {
+            assert!(
+                !output.exists(),
+                "final path must stay absent before publication"
+            );
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            write_font_patch(&output, b"winner").unwrap();
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), b"winner");
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"another operation");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn font_patch_write_rejects_nul_destination_without_publishing_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("font.zip\0ignored");
+        assert!(write_font_patch(&output, b"archive").is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn font_patch_write_preserves_successful_zip_bytes() {
+        let (dir, source, _, _) = fixture();
+        let (bytes, _) = build_font_patch(
+            dir.path(),
+            &source,
+            "fonts/game.ttf",
+            "html",
+            "es",
+            &["Hello"],
+        )
+        .unwrap();
+        let output_dir = tempfile::tempdir().unwrap();
+        let output = output_dir.path().join("font.zip");
+        assert_eq!(write_font_patch(&output, &bytes).unwrap(), output);
+        assert_eq!(std::fs::read(&output).unwrap(), bytes);
+        assert_eq!(std::fs::read_dir(output_dir.path()).unwrap().count(), 1);
+        assert_eq!(zip::ZipArchive::new(Cursor::new(bytes)).unwrap().len(), 3);
     }
 
     #[test]

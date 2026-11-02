@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { FolderOpen, Loader2, X } from "lucide-react";
 import { createFontPatch, getTranslationRuns, type FontPatchRequest } from "../lib/api";
 import { useT } from "../lib/i18n";
+import { ApiError } from "../lib/apiError";
+import { useProjectStore } from "../stores/projectStore";
 import { readLastUsedTranslationPrefs } from "../lib/translationDefaults";
 import { MODAL_BACKDROP_CLASS, MODAL_HEADER_CLASS, MODAL_BODY_CLASS, MODAL_FOOTER_CLASS, modalPanelClass, useModalA11y } from "../lib/modalA11y";
 
@@ -10,22 +12,26 @@ const empty = (): FontPatchRequest => ({ game_path: "", source_font: "", target_
 
 export default function FontPatchDialog({ open, defaultGamePath, onClose, onUsePatch }: Props) {
   const t = useT();
+  const { project } = useProjectStore();
   const [draft, setDraft] = useState<FontPatchRequest>(empty);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [output, setOutput] = useState("");
   const close = () => { if (!busy) onClose(); };
   const { dialogRef, dialogProps, titleProps } = useModalA11y({ open, onClose: close, ownEscape: true });
+  // Bind all defaults to the opening project; a later project change must not
+  // rebind an already prepared form. Closing and reopening captures fresh defaults.
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
-    setDraft({ ...empty(), game_path: defaultGamePath, language: readLastUsedTranslationPrefs().target ?? "" });
+    setDraft({ ...empty(), game_path: defaultGamePath, language: readLastUsedTranslationPrefs().target ?? "",
+      expected_database: project?.database_path ?? ":memory:" });
     setError(""); setOutput("");
     void getTranslationRuns().then(runs => {
       if (!cancelled && runs.length) setDraft(value => value.language ? value : { ...value, language: runs[0].target_lang });
     }).catch(() => {});
     return () => { cancelled = true; };
-  }, [open, defaultGamePath]);
+  }, [open]);
   const update = (key: keyof FontPatchRequest, value: string) => { setDraft(current => ({ ...current, [key]: value })); setOutput(""); setError(""); };
   const choose = async (key: "game_path" | "source_font" | "base_patch" | "output_path") => {
     try {
@@ -43,7 +49,10 @@ export default function FontPatchDialog({ open, defaultGamePath, onClose, onUseP
     try {
       const result = await createFontPatch({ ...draft, base_patch: draft.base_patch?.trim() || undefined });
       setOutput(result.output_path);
-    } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+    } catch (err) {
+      setError(err instanceof ApiError && err.raw === "409: project changed before font patch; retry"
+        ? t("fontPatch.projectChanged") : err instanceof Error ? err.message : String(err));
+    }
     finally { setBusy(false); }
   };
   if (!open) return null;

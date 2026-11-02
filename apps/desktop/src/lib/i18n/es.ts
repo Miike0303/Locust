@@ -512,6 +512,7 @@ export const es: Record<keyof typeof en, string> = {
   "welcome.toast.failedOpen": "No se pudo abrir: {error}",
 
   "editor.noProject": "Sin proyecto",
+  "fontPatch.projectChanged": "El proyecto abierto ha cambiado. Cierre este cuadro y vuelva a abrirlo desde el proyecto que desea usar antes de crear el parche de fuentes.",
   "fontPatch.title": "Crear parche de fuentes",
   "fontPatch.description": "Sustituye una fuente TTF/OTF suelta que ya usa el juego, comprobando los textos traducidos del proyecto. La fuente nueva debe contener todos los caracteres necesarios.",
   "fontPatch.combineNote": "Para incluirla con una traducción, selecciona su ZIP y una copia limpia del juego. No se modifican los atlas de Unity ni la disposición del texto.",
