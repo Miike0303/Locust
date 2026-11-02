@@ -377,16 +377,6 @@ impl FormatPlugin for HtmlGamePlugin {
                     report.skip("unchanged", 1);
                     continue;
                 }
-                if !locust_core::placeholder::PlaceholderProcessor::validate_with_profile(
-                    &entry.source,
-                    translation,
-                    locust_core::placeholder::PlaceholderProfile::for_format(self.id()),
-                )
-                .is_empty()
-                {
-                    report.skip("invalid_placeholders", 1);
-                    continue;
-                }
                 let start = entry
                     .metadata
                     .get("html_start")
@@ -431,11 +421,31 @@ impl FormatPlugin for HtmlGamePlugin {
                     report.skip("source_changed", 1);
                     continue;
                 };
+                let mut encoded = html_encode_text(translation);
+                // Angle-bracket text is literal in RCDATA. Validate the encoded
+                // values so it is not mistaken for protected HTML markup.
+                let rcdata_source =
+                    (slot.kind == "text:textarea").then(|| html_encode_text(&entry.source));
+                let source = rcdata_source.as_deref().unwrap_or(&entry.source);
+                let target = if rcdata_source.is_some() {
+                    encoded.as_str()
+                } else {
+                    translation
+                };
+                if !locust_core::placeholder::PlaceholderProcessor::validate_with_profile(
+                    source,
+                    target,
+                    locust_core::placeholder::PlaceholderProfile::for_format(self.id()),
+                )
+                .is_empty()
+                {
+                    report.skip("invalid_placeholders", 1);
+                    continue;
+                }
                 if !seen.insert(slot.range.start) {
                     report.skip("duplicate", 1);
                     continue;
                 }
-                let mut encoded = html_encode_text(translation);
                 if slot.kind.starts_with("attr:") {
                     encoded = encoded.replace('"', "&quot;").replace('\'', "&#39;");
                 }
@@ -826,6 +836,188 @@ mod tests {
             fs::read_to_string(file).unwrap(),
             r#"<P TITLE = 'Tom&#39;s &quot;amigo&quot; &lt; aquí'>Hola <b>mundo</b> &amp; amigos ©.</P>"#
         );
+    }
+
+    #[test]
+    fn textarea_extracts_prefilled_text() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("game.html");
+        fs::write(&file, "<textarea>Hello traveler</textarea>").unwrap();
+        let plugin = HtmlGamePlugin;
+        let entries = plugin.extract(&file).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source, "Hello traveler");
+        assert_eq!(entries[0].metadata["html_kind"], "text:textarea");
+        assert_eq!(entries[0].tags, ["html-text"]);
+        assert!(plugin.detect(&file));
+    }
+
+    #[test]
+    fn textarea_attributes_follow_normal_quoted_attribute_rules() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("game.html");
+        let plugin = HtmlGamePlugin;
+        for tag in ["input", "textarea"] {
+            let html = format!(
+                r#"<{tag} placeholder="Type here" title='Tom &amp; Jerry' aria-label="Your message" id="Internal name" onclick="Ignore this" data-label="Ignore data" label=Unquoted></{tag}>"#
+            );
+            fs::write(&file, html).unwrap();
+            let mut entries = plugin.extract(&file).unwrap();
+            assert_eq!(
+                entries
+                    .iter()
+                    .map(|e| e.source.as_str())
+                    .collect::<Vec<_>>(),
+                ["Type here", "Tom & Jerry", "Your message"],
+                "{tag}"
+            );
+            for (entry, translation) in
+                entries
+                    .iter_mut()
+                    .zip(["Escribe aquí", "Tom's \"amigo\" & compañía", "Tu mensaje"])
+            {
+                assert_eq!(entry.tags, ["html-attr"]);
+                entry.translation = Some(translation.into());
+            }
+            let report = plugin.inject(&file, &entries).unwrap();
+            assert_eq!((report.strings_written, report.strings_skipped), (3, 0));
+            assert_eq!(
+                fs::read_to_string(&file).unwrap(),
+                format!(
+                    r#"<{tag} placeholder="Escribe aquí" title='Tom&#39;s &quot;amigo&quot; &amp; compañía' aria-label="Tu mensaje" id="Internal name" onclick="Ignore this" data-label="Ignore data" label=Unquoted></{tag}>"#
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn textarea_rcdata_entities_and_literal_tags_round_trip() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("game.html");
+        let html = "<textarea>\r\n  Hello &amp; <b>brave traveler</b> &ampere!  \r\n</textarea>";
+        fs::write(&file, html).unwrap();
+        let plugin = HtmlGamePlugin;
+        let mut entries = plugin.extract(&file).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source, "Hello & <b>brave traveler</b> &ere!");
+        assert_eq!(
+            entries[0].metadata["html_raw"],
+            "Hello &amp; <b>brave traveler</b> &ampere!"
+        );
+        entries[0].translation = Some(entries[0].source.clone());
+        let unchanged = plugin.inject(&file, &entries).unwrap();
+        assert_eq!(unchanged.strings_written, 0);
+        assert_eq!(unchanged.skip_reasons.get("unchanged"), Some(&1));
+        assert_eq!(fs::read_to_string(&file).unwrap(), html);
+
+        let translation = "Hola & <b>viajero valiente</b> &ere!";
+        entries[0].translation = Some(translation.into());
+        let report = plugin.inject(&file, &entries).unwrap();
+        assert_eq!((report.strings_written, report.strings_skipped), (1, 0));
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "<textarea>\r\n  Hola &amp; &lt;b&gt;viajero valiente&lt;/b&gt; &amp;ere!  \r\n</textarea>"
+        );
+        let extracted = plugin.extract(&file).unwrap();
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0].source, translation);
+    }
+
+    #[test]
+    fn textarea_injection_encodes_literal_closing_tags_and_ampersands() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("game.html");
+        fs::write(
+            &file,
+            "<textarea>Hello {player}</textarea><p>Text after the control</p>",
+        )
+        .unwrap();
+        let plugin = HtmlGamePlugin;
+        let mut entries = plugin.extract(&file).unwrap();
+        assert_eq!(entries.len(), 2);
+        let translation = "Hola {player} </textarea><b>viajero</b> & bienvenido";
+        entries[0].translation = Some(translation.into());
+        let report = plugin.inject(&file, &entries[..1]).unwrap();
+        assert_eq!((report.strings_written, report.strings_skipped), (1, 0));
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "<textarea>Hola {player} &lt;/textarea&gt;&lt;b&gt;viajero&lt;/b&gt; &amp; bienvenido</textarea><p>Text after the control</p>"
+        );
+        let mut extracted = plugin.extract(&file).unwrap();
+        assert_eq!(extracted.len(), 2);
+        assert_eq!(extracted[0].source, translation);
+        assert_eq!(extracted[1].source, "Text after the control");
+        let before = fs::read(&file).unwrap();
+        extracted[0].translation = Some("Hola </textarea> & bienvenido".into());
+        let rejected = plugin.inject(&file, &extracted[..1]).unwrap();
+        assert_eq!((rejected.strings_written, rejected.strings_skipped), (0, 1));
+        assert_eq!(rejected.skip_reasons.get("invalid_placeholders"), Some(&1));
+        assert_eq!(fs::read(&file).unwrap(), before);
+    }
+
+    #[test]
+    fn textarea_empty_or_whitespace_content_has_no_row() {
+        for content in ["", " \t\r\n ", "&nbsp; &#32; &#x09;"] {
+            let html = format!("<textarea>{content}</textarea>");
+            assert!(HtmlGamePlugin::extract_from_html(&html, Path::new("game.html")).is_empty());
+        }
+    }
+
+    #[test]
+    fn textarea_preserves_existing_byte_offset_ids() {
+        let html = "<p title='Before tip'>Héllo traveler</p><textarea placeholder='Type here'>Draft text</textarea><p title='After tip'>Goodbye traveler</p>";
+        let file = Path::new("game.html");
+        let entries = HtmlGamePlugin::extract_from_html(html, file);
+        let existing = entries
+            .iter()
+            .filter(|entry| {
+                entry.metadata["html_kind"] != "text:textarea" && entry.source != "Type here"
+            })
+            .map(|entry| (entry.id.as_str(), entry.source.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            existing,
+            [
+                ("game.html#html:10", "Before tip"),
+                ("game.html#html:22", "Héllo traveler"),
+                ("game.html#html:106", "After tip"),
+                ("game.html#html:117", "Goodbye traveler"),
+            ]
+        );
+    }
+
+    #[test]
+    fn textarea_change_preserves_other_raw_text_elements() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("game.html");
+        let plugin = HtmlGamePlugin;
+        for tag in ["script", "style", "xmp", "iframe"] {
+            let raw = format!(
+                "<{tag} title='Hidden title' placeholder='Hidden hint'>Raw &amp; <b>literal text</b></{tag}extra><textarea title='Hidden control'>Hidden content</textarea></{tag}>"
+            );
+            fs::write(
+                &file,
+                format!("<p>Before control</p>{raw}<p>After control</p>"),
+            )
+            .unwrap();
+            let mut entries = plugin.extract(&file).unwrap();
+            assert_eq!(
+                entries
+                    .iter()
+                    .map(|e| e.source.as_str())
+                    .collect::<Vec<_>>(),
+                ["Before control", "After control"],
+                "{tag}"
+            );
+            entries[0].translation = Some("Antes del control".into());
+            entries[1].translation = Some("Después del control".into());
+            let report = plugin.inject(&file, &entries).unwrap();
+            assert_eq!((report.strings_written, report.strings_skipped), (2, 0));
+            assert_eq!(
+                fs::read_to_string(&file).unwrap(),
+                format!("<p>Antes del control</p>{raw}<p>Después del control</p>")
+            );
+        }
     }
 
     #[test]

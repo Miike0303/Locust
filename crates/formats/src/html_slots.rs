@@ -22,6 +22,22 @@ fn tag_end(bytes: &[u8], mut pos: usize) -> Option<usize> {
     None
 }
 
+// Return the content end and the position after the matching closing tag.
+fn raw_text_end(bytes: &[u8], lower: &str, mut search: usize, name: &str) -> (usize, usize) {
+    let needle = format!("</{name}");
+    while let Some(found) = lower[search..].find(&needle) {
+        let index = search + found;
+        let boundary = index + needle.len();
+        if bytes.get(boundary).is_some_and(|b| {
+            b.is_ascii_whitespace() || *b == b'>' || (name == "textarea" && *b == b'/')
+        }) {
+            return (index, tag_end(bytes, boundary).unwrap_or(bytes.len()));
+        }
+        search = boundary;
+    }
+    (bytes.len(), bytes.len())
+}
+
 fn push_slot(content: &str, range: Range<usize>, kind: String, slots: &mut Vec<Slot>) {
     let raw = &content[range.clone()];
     let start = range.start + raw.len() - raw.trim_start().len();
@@ -90,26 +106,8 @@ pub(super) fn scan(content: &str) -> Vec<Slot> {
             pos = end;
             continue;
         }
-        if matches!(
-            name.as_str(),
-            "script" | "style" | "textarea" | "xmp" | "iframe"
-        ) {
-            let needle = format!("</{name}");
-            let mut search = end;
-            let mut close = None;
-            while let Some(found) = lower[search..].find(&needle) {
-                let index = search + found;
-                let boundary = index + needle.len();
-                if bytes
-                    .get(boundary)
-                    .is_some_and(|b| b.is_ascii_whitespace() || *b == b'>')
-                {
-                    close = tag_end(bytes, boundary);
-                    break;
-                }
-                search = boundary;
-            }
-            pos = close.unwrap_or(bytes.len());
+        if matches!(name.as_str(), "script" | "style" | "xmp" | "iframe") {
+            pos = raw_text_end(bytes, &lower, end, &name).1;
             continue;
         }
         let suppressed =
@@ -174,6 +172,15 @@ pub(super) fn scan(content: &str) -> Vec<Slot> {
                     attr_pos += 1;
                 }
             }
+        }
+        if name == "textarea" {
+            let (text_end, close) = raw_text_end(bytes, &lower, end, &name);
+            if !suppressed && !stack.iter().any(|tag| tag == "head") {
+                // RCDATA decodes entities, but literal angle brackets are text.
+                push_slot(content, end..text_end, "text:textarea".into(), &mut slots);
+            }
+            pos = close;
+            continue;
         }
         let self_closing_foreign =
             matches!(name.as_str(), "svg" | "math") && content[pos..end].ends_with("/>");
@@ -330,6 +337,48 @@ mod tests {
             decode_entities("Incomplete &#; &#x;"),
             "Incomplete &#; &#x;"
         );
+    }
+
+    #[test]
+    fn textarea_rcdata_uses_only_its_matching_end_tag_or_eof() {
+        for closing in [
+            "</TeXtArEa>",
+            "</textarea >",
+            "</textarea/>",
+            "</textarea ignored='>'>",
+            "",
+        ] {
+            let text = "Hello <b>traveler</b> </textareax> &amp; friends";
+            let html = format!("<textarea>{text}{closing}");
+            let slots = scan(&html);
+            assert_eq!(slots.len(), 1, "{html}");
+            assert_eq!(
+                slots[0].source,
+                "Hello <b>traveler</b> </textareax> & friends"
+            );
+            assert_eq!(&html[slots[0].range.clone()], text);
+            assert_eq!(slots[0].kind, "text:textarea");
+        }
+    }
+
+    #[test]
+    fn textarea_respects_suppressed_ancestors() {
+        for tag in ["template", "noscript", "svg", "math", "head"] {
+            let html = format!(
+                "<{tag}><textarea placeholder='Hidden hint'>Hidden <b>literal</b> text</textarea></{tag}><p>Visible after control</p>"
+            );
+            let slots = scan(&html);
+            let sources = slots
+                .iter()
+                .map(|slot| slot.source.as_str())
+                .collect::<Vec<_>>();
+            if tag == "head" {
+                // Ordinary attributes in head are editable, but body text is not.
+                assert_eq!(sources, ["Hidden hint", "Visible after control"]);
+            } else {
+                assert_eq!(sources, ["Visible after control"], "{tag}");
+            }
+        }
     }
 
     #[test]
