@@ -68,7 +68,7 @@ impl TranslationProvider for DeepLProvider {
     }
 
     fn is_free(&self) -> bool {
-        false
+        self.free_tier
     }
 
     fn requires_api_key(&self) -> bool {
@@ -158,6 +158,20 @@ impl TranslationProvider for DeepLProvider {
             ))
         })?;
 
+        // DeepL responses are positional; a count mismatch can misattribute text.
+        if deepl_resp.translations.len() != requests.len() {
+            return Err(LocustError::ProviderError(
+                crate::error_sanitizer::sanitize_provider_error(
+                    &format!(
+                        "DeepL returned mismatched translation count: expected {}, received {}",
+                        requests.len(),
+                        deepl_resp.translations.len()
+                    ),
+                    &[&self.api_key],
+                ),
+            ));
+        }
+
         Ok(requests
             .iter()
             .zip(deepl_resp.translations.iter())
@@ -169,10 +183,10 @@ impl TranslationProvider for DeepLProvider {
                 tokens_used: None,
                 input_tokens: None,
                 output_tokens: None,
-                cost_usd: if !self.free_tier {
-                    Some(req.source.len() as f64 * 0.00002)
+                cost_usd: if self.free_tier {
+                    Some(0.0)
                 } else {
-                    None
+                    Some(req.source.len() as f64 * 0.00002)
                 },
             })
             .collect())
@@ -180,7 +194,7 @@ impl TranslationProvider for DeepLProvider {
 
     async fn estimate_cost(&self, char_count: usize, _target_lang: &str) -> Option<f64> {
         if self.free_tier {
-            None
+            Some(0.0)
         } else {
             Some(char_count as f64 * 0.00002)
         }
@@ -223,6 +237,163 @@ mod tests {
 
     fn make_provider(server: &MockServer) -> DeepLProvider {
         DeepLProvider::with_base_url("test-key".to_string(), false, server.base_url())
+    }
+
+    fn batch_requests() -> Vec<TranslationRequest> {
+        [("e2", "Hello"), ("e1", "Goodbye")]
+            .into_iter()
+            .map(|(entry_id, source)| TranslationRequest {
+                entry_id: entry_id.into(),
+                source: source.into(),
+                source_lang: "en".into(),
+                target_lang: "es".into(),
+                context: None,
+                glossary_hint: None,
+            })
+            .collect()
+    }
+
+    async fn assert_count_mismatch(translations: &[&str]) {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v2/translate")
+                .body_contains(r#""text":["Hello","Goodbye"]"#);
+            then.status(200).json_body(serde_json::json!({
+                "translations": translations.iter().map(|text| {
+                    serde_json::json!({"text": text})
+                }).collect::<Vec<_>>()
+            }));
+        });
+
+        let outcome = make_provider(&server).translate(&batch_requests()).await;
+        mock.assert_hits(1);
+        let LocustError::ProviderError(message) = outcome.unwrap_err() else {
+            panic!("count mismatch must reject the entire batch with a provider error");
+        };
+        assert!(message.contains("expected 2"), "{message}");
+        assert!(
+            message.contains(&format!("received {}", translations.len())),
+            "{message}"
+        );
+        for sensitive in ["test-key", "Hello", "Goodbye", "EXTRA", "Hola", "Adiós"] {
+            assert!(!message.contains(sensitive), "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_deepl_translate_rejects_excess_prefix_response() {
+        assert_count_mismatch(&["EXTRA", "Hola", "Adiós"]).await;
+    }
+
+    #[tokio::test]
+    async fn test_deepl_translate_rejects_short_response() {
+        assert_count_mismatch(&["Hola"]).await;
+    }
+
+    #[tokio::test]
+    async fn test_deepl_translate_rejects_empty_response() {
+        assert_count_mismatch(&[]).await;
+    }
+
+    #[tokio::test]
+    async fn test_deepl_count_mismatch_error_uses_sanitizer() {
+        let server = MockServer::start();
+        let api_key = "expected 2";
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v2/translate")
+                .header("Authorization", format!("DeepL-Auth-Key {api_key}"))
+                .body_contains(r#""text":["Hello","Goodbye"]"#);
+            then.status(200)
+                .json_body(serde_json::json!({"translations": []}));
+        });
+        let provider = DeepLProvider::with_base_url(api_key.into(), false, server.base_url());
+        let error = provider
+            .translate(&batch_requests())
+            .await
+            .unwrap_err()
+            .to_string();
+        mock.assert_hits(1);
+        assert!(!error.contains(api_key), "{error}");
+        assert!(error.contains("[REDACTED]"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_deepl_exact_count_preserves_order_and_tier_receipts() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v2/translate")
+                .body_contains(r#""text":["Hello","Goodbye"]"#);
+            then.status(200).json_body(serde_json::json!({
+                "translations": [
+                    {"text": "Hola", "detected_source_language": "EN"},
+                    {"text": "Adiós", "detected_source_language": "DE"}
+                ]
+            }));
+        });
+        let requests = batch_requests();
+        for free_tier in [false, true] {
+            let provider =
+                DeepLProvider::with_base_url("test-key".into(), free_tier, server.base_url());
+            let results = provider.translate(&requests).await.unwrap();
+            assert_eq!(results.len(), 2);
+            for (index, (translation, detected)) in
+                [("Hola", "EN"), ("Adiós", "DE")].into_iter().enumerate()
+            {
+                let result = &results[index];
+                assert_eq!(result.entry_id, requests[index].entry_id);
+                assert_eq!(result.translation, translation);
+                assert_eq!(result.detected_source_lang.as_deref(), Some(detected));
+                assert_eq!(result.provider, "deepl");
+                assert_eq!(
+                    result.cost_usd,
+                    Some(if free_tier {
+                        0.0
+                    } else {
+                        requests[index].source.len() as f64 * 0.00002
+                    })
+                );
+            }
+        }
+        mock.assert_hits(2);
+    }
+
+    #[test]
+    fn test_deepl_tier_classification_keeps_api_key_requirement() {
+        for free_tier in [false, true] {
+            let provider = DeepLProvider::new("test-key".into(), free_tier);
+            assert_eq!(provider.is_free(), free_tier);
+            assert!(provider.requires_api_key());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_deepl_auth_and_quota_errors_remain_sanitized_provider_errors() {
+        for free_tier in [false, true] {
+            for status in [403, 456] {
+                let server = MockServer::start();
+                let mock = server.mock(|when, then| {
+                    when.method(POST)
+                        .path("/v2/translate")
+                        .body_contains(r#""text":["Hello","Goodbye"]"#);
+                    then.status(status)
+                        .body("DeepL credential test-key: auth or quota failure");
+                });
+                let provider =
+                    DeepLProvider::with_base_url("test-key".into(), free_tier, server.base_url());
+                let outcome = provider.translate(&batch_requests()).await;
+                mock.assert_hits(1);
+                let LocustError::ProviderError(message) = outcome.unwrap_err() else {
+                    panic!("auth/quota failure must remain a provider error");
+                };
+                assert!(message.contains(&status.to_string()), "{message}");
+                assert!(message.contains("auth or quota failure"), "{message}");
+                assert!(!message.contains("test-key"), "{message}");
+                assert!(message.contains("[REDACTED]"), "{message}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -383,6 +554,6 @@ mod tests {
         assert!(provider.base_url.contains("api-free.deepl.com"));
 
         let cost = provider.estimate_cost(1000, "es").await;
-        assert_eq!(cost, None);
+        assert_eq!(cost, Some(0.0));
     }
 }
