@@ -166,7 +166,7 @@ test("Refresh font sends one immediate request and cancels the pending draft deb
   await finish(); assert.deepEqual(estimate().data, response);
   options = { ...options, draft: "normal draft" }; estimate(); context.mock.timers.tick(250);
   assert.equal(h.calls.length, 2);
-  assert.equal(Object.hasOwn(h.calls[1].body, "refresh_font"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(h.calls[1].body, "refresh_font"), false);
 });
 
 test("refresh after a draft render retains ownership across the previous effect cleanup", async context => {

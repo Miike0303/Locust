@@ -60,6 +60,7 @@ export const en = {
   "fastWorkflow.injectionFailed": "Injection did not finish successfully. Its status must be checked before retrying.",
   "fastWorkflow.packingFailed": "Patch packing did not finish successfully. Its status must be checked before retrying.",
   "fastWorkflow.busy": "Another project operation is running. Finish or cancel it before starting the workflow.",
+  "textFit.refreshFont": "Refresh font",
   "textFit.title": "Width estimate",
   "textFit.font": "Chosen static font file (TTF / OTF)",
   "textFit.browse": "Browse…",

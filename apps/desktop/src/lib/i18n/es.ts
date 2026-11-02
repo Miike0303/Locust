@@ -62,6 +62,7 @@ export const es: Record<keyof typeof en, string> = {
   "fastWorkflow.injectionFailed": "La inyección no terminó correctamente. Es necesario comprobar su estado antes de reintentar.",
   "fastWorkflow.packingFailed": "El empaquetado del parche no terminó correctamente. Es necesario comprobar su estado antes de reintentar.",
   "fastWorkflow.busy": "Hay otra operación del proyecto en curso. Termínala o cancélala antes de iniciar el flujo.",
+  "textFit.refreshFont": "Actualizar fuente",
   "textFit.title": "Estimación de ancho",
   "textFit.font": "Archivo de fuente estática elegido (TTF / OTF)",
   "textFit.browse": "Examinar…",
