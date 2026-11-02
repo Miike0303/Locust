@@ -473,9 +473,12 @@ impl FormatPlugin for WolfRpgPlugin {
                 }
 
                 let (trans_bytes, _, trans_err) = encoding.encode(translation);
-                if trans_err {
+                // CP932 silently maps characters such as yen to backslash.
+                // Check text fidelity before even accepting byte identity.
+                let (decoded, _, decode_err) = encoding.decode(&trans_bytes);
+                if trans_err || decode_err || decoded != translation.as_str() {
                     report.warnings.push(format!(
-                        "could not encode translation for '{}' to Shift-JIS",
+                        "could not losslessly encode translation for '{}' to Shift-JIS",
                         entry.id
                     ));
                     report.skip("not_encodable", 1);
@@ -853,6 +856,77 @@ mod tests {
             assert_eq!(report.strings_skipped, 0);
             assert_eq!(report.files_modified, 1);
             assert_eq!(fs::read(&path).unwrap(), expected);
+        }
+    }
+
+    fn assert_lossy_translation_refused(translation: &str, canonical: &str) {
+        let (encoded, _, had_errors) = encoding_rs::SHIFT_JIS.encode(translation);
+        assert!(!had_errors, "fixture must be silently mapped");
+        let (decoded, _, had_errors) = encoding_rs::SHIFT_JIS.decode(&encoded);
+        assert!(!had_errors);
+        assert_eq!(decoded, canonical);
+        assert_ne!(decoded, translation);
+
+        // Also exercise the byte-identity path: a lossy translation must be
+        // classified as an encoding refusal even when it encodes to the source.
+        for source in ["Hello world", canonical] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("BasicData.wolf");
+            let original = build_null_separated_sjis_fixture(&[source]);
+            fs::write(&path, &original).unwrap();
+            let plugin = WolfRpgPlugin::new();
+            let mut entries = plugin.extract(&path).unwrap();
+            assert_eq!(entries.len(), 1);
+            entries[0].translation = Some(translation.into());
+            let report = plugin.inject(&path, &entries).unwrap();
+            assert_eq!((report.strings_written, report.strings_skipped), (0, 1));
+            assert_eq!(report.skip_reasons, [("not_encodable".into(), 1)].into());
+            assert_eq!(report.files_modified, 0);
+            assert!(report.files_written.is_empty());
+            assert_eq!(report.warnings.len(), 1);
+            assert!(report.warnings[0].contains(&entries[0].id));
+            assert!(report.warnings[0].contains("Shift-JIS"));
+            assert_eq!(fs::read(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn w9_wolf_yen_translation_is_refused() {
+        assert_lossy_translation_refused("Pay ¥100", "Pay \\100");
+    }
+
+    #[test]
+    fn w9_wolf_overline_translation_is_refused() {
+        assert_lossy_translation_refused("Mark ‾100", "Mark ~100");
+    }
+
+    #[test]
+    fn w9_wolf_minus_translation_is_refused() {
+        assert_lossy_translation_refused("Score −1", "Score －1");
+    }
+
+    #[test]
+    fn w9_wolf_representable_translations_keep_exact_slot_bytes() {
+        for translation in ["Pay \\100", "Mark ~100", "Score －1", "こんにちは"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("BasicData.wolf");
+            let mut expected = build_null_separated_sjis_fixture(&["Hello world"]);
+            fs::write(&path, &expected).unwrap();
+            let plugin = WolfRpgPlugin::new();
+            let mut entries = plugin.extract(&path).unwrap();
+            assert_eq!(entries.len(), 1);
+            entries[0].translation = Some(translation.into());
+            let report = plugin.inject(&path, &entries).unwrap();
+            assert_eq!((report.strings_written, report.strings_skipped), (1, 0));
+            assert!(report.skip_reasons.is_empty());
+            assert_eq!(report.files_modified, 1);
+            assert_eq!(report.files_written, vec![path.clone()]);
+            let (encoded, _, had_errors) = encoding_rs::SHIFT_JIS.encode(translation);
+            assert!(!had_errors);
+            expected[16..27].fill(0);
+            expected[16..16 + encoded.len()].copy_from_slice(&encoded);
+            assert_eq!(fs::read(&path).unwrap(), expected);
+            assert_eq!(plugin.extract(&path).unwrap()[0].source, translation);
         }
     }
 

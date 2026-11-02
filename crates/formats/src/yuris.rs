@@ -408,6 +408,15 @@ fn encode_sjis(s: &str) -> Result<Vec<u8>> {
     if had_errors {
         return Err(parse_err("ystb", "text cannot be encoded in Shift-JIS"));
     }
+    // Check only newly encoded text: expression text is already escaped,
+    // while protected raw-byte tokens bypass this helper.
+    let (decoded, _, decode_errors) = encoding_rs::SHIFT_JIS.decode(&bytes);
+    if decode_errors || decoded != s {
+        return Err(parse_err(
+            "ystb",
+            "text does not round-trip through Shift-JIS",
+        ));
+    }
     Ok(bytes.into_owned())
 }
 
@@ -1441,7 +1450,9 @@ fn ystb_skip_reason(error: &LocustError) -> &'static str {
         _ if message.starts_with("cannot edit overlapping attribute payload:") => {
             "overlapping_locators"
         }
-        "text cannot be encoded in Shift-JIS" => "not_encodable",
+        "text cannot be encoded in Shift-JIS" | "text does not round-trip through Shift-JIS" => {
+            "not_encodable"
+        }
         "unknown raw control token or bare CR" | "raw control sequence changed" => {
             "unsafe_controls"
         }
@@ -3547,6 +3558,146 @@ mod tests {
                 !e.metadata.contains_key("binary_slot"),
                 "YU-RIS rebuild must not set binary_slot"
             );
+        }
+    }
+
+    #[test]
+    fn w9_yuris_serialization_refuses_lossy_shift_jis_aliases() {
+        for attr_type in [ATTR_RAW, ATTR_EXPRESSION] {
+            for text in ["Cost ¥n coin", "Mark ‾100", "Score −1"] {
+                let (encoded, _, errors) = encoding_rs::SHIFT_JIS.encode(text);
+                assert!(!errors, "fixture must be silently mapped");
+                assert_ne!(decode_sjis(&encoded), text);
+                let err = serialize_attr_value(attr_type, text).unwrap_err();
+                assert!(err.to_string().contains("Shift-JIS"), "{err}");
+                assert_eq!(ystb_skip_reason(&err), "not_encodable");
+            }
+        }
+    }
+
+    #[test]
+    fn w9_yuris_inject_refuses_yen_without_changing_original_bytes() {
+        for packed in [false, true] {
+            for attr_type in [ATTR_RAW, ATTR_EXPRESSION] {
+                let dir = tempfile::tempdir().unwrap();
+                let original = real_layout(
+                    &[(
+                        108,
+                        vec![(
+                            0,
+                            attr_type,
+                            if attr_type == ATTR_RAW {
+                                b"Hello, traveler!".to_vec()
+                            } else {
+                                fixture_expr("Hello, traveler!")
+                            },
+                        )],
+                    )],
+                    TRUE_KEY_B4626AD8,
+                );
+                let path = dir
+                    .path()
+                    .join(if packed { "game.ypf" } else { "story.ybn" });
+                let original = if packed {
+                    yuris_ypf::write_ypf(0x1E4, 0xFF, &[("story.ybn".into(), original, true)])
+                        .unwrap()
+                } else {
+                    original
+                };
+                fs::write(&path, &original).unwrap();
+                let plugin = YurisPlugin::new();
+                let mut rows = plugin.extract(dir.path()).unwrap();
+                assert_eq!(rows.len(), 1);
+                rows[0].translation = Some("Cost ¥n coin".into());
+                let report = plugin.inject(dir.path(), &rows).unwrap();
+                assert_eq!((report.strings_written, report.strings_skipped), (0, 1));
+                assert_eq!(report.skip_reasons, [("not_encodable".into(), 1)].into());
+                assert_eq!(report.files_modified, 0);
+                assert!(report.files_written.is_empty());
+                assert_eq!(report.warnings.len(), 1);
+                assert!(report.warnings[0].contains(&rows[0].id));
+                assert!(report.warnings[0].contains("Shift-JIS"));
+                assert_eq!(fs::read(&path).unwrap(), original);
+                assert_eq!(
+                    plugin.extract(dir.path()).unwrap()[0].source,
+                    rows[0].source
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn w9_yuris_mixed_injection_preserves_refused_attributes_and_raw_tokens() {
+        for packed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            // Include an invalid pair, a noncanonical CP932 alias, a word
+            // control, an engine line break, and literal CRLF bytes.
+            let raw = b"Keep\x81\x01\xED\x40\xEF\xF2\xEF\xF0bytes\r\n";
+            let refused = fixture_expr("Hello, traveler!");
+            let original = real_layout(
+                &[
+                    (108, vec![(0, ATTR_EXPRESSION, refused.clone())]),
+                    (108, vec![(0, ATTR_RAW, raw.to_vec())]),
+                    (
+                        108,
+                        vec![(0, ATTR_EXPRESSION, fixture_expr("Welcome home."))],
+                    ),
+                ],
+                TRUE_KEY_B4626AD8,
+            );
+            let path = dir
+                .path()
+                .join(if packed { "game.ypf" } else { "story.ybn" });
+            let original = if packed {
+                yuris_ypf::write_ypf(0x1E4, 0xFF, &[("story.ybn".into(), original, true)]).unwrap()
+            } else {
+                original
+            };
+            fs::write(&path, original).unwrap();
+            let plugin = YurisPlugin::new();
+            let mut rows = plugin.extract(dir.path()).unwrap();
+            assert_eq!(rows.len(), 3);
+            let raw_translation = format!("Hola {}", rows[1].source);
+            let ordinary = "Cost \\n coin\tend\r\nNext line";
+            rows[0].translation = Some("Cost ¥n coin".into());
+            rows[1].translation = Some(raw_translation.clone());
+            rows[2].translation = Some(ordinary.into());
+            let report = plugin.inject(dir.path(), &rows).unwrap();
+            assert_eq!((report.strings_written, report.strings_skipped), (2, 1));
+            assert_eq!(report.skip_reasons, [("not_encodable".into(), 1)].into());
+            assert_eq!(report.files_modified, 1);
+            assert_eq!(report.files_written, vec![path.clone()]);
+            let refusals: Vec<_> = report
+                .warnings
+                .iter()
+                .filter(|w| w.starts_with("skip "))
+                .collect();
+            assert_eq!(refusals.len(), 1);
+            assert!(refusals[0].contains(&rows[0].id));
+            let bytes = if packed {
+                let archive = YpfArchive::open(&path).unwrap();
+                archive.read_entry(&archive.entries[0]).unwrap()
+            } else {
+                fs::read(&path).unwrap()
+            };
+            let after = load_ystb(&bytes, "after").unwrap().unwrap();
+            let (_, _, values, _) = section_offsets(&after.hdr);
+            let body = b"`Cost \\\\n coin\\tend\\nNext line`";
+            let mut expression = vec![PUSH_STRING];
+            expression.extend_from_slice(&(body.len() as u16).to_le_bytes());
+            expression.extend_from_slice(body);
+            for (index, expected) in [refused, [b"Hola ".as_slice(), raw].concat(), expression]
+                .into_iter()
+                .enumerate()
+            {
+                let attr = &after.attrs[index];
+                let start = values + attr.offset as usize;
+                assert_eq!(&after.data[start..start + attr.size as usize], expected);
+            }
+            let again = plugin.extract(dir.path()).unwrap();
+            assert_eq!(again[0].source, rows[0].source);
+            assert_eq!(again[1].source, raw_translation);
+            assert_eq!(again[2].source, ordinary);
         }
     }
 
