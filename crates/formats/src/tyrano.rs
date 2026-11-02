@@ -353,7 +353,7 @@ fn ks_tag(line: &str, range: Range<usize>, body: Range<usize>) -> KsTag<'_> {
     KsTag { range, name, body }
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ScanState {
     comment: bool,
     script: bool,
@@ -508,6 +508,10 @@ struct KsSlot {
     locator: String,
     range: Range<usize>,
     kind: SlotKind,
+    // A fragment can change line-prefix dispatch or consume an adjacent tag.
+    // Keep its original line and incoming scanner state for contextual checks.
+    line_range: Range<usize>,
+    scan_state: ScanState,
     // Every byte outside the selected values on this line, including controls,
     // spacing, targets, storage and quotes. Independent of value lengths.
     guard: Vec<String>,
@@ -600,12 +604,16 @@ fn literal_attribute(value: &str) -> bool {
 }
 
 fn scenario_slots(text: &str) -> Vec<KsSlot> {
-    let mut state = ScanState::default();
+    scenario_slots_with_state(text, ScanState::default())
+}
+
+fn scenario_slots_with_state(text: &str, mut state: ScanState) -> Vec<KsSlot> {
     let mut slots = Vec::new();
     let mut offset = 0;
     for (idx, physical) in text.split_inclusive('\n').enumerate() {
         let line = physical.strip_suffix('\n').unwrap_or(physical);
         let line = line.strip_suffix('\r').unwrap_or(line);
+        let scan_state = state.clone();
         let scan = scan_line(line, &mut state);
         let line_no = idx + 1;
         let first_slot = slots.len();
@@ -614,6 +622,8 @@ fn scenario_slots(text: &str) -> Vec<KsSlot> {
                 locator: line_no.to_string(),
                 range: speaker_range(line).unwrap(),
                 kind: SlotKind::Speaker,
+                line_range: offset..offset + line.len(),
+                scan_state: scan_state.clone(),
                 guard: Vec::new(),
             });
         } else {
@@ -624,6 +634,8 @@ fn scenario_slots(text: &str) -> Vec<KsSlot> {
                         locator: format!("{line_no}:attr:{tag_no}:{name}"),
                         range,
                         kind: SlotKind::Attribute(quote),
+                        line_range: offset..offset + line.len(),
+                        scan_state: scan_state.clone(),
                         guard: Vec::new(),
                     });
                 }
@@ -634,6 +646,8 @@ fn scenario_slots(text: &str) -> Vec<KsSlot> {
                         locator: line_no.to_string(),
                         range: 0..line.len(),
                         kind: SlotKind::Dialogue,
+                        line_range: offset..offset + line.len(),
+                        scan_state: scan_state.clone(),
                         guard: Vec::new(),
                     });
                 } else {
@@ -642,6 +656,8 @@ fn scenario_slots(text: &str) -> Vec<KsSlot> {
                             locator: format!("{line_no}:text:{part}"),
                             range,
                             kind: SlotKind::Text,
+                            line_range: offset..offset + line.len(),
+                            scan_state: scan_state.clone(),
                             guard: Vec::new(),
                         });
                     }
@@ -820,7 +836,31 @@ fn bare_attribute_quote(translation: &str) -> std::result::Result<Option<char>, 
         .ok_or(())
 }
 
-fn safe_replacement(slot: &KsSlot, source: &str, translation: &str) -> bool {
+/// Re-scan the complete line from its original state: checking the translated
+/// fragment alone misses prefix dispatch, whitespace-only text and escaped tags.
+fn fragment_structure_preserved(text: &str, slot: &KsSlot, translation: &str) -> bool {
+    let line = &text[slot.line_range.clone()];
+    let mut rebuilt = line.to_string();
+    rebuilt.replace_range(
+        slot.range.start - slot.line_range.start..slot.range.end - slot.line_range.start,
+        translation,
+    );
+    let mut old_state = slot.scan_state.clone();
+    let mut new_state = slot.scan_state.clone();
+    let old = scan_line(line, &mut old_state);
+    let new = scan_line(&rebuilt, &mut new_state);
+    old.kind == new.kind
+        && old.split == new.split
+        && old_state == new_state
+        && revision_aligned(
+            line,
+            &scenario_slots_with_state(line, slot.scan_state.clone()),
+            &rebuilt,
+            &scenario_slots_with_state(&rebuilt, slot.scan_state.clone()),
+        )
+}
+
+fn safe_replacement(slot: &KsSlot, text: &str, translation: &str) -> bool {
     if translation.is_empty() || translation.contains(['\r', '\n', '\0']) {
         return false;
     }
@@ -833,10 +873,12 @@ fn safe_replacement(slot: &KsSlot, source: &str, translation: &str) -> bool {
                 }
         }
         SlotKind::Speaker => !translation.contains(':') && !translation.trim().is_empty(),
-        SlotKind::Text => !translation.contains('['),
+        SlotKind::Text => {
+            !translation.contains('[') && fragment_structure_preserved(text, slot, translation)
+        }
         SlotKind::Dialogue => {
             scan_line(translation, &mut ScanState::default()).kind == LineKind::Text
-                && preserved_tags(source, translation)
+                && preserved_tags(&text[slot.range.clone()], translation)
         }
     }
 }
@@ -900,7 +942,7 @@ fn apply_ks_translations_with_report(
             Some("stale_translation")
         } else if entry.require_preserved_translation_controls().is_err() {
             Some("invalid_placeholders")
-        } else if !safe_replacement(slot, &entry.source, translation) {
+        } else if !safe_replacement(slot, &decoded.text, translation) {
             Some("invalid_translation")
         } else if translation == entry.source {
             Some("unchanged")
@@ -1330,12 +1372,7 @@ impl FormatPlugin for TyranoPlugin {
             let actual = if file_path.exists() {
                 file_path.clone()
             } else {
-                let as_rel = search_root.join(&file_path);
-                if as_rel.exists() {
-                    as_rel
-                } else {
-                    search_root.join(file_path.file_name().unwrap_or_default())
-                }
+                search_root.join(&file_path)
             };
             if !actual.exists() {
                 report
@@ -2054,6 +2091,228 @@ mod tests {
             &entries.iter().collect::<Vec<_>>(),
         )
         .unwrap()
+    }
+
+    fn w7_a7_reject_leading_fragment(prefix: char) {
+        for leading in ["", " \t", "\u{2003}"] {
+            for whitespace in ["", " \t", "\u{2003}"] {
+                let text = format!("{leading}Hello[glink text=Go]\r\n");
+                let dir = tempdir();
+                let path = write_tyrano_layout(dir.path(), "scene.ks", &text, true);
+                let plugin = TyranoPlugin::new();
+                let mut entries = plugin.extract(dir.path()).unwrap();
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0].id, "data/scenario/scene.ks#1:text:0");
+                assert_eq!(entries[0].source, "Hello");
+                assert_eq!(entries[1].id, "data/scenario/scene.ks#1:attr:0:text");
+                assert_eq!(entries[1].source, "Go");
+                entries.truncate(1);
+                entries[0].translation = Some(format!("{whitespace}{prefix}Hola"));
+                let before = fs::read(&path).unwrap();
+                let report = plugin.inject(dir.path(), &entries).unwrap();
+                assert_eq!(
+                    (
+                        report.strings_written,
+                        report.strings_skipped,
+                        report.files_modified
+                    ),
+                    (0, 1, 0),
+                    "{prefix:?}, leading={leading:?}, whitespace={whitespace:?}: {report:?}"
+                );
+                assert_eq!(report.skip_reasons.get("invalid_translation"), Some(&1));
+                assert!(report.files_written.is_empty());
+                assert_eq!(fs::read(&path).unwrap(), before);
+                let again = plugin.extract(dir.path()).unwrap();
+                assert_eq!(again[0].id, entries[0].id);
+                assert_eq!(again[0].source, entries[0].source);
+                assert_eq!(again[1].source, "Go");
+            }
+        }
+    }
+
+    #[test]
+    fn w7_a7_leading_fragment_cannot_become_comment() {
+        w7_a7_reject_leading_fragment(';');
+    }
+
+    #[test]
+    fn w7_a7_leading_fragment_cannot_become_label() {
+        w7_a7_reject_leading_fragment('*');
+    }
+
+    #[test]
+    fn w7_a7_leading_fragment_cannot_become_speaker() {
+        w7_a7_reject_leading_fragment('#');
+    }
+
+    #[test]
+    fn w7_a7_leading_fragment_cannot_become_command() {
+        w7_a7_reject_leading_fragment('@');
+    }
+
+    #[test]
+    fn w7_a7_fragment_cannot_remove_or_swallow_slots() {
+        for (text, translation) in [
+            ("Hello[glink text=Go]\r\n", " "),
+            ("Hello[glink text=Go]\r\n", "\\"),
+            ("Hello[glink text=Go]\r\n", "Hola\\"),
+            // The runtime's substring reset makes this line visible despite
+            // incoming script mode. Removing it must not hide this or later rows.
+            ("@iscript\r\nendscript Hello[glink text=Go]\r\n", "Hola"),
+        ] {
+            let mut entries = c119_entries(text);
+            entries.truncate(1);
+            entries[0].translation = Some(translation.into());
+            let mut report = empty_injection_report();
+            let out = apply_ks_translations_with_report(
+                text.as_bytes(),
+                "scene.ks",
+                &entries.iter().collect::<Vec<_>>(),
+                &mut report,
+            )
+            .unwrap();
+            assert!(out.is_none(), "unsafe fragment {translation:?}: {report:?}");
+            assert_eq!(report.strings_skipped, 1);
+            assert_eq!(report.skip_reasons.get("invalid_translation"), Some(&1));
+        }
+    }
+
+    #[test]
+    fn w7_a7_fragments_and_attributes_roundtrip_in_line_context() {
+        for (prefix, translation) in [
+            ("", "Hola"),
+            (" \t", "Hola"),
+            ("; keep\r\n \t", "Hola"),
+            ("[wait time=1]", ";Hola"),
+            ("[wait time=1]", "*Hola"),
+            ("[wait time=1]", "#Hola"),
+            ("[wait time=1]", "@Hola"),
+        ] {
+            let text = format!("{prefix}Hello[glink text=Go] tail\r\n");
+            let expected =
+                format!("{prefix}{translation}[glink text=\"Seguir adelante\"] final\r\n");
+            let mut entries = c119_entries(&text);
+            let original: Vec<_> = entries
+                .iter()
+                .map(|e| (e.id.clone(), e.source.clone()))
+                .collect();
+            assert_eq!(original.len(), 3);
+            for (entry, value) in entries
+                .iter_mut()
+                .zip([translation, "Seguir adelante", " final"])
+            {
+                entry.translation = Some(value.into());
+            }
+            let (out, written, skipped) = c119_apply(&text, &entries).unwrap();
+            assert_eq!((written, skipped), (3, 0));
+            assert_eq!(out, expected.as_bytes());
+            assert_eq!(classify_lines(&text), classify_lines(&expected));
+            let again = c119_entries(&expected);
+            assert_eq!(
+                again.iter().map(|e| &e.id).collect::<Vec<_>>(),
+                entries.iter().map(|e| &e.id).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                again.iter().map(|e| e.source.as_str()).collect::<Vec<_>>(),
+                [translation, "Seguir adelante", " final"]
+            );
+            assert_eq!(
+                entries
+                    .iter()
+                    .map(|e| (e.id.clone(), e.source.clone()))
+                    .collect::<Vec<_>>(),
+                original
+            );
+        }
+    }
+
+    #[test]
+    fn w7_a7_missing_loose_path_never_uses_matching_basename() {
+        for absolute in [false, true] {
+            let dir = tempdir();
+            let relative = PathBuf::from("data/scenario/chapter/a.ks");
+            let missing = dir.path().join(&relative);
+            c122_write(&missing, "loose", "\u{feff}Hello.[p]\r\n");
+            let plugin = TyranoPlugin::new();
+            let mut entries = plugin.extract(dir.path()).unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].id, "data/scenario/chapter/a.ks#1");
+            assert_eq!(entries[0].source, "Hello.[p]");
+            entries[0].translation = Some("Hola.[p]".into());
+            if !absolute {
+                entries[0].file_path = relative;
+            }
+            let unrelated = dir.path().join("a.ks");
+            fs::rename(&missing, &unrelated).unwrap();
+            let before = fs::read(&unrelated).unwrap();
+            let report = plugin.inject(dir.path(), &entries).unwrap();
+            assert_eq!(
+                (
+                    report.strings_written,
+                    report.strings_skipped,
+                    report.files_modified
+                ),
+                (0, 1, 0),
+                "absolute={absolute}: {report:?}"
+            );
+            assert_eq!(report.skip_reasons.get("target_missing"), Some(&1));
+            assert!(report.files_written.is_empty());
+            assert!(!report.warnings.is_empty());
+            assert_eq!(fs::read(&unrelated).unwrap(), before);
+            assert!(!missing.exists());
+            assert_eq!(entries[0].id, "data/scenario/chapter/a.ks#1");
+            assert_eq!(entries[0].source, "Hello.[p]");
+        }
+    }
+
+    #[test]
+    fn w7_a7_loose_exact_and_game_relative_paths_work_in_output_copy() {
+        for relative in [false, true] {
+            for copied in [false, true] {
+                let dir = tempdir();
+                let game = dir.path().join("game");
+                let rel = PathBuf::from("data/scenario/chapter/a.ks");
+                let source = game.join(&rel);
+                let text = "\u{feff}Hello.[p]\r\n";
+                c122_write(&source, "loose", text);
+                let plugin = TyranoPlugin::new();
+                let mut entries = plugin.extract(&game).unwrap();
+                entries[0].translation = Some("Hola.[p]".into());
+                let destination = if copied {
+                    dir.path().join("output")
+                } else {
+                    game.clone()
+                };
+                let target = destination.join(&rel);
+                if copied {
+                    c122_write(&target, "loose", text);
+                }
+                entries[0].file_path = if relative { rel } else { target.clone() };
+                let unrelated = destination.join("a.ks");
+                fs::write(&unrelated, text).unwrap();
+                let report = plugin.inject(&destination, &entries).unwrap();
+                assert_eq!(
+                    (
+                        report.strings_written,
+                        report.strings_skipped,
+                        report.files_modified
+                    ),
+                    (1, 0, 1),
+                    "relative={relative}, copied={copied}: {report:?}"
+                );
+                assert_eq!(report.files_written, std::slice::from_ref(&target));
+                assert_eq!(
+                    fs::read(&target).unwrap(),
+                    text.replace("Hello", "Hola").as_bytes()
+                );
+                assert_eq!(fs::read(&unrelated).unwrap(), text.as_bytes());
+                if copied {
+                    assert_eq!(fs::read(&source).unwrap(), text.as_bytes());
+                }
+                assert_eq!(entries[0].id, "data/scenario/chapter/a.ks#1");
+                assert_eq!(entries[0].source, "Hello.[p]");
+            }
+        }
     }
 
     #[test]
