@@ -3390,6 +3390,52 @@ mod text_fit_tests {
     }
 
     #[tokio::test]
+    async fn text_fit_native_http_refresh_parity_and_metric_reuse() {
+        let state = locust_server::create_test_state();
+        *state.current_project.write().await = Some(ProjectInfo {
+            path: "owned-game".into(),
+            ..Default::default()
+        });
+        let row = StringEntry::new("owned#cmd_1#msg", "iii", "any.asset".into())
+            .with_format_id("rpgmaker-mv")
+            .with_tags(vec!["dialogue".into()]);
+        state.db.save_entries(std::slice::from_ref(&row)).unwrap();
+        let before = serde_json::to_value(state.db.get_entry(&row.id).unwrap()).unwrap();
+        let mut wire_request = json!({
+            "entry_id": row.id,
+            "font_path": Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../crates/core/tests/fixtures/proportional-latin.ttf"),
+            "font_size_px": 20.0,
+            "usable_width_px": 30.0,
+            "draft_text": "WWW",
+        });
+        let request: TextFitRequest = serde_json::from_value(wire_request.clone()).unwrap();
+        let expected = apply_text_fit(&state, request).await.unwrap();
+        wire_request["refresh_font"] = true.into();
+        let request: TextFitRequest = serde_json::from_value(wire_request).unwrap();
+        let (base, server) = locust_server::start_test_server(state.clone()).await;
+        let native = apply_text_fit(&state, request.clone()).await.unwrap();
+        let (status, body) = http_estimate(&base, &request).await;
+        assert_eq!(status, 200);
+        assert_eq!(native, expected);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!(native)
+        );
+        let stats = state.text_fit_cache.lock().unwrap().stats();
+        assert_eq!(
+            stats.font_reads, 3,
+            "one warmup and one reread per transport"
+        );
+        assert_eq!(stats.font_parses, 1);
+        assert_eq!(
+            serde_json::to_value(state.db.get_entry(&row.id).unwrap()).unwrap(),
+            before
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn text_fit_native_http_parity_and_read_only() {
         let state = locust_server::create_test_state();
         *state.current_project.write().await = Some(ProjectInfo {
@@ -3418,6 +3464,7 @@ mod text_fit_tests {
             font_size_px: 28.0,
             usable_width_px: 56.0,
             draft_text: Some("Hola\n WWW \n".into()),
+            refresh_font: false,
         };
         {
             let _operation = try_project_operation(&state).unwrap();

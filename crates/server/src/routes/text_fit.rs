@@ -79,6 +79,7 @@ mod tests {
             font_size_px: 28.0,
             usable_width_px: 56.0,
             draft_text: Some("Hola\n WWW ".into()),
+            refresh_font: false,
         }
     }
 
@@ -111,6 +112,51 @@ mod tests {
         assert_eq!(body["source"][0]["status"], "unavailable");
         assert_eq!(body["draft"][0]["advance_px"], 56.0);
         assert_eq!(body["draft"][1]["status"], "exceeds_width");
+        assert_eq!(snapshot(&state, &entry.id), before);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn http_refresh_rereads_only_selected_font_and_legacy_requests_stay_warm() {
+        let (base, server, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        let entry = row();
+        state.db.save_entries(std::slice::from_ref(&entry)).unwrap();
+        let before = snapshot(&state, &entry.id);
+        let mut request = serde_json::to_value(request(&entry.id)).unwrap();
+        request.as_object_mut().unwrap().remove("refresh_font");
+        let endpoint = format!("{base}/api/text-fit");
+        let expected: Value = client()
+            .post(&endpoint)
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let mut expected_reads = 1;
+        for refresh in [None, Some(false), Some(true), None] {
+            request.as_object_mut().unwrap().remove("refresh_font");
+            if let Some(refresh) = refresh {
+                request["refresh_font"] = refresh.into();
+            }
+            let response = client()
+                .post(&endpoint)
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            assert_eq!(response.json::<Value>().await.unwrap(), expected);
+            if refresh == Some(true) {
+                expected_reads += 1;
+            }
+            let stats = state.text_fit_cache.lock().unwrap().stats();
+            assert_eq!(stats.font_reads, expected_reads);
+            assert_eq!(stats.font_parses, 1);
+        }
+        assert_eq!(state.text_fit_cache.lock().unwrap().stats().font_reads, 2);
         assert_eq!(snapshot(&state, &entry.id), before);
         server.abort();
     }

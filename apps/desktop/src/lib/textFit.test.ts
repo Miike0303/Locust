@@ -157,6 +157,83 @@ test("requests debounce for 250 ms, send independent current draft, and leave ro
   assert.equal(JSON.stringify({ row, validProfile }), snapshot);
 });
 
+test("Refresh font sends one immediate request and cancels the pending draft debounce", async context => {
+  estimate().refreshFont();
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls[0].body.refresh_font, true);
+  context.mock.timers.tick(250);
+  assert.equal(h.calls.length, 1, "the superseded debounce must not send another request");
+  await finish(); assert.deepEqual(estimate().data, response);
+  options = { ...options, draft: "normal draft" }; estimate(); context.mock.timers.tick(250);
+  assert.equal(h.calls.length, 2);
+  assert.equal(Object.hasOwn(h.calls[1].body, "refresh_font"), false);
+});
+
+test("refresh after a draft render retains ownership across the previous effect cleanup", async context => {
+  estimate(); context.mock.timers.tick(250);
+  options = { ...options, draft: "just edited" };
+  estimate(false).refreshFont();
+  assert.equal(h.calls.length, 2); assert.equal(h.calls[1].body.refresh_font, true);
+  flush(); context.mock.timers.tick(250);
+  assert.equal(h.calls.length, 2, "effect setup must preserve the explicit refresh");
+  assert.equal(h.calls[1].signal.aborted, false);
+  await finish(1); assert.deepEqual(estimate().data, response);
+});
+
+test("refresh supersedes older successes and failures, including repeated refreshes", async context => {
+  estimate(); context.mock.timers.tick(250); const oldSignal = h.calls[0].signal;
+  estimate().refreshFont(); assert.equal(oldSignal.aborted, true);
+  assert.equal(estimate().loading, true);
+  const firstRefreshSignal = h.calls[1].signal;
+  estimate().refreshFont(); assert.equal(firstRefreshSignal.aborted, true);
+  await finish(2); assert.deepEqual(estimate().data, response);
+  await finish(0, { source: [], draft: [] });
+  h.requests[1].reject(Error("obsolete refresh")); await Promise.resolve(); await Promise.resolve();
+  assert.deepEqual(estimate().data, response); assert.equal(estimate().error, undefined);
+});
+
+test("refresh clears a visible estimate and displays the owned error", async context => {
+  estimate(); context.mock.timers.tick(250); await finish(); assert.deepEqual(estimate().data, response);
+  estimate().refreshFont(); assert.equal(estimate().data, undefined); assert.equal(estimate().loading, true);
+  h.requests[1].reject(Error("font unreadable")); await Promise.resolve(); await Promise.resolve();
+  assert.equal(estimate().loading, false); assert.equal(estimate().error, "font unreadable");
+});
+
+for (const change of ["row", "project", "collapse", "unmount", "transition"] as const) test(`refresh completion is discarded after ${change}`, async () => {
+  estimate().refreshFont(); assert.equal(h.calls.length, 1); const signal = h.calls[0].signal;
+  if (change === "row") options = { ...options, entry: { ...row, id: "Map002.json#cmd_1#msg" } };
+  if (change === "project") { options = { ...options, projectKey: "project-b" }; h.confirmed = "project-b"; }
+  if (change === "collapse") options = { ...options, enabled: false };
+  if (change === "unmount") h.cleanups.forEach(fn => fn?.());
+  if (change === "transition") h.transition = true;
+  else if (change !== "unmount") {
+    assert.equal(estimate(false).data, undefined);
+    assert.equal(signal.aborted, true);
+  }
+  await finish(); assert.equal(estimate(false).data, undefined, "completion before effect cleanup cannot publish");
+});
+
+test("refresh cannot dispatch from a stale row callback or during a live project transition", () => {
+  const oldRefresh = estimate().refreshFont;
+  options = { ...options, entry: { ...row, id: "Map002.json#cmd_1#msg" } }; estimate(false);
+  oldRefresh(); assert.equal(h.calls.length, 0);
+  flush(); const refresh = estimate().refreshFont; h.transition = true;
+  refresh(); assert.equal(h.calls.length, 0);
+});
+
+test("Refresh font button requires an active configured profile and uses the current unsaved draft", context => {
+  expand();
+  const button = () => nodes(component()).find(node => node.type === "button" && node.props.children === t("textFit.refreshFont"));
+  assert.ok(button()); assert.equal(button().props.disabled, true);
+  for (const [suffix, value] of [["-font", "fixture.ttf"], ["-size", "20"], ["-width", "30"]]) control(suffix).props.onChange({ target: { value } });
+  const tree = component("project-a", row, "unsaved draft");
+  const refresh = nodes(tree).find(node => node.type === "button" && node.props.children === t("textFit.refreshFont"));
+  assert.equal(refresh.props.disabled, false); refresh.props.onClick();
+  assert.equal(h.calls.length, 1); assert.equal(h.calls[0].body.refresh_font, true);
+  assert.equal(h.calls[0].body.draft_text, "unsaved draft");
+  context.mock.timers.tick(250); assert.equal(h.calls.length, 1);
+});
+
 const changes: Record<string, () => void> = {
   row: () => { options = { ...options, entry: { ...row, id: "Map002.json#cmd_1#msg" } }; },
   project: () => { options = { ...options, projectKey: "project-b" }; h.confirmed = "project-b"; },
@@ -305,6 +382,9 @@ for (const tauri of [true, false]) test(`${tauri ? "Tauri" : "HTTP"} API preserv
     return new Response(JSON.stringify({ source: [], draft: [] }));
   };
   const controller = new AbortController(); const request = ui.textFitRequest(row.id, "typed\n", validProfile)!;
-  assert.deepEqual(await api.estimateTextFit(request, controller.signal), { source: [], draft: [] });
-  assert.deepEqual(h.transport, [tauri ? ["text_fit", { request }] : ["http://localhost:7842/api/text-fit", "POST", request, controller.signal]]);
+  for (const body of [request, { ...request, refresh_font: true }]) {
+    h.transport = [];
+    assert.deepEqual(await api.estimateTextFit(body, controller.signal), { source: [], draft: [] });
+    assert.deepEqual(h.transport, [tauri ? ["text_fit", { request: body }] : ["http://localhost:7842/api/text-fit", "POST", body, controller.signal]]);
+  }
 });

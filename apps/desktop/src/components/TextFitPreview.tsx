@@ -79,39 +79,50 @@ export function useTextFitEstimate({ projectKey, entry, draft, profile, enabled,
   const allowed = enabled && active && confirmed && isTextFitEligible(entry) && body !== null;
   const key = JSON.stringify([projectKey, entry.id, entry.source, draft, profile, allowed]);
   const identity = useRef({ key, generation: 0 });
-  const pending = useRef<{ controller: AbortController; key: string } | null>(null);
+  const pending = useRef<{ controller: AbortController; timer?: ReturnType<typeof setTimeout> } | null>(null);
+  const cancelPending = () => {
+    if (pending.current?.timer !== undefined) clearTimeout(pending.current.timer);
+    pending.current?.controller.abort();
+    pending.current = null;
+  };
   // Invalidate during render: effect cleanup alone can expose a completed old
   // request for one frame when row, project, source, draft or profile changes.
   if (identity.current.key !== key) {
     identity.current = { key, generation: identity.current.generation + 1 };
-    pending.current?.controller.abort();
-    pending.current = null;
+    cancelPending();
   }
   const generation = identity.current.generation;
   const [result, setResult] = useState<Result | null>(null);
-  useEffect(() => {
-    if (!allowed || !body) return;
-    const ticket = { controller: new AbortController(), key };
+  const startRequest = (refreshFont: boolean) => {
+    if (!allowed || !body || identity.current.key !== key || !isProjectScopedQueryEnabled(projectKey)) return;
+    cancelPending();
+    const requestGeneration = ++identity.current.generation;
+    const ticket: NonNullable<typeof pending.current> = { controller: new AbortController() };
     pending.current = ticket;
+    setResult(null);
     const owns = () => pending.current === ticket && identity.current.key === key
-      && identity.current.generation === generation && !ticket.controller.signal.aborted && isProjectScopedQueryEnabled(projectKey);
-    const timer = setTimeout(() => {
+      && identity.current.generation === requestGeneration && !ticket.controller.signal.aborted && isProjectScopedQueryEnabled(projectKey);
+    const send = () => {
       if (!owns()) return;
-      void estimateTextFit(body, ticket.controller.signal).then(data => {
-        if (owns()) setResult({ key, generation, data });
+      void estimateTextFit(refreshFont ? { ...body, refresh_font: true } : body, ticket.controller.signal).then(data => {
+        if (owns()) setResult({ key, generation: requestGeneration, data });
       }).catch(error => {
-        if (owns()) setResult({ key, generation, error: error instanceof Error ? error.message : String(error) });
+        if (owns()) setResult({ key, generation: requestGeneration, error: error instanceof Error ? error.message : String(error) });
       });
-    }, 250);
+    };
+    if (refreshFont) send();
+    else ticket.timer = setTimeout(send, 250);
+  };
+  useEffect(() => {
+    // A manual refresh may already own this render before passive effects run.
+    if (!pending.current) startRequest(false);
     return () => {
-      clearTimeout(timer);
-      ticket.controller.abort();
-      if (pending.current === ticket) pending.current = null;
+      if (identity.current.key === key) cancelPending();
     };
   }, [key]); // The key includes the complete request and its ownership context.
   const visible = allowed && result?.key === key && result.generation === generation ? result : null;
   return { configured: body !== null, data: visible?.data, error: visible?.error,
-    loading: allowed && !visible, active: allowed };
+    loading: allowed && !visible, active: allowed, refreshFont: () => startRequest(true) };
 }
 
 interface Props { projectKey: string; entry: StringEntry; draft: string }
@@ -174,6 +185,8 @@ export default function TextFitPreview({ projectKey, entry, draft }: Props) {
           className="min-w-0 w-full p-1 border border-border rounded bg-surface" />
         {IS_TAURI && <button type="button" onClick={chooseFont} className="underline">{t("textFit.browse")}</button>}
       </div>
+      <button type="button" onClick={estimate.refreshFont} disabled={!estimate.active}
+        className="text-text-muted underline hover:text-text disabled:opacity-50">{t("textFit.refreshFont")}</button>
       <div className="grid grid-cols-2 gap-2">
         <label htmlFor={`${id}-size`}>{t("textFit.size")}
           <input id={`${id}-size`} type="number" min="0" step="any" value={profile.fontSize}

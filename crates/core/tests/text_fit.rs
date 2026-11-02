@@ -32,6 +32,7 @@ fn request(entry: &StringEntry, draft: &str) -> TextFitRequest {
         font_size_px: 20.0,
         usable_width_px: 30.0,
         draft_text: Some(draft.into()),
+        refresh_font: false,
     }
 }
 
@@ -381,6 +382,164 @@ fn cache_uses_content_and_settings_boundedly_without_stale_text() {
     }
     assert!(cache.stats().cached_profiles <= 4);
     assert!(cache.stats().cached_paths <= 4);
+}
+
+fn refresh_request(request: &TextFitRequest) -> TextFitRequest {
+    // Exercise the wire field too: old implementations deserialize but ignore it.
+    let mut value = serde_json::to_value(request).unwrap();
+    value["refresh_font"] = true.into();
+    serde_json::from_value(value).unwrap()
+}
+
+#[test]
+fn refresh_font_is_optional_for_legacy_requests() {
+    let mut value = serde_json::to_value(request(&entry("iii"), "WWW")).unwrap();
+    value.as_object_mut().unwrap().remove("refresh_font");
+    let legacy: TextFitRequest = serde_json::from_value(value).unwrap();
+    assert_eq!(serde_json::to_value(legacy).unwrap()["refresh_font"], false);
+}
+
+#[test]
+fn refresh_detects_same_length_rewrite_with_unchanged_stamp() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("chosen.ttf");
+    let mut bytes = std::fs::read(fixture()).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    let row = entry("iii");
+    let mut req = request(&row, "WWW");
+    req.font_path = path.clone();
+    let mut cache = TextFitCache::default();
+    let original = estimate_entry(&row, &req, &mut cache).unwrap();
+    assert_eq!(original.draft[0].advance_px, Some(54.0));
+    let before = std::fs::metadata(&path).unwrap();
+
+    let glyph = ttf_parser::Face::parse(&bytes, 0)
+        .unwrap()
+        .glyph_index('W')
+        .unwrap();
+    let table = ttf_parser::RawFace::parse(&bytes, 0)
+        .unwrap()
+        .table_records
+        .into_iter()
+        .find(|record| record.tag == ttf_parser::Tag::from_bytes(b"hmtx"))
+        .unwrap();
+    let offset = table.offset as usize + usize::from(glyph.0) * 4;
+    bytes[offset..offset + 2].copy_from_slice(&450_u16.to_be_bytes());
+    // FileStamp uses created() (birth time), not POSIX ctime/change-time.
+    // An in-place rewrite preserves birth time, including on Windows; restore
+    // mtime and verify every stamp field rather than needing to restore ctime.
+    std::fs::write(&path, &bytes).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(before.modified().unwrap()))
+        .unwrap();
+    let after = std::fs::metadata(&path).unwrap();
+    assert_eq!(after.len(), before.len());
+    assert_eq!(after.modified().ok(), before.modified().ok());
+    assert_eq!(after.created().ok(), before.created().ok());
+
+    assert_eq!(estimate_entry(&row, &req, &mut cache).unwrap(), original);
+    assert_eq!(cache.stats().font_reads, 1);
+    let refreshed = estimate_entry(&row, &refresh_request(&req), &mut cache).unwrap();
+    assert_eq!(refreshed.draft[0].advance_px, Some(27.0));
+    assert_eq!(refreshed.draft[0].status, EstimateStatus::WithinWidth);
+    assert_eq!(cache.stats().font_reads, 2);
+    assert_eq!(cache.stats().font_parses, 2);
+    assert_eq!(estimate_entry(&row, &req, &mut cache).unwrap(), refreshed);
+    assert_eq!(cache.stats().font_reads, 2);
+}
+
+#[test]
+fn warm_draft_and_profile_requests_do_not_reread_font() {
+    let row = entry("iii");
+    let mut req = request(&row, "WWW");
+    let mut cache = TextFitCache::default();
+    estimate_entry(&row, &req, &mut cache).unwrap();
+    for revision in 1..=8 {
+        req.draft_text = Some("W".repeat(revision));
+        req.usable_width_px = 30.0 + revision as f64;
+        let result = estimate_entry(&row, &req, &mut cache).unwrap();
+        assert_eq!(result.draft[0].advance_px, Some(18.0 * revision as f64));
+    }
+    assert_eq!(cache.stats().font_reads, 1);
+    assert_eq!(cache.stats().font_parses, 1);
+}
+
+#[test]
+fn refresh_of_unchanged_hash_rereads_once_without_reparsing_metrics() {
+    let row = entry("iii");
+    let req = request(&row, "WWW");
+    let mut cache = TextFitCache::default();
+    let expected = estimate_entry(&row, &req, &mut cache).unwrap();
+    assert_eq!(
+        estimate_entry(&row, &refresh_request(&req), &mut cache).unwrap(),
+        expected
+    );
+    assert_eq!(cache.stats().font_reads, 2);
+    assert_eq!(cache.stats().font_parses, 1);
+    assert_eq!(cache.stats().cached_paths, 1);
+    assert_eq!(cache.stats().cached_fonts, 1);
+    assert_eq!(cache.stats().cached_profiles, 1);
+    assert_eq!(cache.stats().cached_results, 1);
+    assert_eq!(estimate_entry(&row, &req, &mut cache).unwrap(), expected);
+    assert_eq!(cache.stats().font_reads, 2);
+}
+
+#[test]
+fn concurrent_refresh_of_one_path_keeps_other_warm_paths() {
+    use std::sync::{Arc, Barrier, Mutex};
+
+    let directory = tempfile::tempdir().unwrap();
+    let row = entry("iii");
+    let mut requests = Vec::new();
+    let mut cache = TextFitCache::default();
+    // Fill all four path slots so reinserting a refresh cannot evict a peer.
+    for index in 0..4 {
+        let mut req = request(&row, "WWW");
+        req.font_path = directory.path().join(format!("font-{index}.ttf"));
+        std::fs::copy(fixture(), &req.font_path).unwrap();
+        estimate_entry(&row, &req, &mut cache).unwrap();
+        requests.push(req);
+    }
+    let cache = Arc::new(Mutex::new(cache));
+    let barrier = Arc::new(Barrier::new(4));
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = requests
+            .iter()
+            .enumerate()
+            .map(|(index, req)| {
+                let cache = cache.clone();
+                let barrier = barrier.clone();
+                let row = &row;
+                scope.spawn(move || {
+                    barrier.wait();
+                    let req = if index == 0 {
+                        refresh_request(req)
+                    } else {
+                        req.clone()
+                    };
+                    let result = estimate_entry(row, &req, &mut cache.lock().unwrap()).unwrap();
+                    assert_eq!(result.draft[0].advance_px, Some(54.0));
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    });
+    let mut cache = cache.lock().unwrap();
+    for req in &requests {
+        estimate_entry(&row, req, &mut cache).unwrap();
+    }
+    assert_eq!(
+        cache.stats().font_reads,
+        5,
+        "only the refreshed path rereads"
+    );
+    assert_eq!(cache.stats().font_parses, 1);
+    assert_eq!(cache.stats().cached_paths, 4);
 }
 
 #[test]

@@ -22,6 +22,8 @@ pub struct TextFitRequest {
     pub font_size_px: f64,
     pub usable_width_px: f64,
     pub draft_text: Option<String>,
+    #[serde(default)]
+    pub refresh_font: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,8 +117,8 @@ struct CachedResult {
 /// Four paths, four parsed faces, four profiles, and four bounded text results.
 /// Unchanged path metadata avoids disk reads on each debounced draft revision.
 /// Changed metadata triggers a bounded read and SHA-256 content identity check.
-/// Replacing a file while preserving length and both timestamps is not detected;
-/// callers can clear the cache when explicit external edits require a reread.
+/// Explicit refresh drops only the selected path stamp, forcing a reread/hash
+/// while retaining parsed metrics and results for unchanged content.
 #[derive(Default)]
 pub struct TextFitCache {
     paths: VecDeque<CachedPath>,
@@ -158,6 +160,7 @@ impl TextFitCache {
         path: &Path,
         size: f64,
         width: f64,
+        refresh_font: bool,
     ) -> Result<(ProfileKey, ParsedFont), String> {
         if path.as_os_str().is_empty() {
             return Err("font_not_selected".into());
@@ -170,6 +173,10 @@ impl TextFitCache {
             })
         {
             return Err("unsupported_font_format: select a single static TTF/OTF face".into());
+        }
+        if refresh_font {
+            // Invalidate only this path; content-keyed metrics remain reusable.
+            self.paths.retain(|cached| cached.path != path);
         }
         let stamp = FileStamp::read(path)?;
         let cached_hash = self
@@ -270,6 +277,7 @@ pub fn estimate_entry(
         &request.font_path,
         request.font_size_px,
         request.usable_width_px,
+        request.refresh_font,
     ) {
         Ok(font) => font,
         Err(reason) => {

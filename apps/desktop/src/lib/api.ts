@@ -162,6 +162,7 @@ export interface TextFitRequest {
   font_size_px: number;
   usable_width_px: number;
   draft_text?: string;
+  refresh_font?: boolean;
 }
 
 export interface TextFitLine {
