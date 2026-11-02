@@ -979,7 +979,7 @@ fn a_first_direct_inject_that_writes_zero_files_explains_why_nothing_was_recorde
         "the skip cause must be named: {stdout}"
     );
     assert!(
-        stdout.contains("could not encode"),
+        stdout.contains("could not losslessly encode"),
         "the plugin's skip warnings must be surfaced, not just counted: {stdout}"
     );
 
