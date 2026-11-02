@@ -186,6 +186,7 @@ export const es: Record<keyof typeof en, string> = {
   "welcome.source.hint": "Elige una carpeta o un archivo del juego. Godot/Dialogic requiere un archivo .pck independiente.",
   "welcome.format.chooseSource": "Elegir origen del juego…",
   "format.desc.godot-dialogic": "Godot 4 .pck independiente con líneas de tiempo de Dialogic (experimental). Reemplazar crea una copia solo del archivo, no una carpeta de juego ejecutable.",
+  "inject.reviewOversized": "Revisar textos demasiado largos",
   "inject.archiveOnly": "Reemplazar crea una copia solo del PCK seleccionado. No incluye un juego ejecutable ni su lanzador.",
   "common.providerDefault": "Predeterminado del proveedor",
   "activity.translation.startingDefault": "Iniciando traducción con la cadena de proveedores: {chain}, origen: {source}, destino: {target}, lote: predeterminado",

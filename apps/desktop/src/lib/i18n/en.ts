@@ -184,6 +184,7 @@ export const en = {
   "welcome.source.hint": "Choose a folder or an individual game file. Godot/Dialogic requires a standalone .pck file.",
   "welcome.format.chooseSource": "Choose Game Source…",
   "format.desc.godot-dialogic": "Godot 4 standalone .pck with Dialogic timelines (experimental). Replace creates an archive-only copy, not a runnable game folder.",
+  "inject.reviewOversized": "Review oversized strings",
   "inject.archiveOnly": "Replace creates an archive-only copy of the selected PCK. It does not include a runnable game or launcher.",
   "common.providerDefault": "Provider default",
   "activity.translation.startingDefault": "Starting translation with chain: {chain}, source: {source}, target: {target}, batch: default",
