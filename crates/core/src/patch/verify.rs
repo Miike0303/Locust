@@ -1,6 +1,6 @@
 //! Read-only patch verification against a game tree.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -583,9 +583,23 @@ fn verify_with_manifest(
         }
         match compare_versions(&r.patch_version, &manifest.patch_version) {
             VersionOrder::Equal => {
-                let msg = format!("patch {}@{} already applied", r.patch_id, r.patch_version);
+                let mismatches = receipt_identity_mismatches(&manifest, r)?;
+                let (outcome, msg) = if mismatches.is_empty() {
+                    (
+                        VerificationOutcome::AlreadyApplied,
+                        format!("patch {}@{} already applied", r.patch_id, r.patch_version),
+                    )
+                } else {
+                    (
+                        VerificationOutcome::Mismatch(mismatches),
+                        format!(
+                            "patch {}@{} differs from the installed receipt; reapply required",
+                            r.patch_id, r.patch_version
+                        ),
+                    )
+                };
                 return Ok(VerificationReport {
-                    outcome: VerificationOutcome::AlreadyApplied,
+                    outcome,
                     tier: Some(if manifest.supports_strict_tier() {
                         VerificationTier::Strict
                     } else {
@@ -650,6 +664,68 @@ fn verify_with_manifest(
     } else {
         verify_structural(game_root, &manifest, backup_compromised, destinations)
     }
+}
+
+/// An id/version can name multiple artifacts (for example text-only and
+/// combined text/font patches). Compare the full installed payload inventory,
+/// independent of ordering and of apply's replaced/added classification.
+fn receipt_identity_mismatches(
+    manifest: &PatchManifest,
+    receipt: &Receipt,
+) -> Result<Vec<FileMismatch>> {
+    let mut installed = BTreeMap::new();
+    for (path, hash) in receipt
+        .replaced
+        .iter()
+        .map(|file| (&file.path, &file.patched_sha256))
+        .chain(
+            receipt
+                .added
+                .iter()
+                .map(|file| (&file.path, &file.patched_sha256)),
+        )
+    {
+        let path = super::zipsec::canonical_archive_name(path)?;
+        if installed.insert(path.clone(), hash).is_some() {
+            return Err(LocustError::PatchUnsafeEntry(format!(
+                "duplicate receipt target: {path}"
+            )));
+        }
+    }
+
+    let mut mismatches = Vec::new();
+    for file in &manifest.files {
+        // Manifest paths were canonicalized and validated against the archive.
+        let expected = installed.remove(&file.path);
+        if expected != Some(&file.patched_sha256) {
+            mismatches.push(FileMismatch {
+                path: file.path.clone(),
+                expected: expected.cloned().unwrap_or_else(|| "absent".into()),
+                found: file.patched_sha256.clone(),
+            });
+        }
+    }
+    for (path, hash) in installed {
+        mismatches.push(FileMismatch {
+            path,
+            expected: hash.clone(),
+            found: "absent".into(),
+        });
+    }
+    for (field, expected, found) in [
+        ("engine", &receipt.engine, &manifest.engine),
+        ("language", &receipt.language, &manifest.language),
+    ] {
+        if expected != found {
+            mismatches.push(FileMismatch {
+                path: format!("({field})"),
+                expected: expected.clone(),
+                found: found.clone(),
+            });
+        }
+    }
+    mismatches.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(mismatches)
 }
 
 fn verify_strict(

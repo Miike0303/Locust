@@ -34,7 +34,17 @@ fn write_file(root: &Path, rel: &str, contents: &[u8]) {
 type PatchZipFile<'a> = (&'a str, &'a [u8], Option<&'a [u8]>);
 
 fn build_patch_zip(path: &Path, files: &[PatchZipFile<'_>], version: &str, patch_id: &str) {
-    let manifest = PatchManifest {
+    build_patch_zip_with_manifest(path, files, version, patch_id, |_| {});
+}
+
+fn build_patch_zip_with_manifest(
+    path: &Path,
+    files: &[PatchZipFile<'_>],
+    version: &str,
+    patch_id: &str,
+    customize: impl FnOnce(&mut PatchManifest),
+) {
+    let mut manifest = PatchManifest {
         game: None,
         schema_version: 1,
         patch_id: patch_id.into(),
@@ -55,6 +65,7 @@ fn build_patch_zip(path: &Path, files: &[PatchZipFile<'_>], version: &str, patch
             })
             .collect(),
     };
+    customize(&mut manifest);
     let f = File::create(path).unwrap();
     let mut zip = ZipWriter::new(f);
     let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
@@ -164,6 +175,203 @@ fn already_applied_blocks_without_force() {
     let err = apply(&game, &zip, ApplyOptions::default(), |_| {}).unwrap_err();
     assert!(matches!(err, LocustError::PatchAlreadyApplied(_)));
     let _ = fs::remove_dir_all(&game);
+}
+
+/// Verification must preserve game bytes, paths, receipts and backup evidence,
+/// including when the incoming artifact differs from the installed receipt.
+fn verify_same_version_without_writes(
+    game: &Path,
+    zip: &Path,
+) -> locust_core::patch::VerificationReport {
+    let before = snapshot_patch_tree(game);
+    let report = verify(game, zip).unwrap();
+    assert_eq!(snapshot_patch_tree(game), before);
+    report
+}
+
+fn same_version_fixture() -> tempfile::TempDir {
+    let game = tmp_game("same_version_identity");
+    write_file(game.path(), "data/a.json", b"ORIGINAL");
+    write_file(game.path(), "fonts/game.ttf", b"ORIGINAL_FONT");
+    let zip = game.path().join("base.zip");
+    build_patch_zip(
+        &zip,
+        &[
+            ("data/a.json", b"TRANSLATED", Some(b"ORIGINAL")),
+            ("data/added.json", b"ADDED", None),
+        ],
+        "1.0.0",
+        "same-version",
+    );
+    apply(game.path(), &zip, ApplyOptions::default(), |_| {}).unwrap();
+    game
+}
+
+fn assert_same_version_mismatch(game: &Path, zip: &Path, path: &str) {
+    let report = verify_same_version_without_writes(game, zip);
+    let VerificationOutcome::Mismatch(mismatches) = &report.outcome else {
+        panic!(
+            "expected artifact identity mismatch, got {:?}",
+            report.outcome
+        );
+    };
+    assert!(
+        mismatches
+            .iter()
+            .any(|mismatch| mismatch.path == path && mismatch.expected != mismatch.found),
+        "expected mismatch for {path}: {mismatches:?}"
+    );
+    let manifest = report.manifest.unwrap();
+    assert_eq!(manifest.patch_id, "same-version");
+    assert_eq!(manifest.patch_version, "1.0.0");
+}
+
+#[test]
+fn same_version_combined_font_inventory_is_not_already_applied() {
+    let game = same_version_fixture();
+    let zip = game.path().join("combined.zip");
+    // Mirror combine_font_patch: append the loose font to the base inventory
+    // while retaining the translation patch's id, version and original hashes.
+    build_patch_zip(
+        &zip,
+        &[
+            ("data/a.json", b"TRANSLATED", Some(b"ORIGINAL")),
+            ("data/added.json", b"ADDED", None),
+            (
+                "fonts/game.ttf",
+                b"REPLACEMENT_FONT",
+                Some(b"ORIGINAL_FONT"),
+            ),
+        ],
+        "1.0.0",
+        "same-version",
+    );
+    assert_same_version_mismatch(game.path(), &zip, "fonts/game.ttf");
+    assert_eq!(
+        fs::read(game.path().join("fonts/game.ttf")).unwrap(),
+        b"ORIGINAL_FONT"
+    );
+}
+
+#[test]
+fn same_version_identical_inventory_is_already_applied() {
+    let game = same_version_fixture();
+    let report = verify_same_version_without_writes(game.path(), &game.path().join("base.zip"));
+    assert_eq!(report.outcome, VerificationOutcome::AlreadyApplied);
+
+    let zip = game.path().join("reordered.zip");
+    build_patch_zip_with_manifest(
+        &zip,
+        &[
+            (r"data\./added.json", b"ADDED", None),
+            ("./data//a.json", b"TRANSLATED", Some(b"ORIGINAL")),
+        ],
+        "1.0.0",
+        "same-version",
+        |manifest| {
+            manifest.created_at = "later".into();
+            manifest.generator_version = "another generator".into();
+        },
+    );
+    let report = verify_same_version_without_writes(game.path(), &zip);
+    assert_eq!(report.outcome, VerificationOutcome::AlreadyApplied);
+}
+
+#[test]
+fn same_version_changed_payload_hash_is_not_already_applied() {
+    for (path, patched, added) in [
+        ("data/a.json", &b"REVISED"[..], &b"ADDED"[..]),
+        ("data/added.json", &b"TRANSLATED"[..], &b"REVISED_ADD"[..]),
+    ] {
+        let game = same_version_fixture();
+        let zip = game.path().join("changed.zip");
+        build_patch_zip(
+            &zip,
+            &[
+                ("data/a.json", patched, Some(b"ORIGINAL")),
+                ("data/added.json", added, None),
+            ],
+            "1.0.0",
+            "same-version",
+        );
+        assert_same_version_mismatch(game.path(), &zip, path);
+    }
+}
+
+#[test]
+fn same_version_removed_payload_is_not_already_applied() {
+    let game = same_version_fixture();
+    let zip = game.path().join("removed.zip");
+    build_patch_zip(
+        &zip,
+        &[("data/a.json", b"TRANSLATED", Some(b"ORIGINAL"))],
+        "1.0.0",
+        "same-version",
+    );
+    assert_same_version_mismatch(game.path(), &zip, "data/added.json");
+}
+
+#[test]
+fn same_version_changed_payload_path_is_not_already_applied() {
+    let game = same_version_fixture();
+    let zip = game.path().join("renamed.zip");
+    build_patch_zip(
+        &zip,
+        &[
+            ("data/a.json", b"TRANSLATED", Some(b"ORIGINAL")),
+            ("data/renamed.json", b"ADDED", None),
+        ],
+        "1.0.0",
+        "same-version",
+    );
+    assert_same_version_mismatch(game.path(), &zip, "data/renamed.json");
+    assert_same_version_mismatch(game.path(), &zip, "data/added.json");
+}
+
+fn assert_same_version_metadata_mismatch(field: &str) {
+    let game = same_version_fixture();
+    let zip = game.path().join("metadata.zip");
+    build_patch_zip_with_manifest(
+        &zip,
+        &[
+            ("data/a.json", b"TRANSLATED", Some(b"ORIGINAL")),
+            ("data/added.json", b"ADDED", None),
+        ],
+        "1.0.0",
+        "same-version",
+        |manifest| match field {
+            "engine" => manifest.engine = "other_engine".into(),
+            "language" => manifest.language = "fr".into(),
+            _ => panic!("unexpected identity field {field}"),
+        },
+    );
+    assert_same_version_mismatch(game.path(), &zip, &format!("({field})"));
+}
+
+#[test]
+fn same_version_changed_engine_is_not_already_applied() {
+    assert_same_version_metadata_mismatch("engine");
+}
+
+#[test]
+fn same_version_changed_language_is_not_already_applied() {
+    assert_same_version_metadata_mismatch("language");
+}
+
+#[test]
+fn same_version_normalizes_receipt_inventory_paths() {
+    let game = same_version_fixture();
+    let store = PatchStore::new(game.path());
+    let mut receipt = store.read_receipt().unwrap().unwrap();
+    receipt.replaced[0].path = r"data\./a.json".into();
+    receipt.added[0].path = "./data//added.json".into();
+    fs::write(
+        store.receipt_path(),
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+    let report = verify_same_version_without_writes(game.path(), &game.path().join("base.zip"));
+    assert_eq!(report.outcome, VerificationOutcome::AlreadyApplied);
 }
 
 #[test]
