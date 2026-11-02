@@ -1362,12 +1362,6 @@ impl FormatPlugin for SugarCubePlugin {
     }
 
     fn inject(&self, path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
-        let html_file = Self::find_html_file(path).ok_or_else(|| LocustError::ParseError {
-            file: path.display().to_string(),
-            message: "no SugarCube HTML file found".to_string(),
-        })?;
-
-        let content = std::fs::read_to_string(&html_file)?;
         let mut report = InjectionReport {
             skip_reasons: Default::default(),
             files_modified: 0,
@@ -1376,6 +1370,64 @@ impl FormatPlugin for SugarCubePlugin {
             warnings: Vec::new(),
             files_written: Vec::new(),
         };
+
+        let html_file = if let Some(first) = entries.first() {
+            // One story per injection. Distinct stored paths are ambiguous even
+            // when remapping would collapse them onto the same basename.
+            if entries
+                .iter()
+                .any(|entry| entry.file_path != first.file_path)
+            {
+                report.skip("ambiguous_target", entries.len());
+                report.warnings.push(
+                    "SugarCube entries reference multiple story files; select one story's rows."
+                        .into(),
+                );
+                return Ok(report);
+            }
+            if path.is_dir() {
+                let Some(filename) = first.file_path.file_name() else {
+                    report.skip("missing_target", entries.len());
+                    return Ok(report);
+                };
+                // Keep the full location if core already remapped this entry
+                // into the target. Otherwise extraction's top-level filename
+                // identifies the story in a separately selected copy.
+                let root = path.canonicalize()?;
+                let absolute_root = std::path::absolute(path)?;
+                let stored = std::path::absolute(&first.file_path)?;
+                let relative = stored
+                    .strip_prefix(&root)
+                    .or_else(|_| stored.strip_prefix(&absolute_root));
+                match relative {
+                    Ok(relative) => path.join(relative),
+                    Err(_) => path.join(filename),
+                }
+            } else {
+                // Explicit file selection also supports a renamed story copy.
+                path.to_path_buf()
+            }
+        } else {
+            Self::find_html_file(path).ok_or_else(|| LocustError::ParseError {
+                file: path.display().to_string(),
+                message: "no SugarCube HTML file found".to_string(),
+            })?
+        };
+        if !html_file.is_file() {
+            report.skip("missing_target", entries.len());
+            report.warnings.push(format!(
+                "SugarCube target story is missing: {}",
+                html_file.display()
+            ));
+            return Ok(report);
+        }
+        if !is_html(&html_file) || !is_sugarcube_html(&html_file) {
+            return Err(LocustError::ParseError {
+                file: html_file.display().to_string(),
+                message: "no SugarCube HTML file found".to_string(),
+            });
+        }
+        let content = std::fs::read_to_string(&html_file)?;
 
         // Index requested rows once. Duplicate locators are ambiguous and fail closed.
         let mut selected: HashMap<PassageLocator, Vec<PendingEntry>> = HashMap::new();
@@ -1922,6 +1974,169 @@ Visible dialogue.</tw-passagedata>"#
                 "source should not contain macros: {}",
                 e.source
             );
+        }
+    }
+
+    fn binding_fixture(dir: &Path, name: &str) -> PathBuf {
+        let fixture = create_fixture(dir);
+        let content = fs::read_to_string(&fixture)
+            .unwrap()
+            .replace("Hello, welcome to the game!", "Hello traveler")
+            .replace("name=\"Test\"", &format!("name=\"{name}\""));
+        let story = dir.join(name);
+        fs::rename(fixture, &story).unwrap();
+        fs::write(&story, content).unwrap();
+        story
+    }
+
+    fn binding_translation(plugin: &SugarCubePlugin, story: &Path) -> StringEntry {
+        let mut entry = plugin
+            .extract(story)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.source == "Hello traveler")
+            .unwrap();
+        entry.translation = Some("Hola viajero".into());
+        entry
+    }
+
+    #[test]
+    fn target_binding_missing_story_does_not_redirect_to_another_story() {
+        let dir = tempdir();
+        let a = binding_fixture(dir.path(), "A.html");
+        let plugin = SugarCubePlugin::new();
+        let entry = binding_translation(&plugin, &a);
+        let b = binding_fixture(dir.path(), "B.html");
+        let before = fs::read(&b).unwrap();
+        fs::remove_file(&a).unwrap();
+
+        let report = plugin.inject(dir.path(), &[entry]).unwrap();
+        assert_eq!((report.strings_written, report.files_modified), (0, 0));
+        assert_eq!(report.strings_skipped, 1);
+        assert_eq!(report.skip_reasons.get("missing_target"), Some(&1));
+        assert!(report.files_written.is_empty());
+        assert_eq!(fs::read(&b).unwrap(), before);
+        assert!(!a.exists());
+    }
+
+    #[test]
+    fn target_binding_directory_discovery_order_cannot_redirect_injection() {
+        let dir = tempdir();
+        let a = binding_fixture(dir.path(), "A.html");
+        let b = binding_fixture(dir.path(), "B.html");
+        let plugin = SugarCubePlugin::new();
+        // Always select the story that discovery would NOT pick, whatever the
+        // filesystem's iteration order happens to be.
+        let discovered = SugarCubePlugin::find_html_file(dir.path()).unwrap();
+        let target = if discovered == a { b } else { a };
+        let other_before = fs::read(&discovered).unwrap();
+        let target_before = fs::read_to_string(&target).unwrap();
+        let entry = binding_translation(&plugin, &target);
+
+        let report = plugin.inject(dir.path(), &[entry]).unwrap();
+        assert_eq!((report.strings_written, report.files_modified), (1, 1));
+        assert_eq!(report.strings_skipped, 0);
+        assert_eq!(report.files_written, vec![target.clone()]);
+        assert_eq!(fs::read(&discovered).unwrap(), other_before);
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            target_before.replace("Hello traveler", "Hola viajero")
+        );
+    }
+
+    #[test]
+    fn target_binding_translated_copy_uses_the_stored_story_name() {
+        for (remapped, nested) in [(false, false), (true, false), (true, true)] {
+            let source = tempdir();
+            let copy = tempdir();
+            let original = binding_fixture(source.path(), "A.html");
+            let story_dir = if nested {
+                copy.path().join("stories")
+            } else {
+                copy.path().to_path_buf()
+            };
+            fs::create_dir_all(&story_dir).unwrap();
+            let target = binding_fixture(&story_dir, "A.html");
+            let other = binding_fixture(copy.path(), if nested { "A.html" } else { "B.html" });
+            let plugin = SugarCubePlugin::new();
+            let mut entry = binding_translation(&plugin, &original);
+            if remapped {
+                // Core's translated-copy dispatcher already remaps entry paths.
+                entry.file_path = target.clone();
+            }
+            let original_before = fs::read(&original).unwrap();
+            let other_before = fs::read(&other).unwrap();
+            let target_before = fs::read_to_string(&target).unwrap();
+
+            let report = plugin.inject(copy.path(), &[entry]).unwrap();
+            assert_eq!((report.strings_written, report.files_modified), (1, 1));
+            assert_eq!(report.strings_skipped, 0);
+            assert_eq!(report.files_written, vec![target.clone()]);
+            assert_eq!(fs::read(&original).unwrap(), original_before);
+            assert_eq!(fs::read(&other).unwrap(), other_before);
+            assert_eq!(
+                fs::read_to_string(&target).unwrap(),
+                target_before.replace("Hello traveler", "Hola viajero")
+            );
+        }
+    }
+
+    #[test]
+    fn target_binding_explicit_single_file_selection_still_works() {
+        let dir = tempdir();
+        let original = binding_fixture(dir.path(), "A.html");
+        let plugin = SugarCubePlugin::new();
+        let entry = binding_translation(&plugin, &original);
+        let selected = dir.path().join("chosen.htm");
+        fs::copy(&original, &selected).unwrap();
+        let before = fs::read(&original).unwrap();
+
+        let report = plugin.inject(&selected, &[entry]).unwrap();
+        assert_eq!((report.strings_written, report.files_modified), (1, 1));
+        assert_eq!(report.strings_skipped, 0);
+        assert_eq!(report.files_written, vec![selected.clone()]);
+        assert_eq!(fs::read(&original).unwrap(), before);
+        assert_eq!(
+            fs::read_to_string(&selected).unwrap(),
+            String::from_utf8(before)
+                .unwrap()
+                .replace("Hello traveler", "Hola viajero")
+        );
+    }
+
+    #[test]
+    fn target_binding_refuses_mixed_or_ambiguous_entry_files() {
+        for same_basename in [false, true] {
+            let dir = tempdir();
+            let external = tempdir();
+            let a = binding_fixture(dir.path(), "A.html");
+            let b = binding_fixture(dir.path(), "B.html");
+            let plugin = SugarCubePlugin::new();
+            let first = binding_translation(&plugin, &a);
+            let mut second = first.clone();
+            // A different row would otherwise be independently writable.
+            second.id = plugin.extract(&a).unwrap()[1].id.clone();
+            second.source = "This is the second line.".into();
+            second.translation = Some("Esta es la segunda línea.".into());
+            second.file_path = if same_basename {
+                external.path().join("A.html")
+            } else {
+                b.clone()
+            };
+            let a_before = fs::read(&a).unwrap();
+            let b_before = fs::read(&b).unwrap();
+
+            for selection in [dir.path(), a.as_path()] {
+                let report = plugin
+                    .inject(selection, &[first.clone(), second.clone()])
+                    .unwrap();
+                assert_eq!((report.strings_written, report.files_modified), (0, 0));
+                assert_eq!(report.strings_skipped, 2);
+                assert_eq!(report.skip_reasons.get("ambiguous_target"), Some(&2));
+                assert!(report.files_written.is_empty());
+                assert_eq!(fs::read(&a).unwrap(), a_before);
+                assert_eq!(fs::read(&b).unwrap(), b_before);
+            }
         }
     }
 

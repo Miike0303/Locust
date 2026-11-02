@@ -361,11 +361,22 @@ impl UnityPlugin {
                     // Replace only the dialogue span; retain indentation,
                     // speaker spacing, trailing whitespace and the line ending.
                     let start = body.len() - body.trim_start().len() + trimmed.len() - text.len();
-                    format!(
+                    let rebuilt = format!(
                         "{}{translation}{}",
                         &body[..start],
                         &body[start + text.len()..]
-                    )
+                    );
+                    // Translated prose must not become an engine modifier or
+                    // block directive, or lose any of its intended text body.
+                    if !extract_vn_dialogue(&rebuilt).is_some_and(|parsed| {
+                        parsed.character == dialogue.character
+                            && parsed.engine_prefix == dialogue.engine_prefix
+                            && parsed.text == translation
+                    }) {
+                        report.skip("unsafe_dialogue_grammar", 1);
+                        continue;
+                    }
+                    rebuilt
                 } else {
                     report.skip("source_changed", 1);
                     continue;
@@ -3343,6 +3354,72 @@ mod tests {
             .iter()
             .any(|e| e.source == "Welcome traveler!"
                 && e.metadata["extraction_method"] == "heuristic"));
+    }
+
+    fn assert_dialogue_grammar_translation_is_refused(translation: &str) {
+        for prefix in [" ", "  +Smile +Wave -Frown\t"] {
+            for ending in ["\r\n", "\n", ""] {
+                let before = format!("# untouched\r\n  L{prefix}Hello  \t{ending}");
+                let (fixture, file) = vn_controls_fixture(&before);
+                let plugin = UnityPlugin::new();
+                let mut entries = plugin.extract(fixture.path()).unwrap();
+                assert_eq!(entries.len(), 1);
+                entries[0].translation = Some(translation.into());
+
+                let report = plugin.inject(fixture.path(), &entries).unwrap();
+                assert_diagnostic_totals(&report, 1);
+                assert_eq!((report.strings_written, report.files_modified), (0, 0));
+                assert_eq!(report.skip_reasons.get("unsafe_dialogue_grammar"), Some(&1));
+                assert!(report.files_written.is_empty());
+                assert_eq!(fs::read(&file).unwrap(), before.as_bytes());
+                assert_eq!(plugin.extract(fixture.path()).unwrap()[0].source, "Hello");
+            }
+        }
+    }
+
+    #[test]
+    fn dialogue_grammar_rejects_translation_becoming_modifier() {
+        assert_dialogue_grammar_translation_is_refused("+Smile Hola");
+    }
+
+    #[test]
+    fn dialogue_grammar_rejects_translation_becoming_block() {
+        assert_dialogue_grammar_translation_is_refused("{Hola}");
+    }
+
+    #[test]
+    fn dialogue_grammar_normal_translation_roundtrips_with_authored_structure() {
+        for prefix in [" ", "\t+Smile  +Wave\t-Frown\u{2003}"] {
+            for (source, translation) in [
+                ("Hello", "Hola"),
+                (r"Hello \bamigo\b.", r"Hola \bamigo\b."),
+                ("Hello", "¡Hola!"),
+            ] {
+                for ending in ["\r\n", "\n", ""] {
+                    let before = format!("# untouched\r\n  L{prefix}{source}  \t{ending}");
+                    let (fixture, file) = vn_controls_fixture(&before);
+                    let plugin = UnityPlugin::new();
+                    let mut entries = plugin.extract(fixture.path()).unwrap();
+                    assert_eq!(entries.len(), 1);
+                    entries[0].translation = Some(translation.into());
+
+                    let report = plugin.inject(fixture.path(), &entries).unwrap();
+                    assert_diagnostic_totals(&report, 1);
+                    assert_eq!((report.strings_written, report.files_modified), (1, 1));
+                    assert_eq!(report.strings_skipped, 0);
+                    assert_eq!(
+                        fs::read(&file).unwrap(),
+                        format!("# untouched\r\n  L{prefix}{translation}  \t{ending}").as_bytes()
+                    );
+                    let after = plugin.extract(fixture.path()).unwrap();
+                    assert_eq!(after.len(), 1);
+                    assert_eq!(after[0].id, entries[0].id);
+                    assert_eq!(after[0].source, translation);
+                    assert_eq!(after[0].context, entries[0].context);
+                    assert_eq!(after[0].metadata["vn_engine_prefix"], prefix);
+                }
+            }
+        }
     }
 
     #[test]
