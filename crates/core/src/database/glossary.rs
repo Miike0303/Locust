@@ -25,6 +25,47 @@ impl Database {
         Ok(())
     }
 
+    /// Compare the original row and write atomically. A missing row conflicts;
+    /// omitting the baseline retains the legacy unconditional upsert.
+    pub fn save_glossary_entry_guarded(
+        &self,
+        entry: &GlossaryEntry,
+        expected: Option<&GlossaryEntry>,
+    ) -> std::result::Result<(), crate::glossary::GlossarySaveError> {
+        use crate::glossary::GlossarySaveError;
+
+        let Some(expected) = expected else {
+            return self.save_glossary_entry(entry).map_err(Into::into);
+        };
+        if entry.term != expected.term || entry.lang_pair != expected.lang_pair {
+            return Err(GlossarySaveError::Conflict);
+        }
+        let conn = lock_connection(&self.conn);
+        // One conditional UPDATE also protects against clients with their own
+        // SQLite connections. IS keeps NULL and empty contexts distinct.
+        let changed = conn
+            .execute(
+                "UPDATE glossary SET translation = ?2, context = ?4, case_sensitive = ?5
+             WHERE term = ?1 AND lang_pair = ?3 AND translation = ?6
+                 AND context IS ?7 AND case_sensitive = ?8",
+                params![
+                    entry.term,
+                    entry.translation,
+                    entry.lang_pair,
+                    entry.context,
+                    entry.case_sensitive as i32,
+                    expected.translation,
+                    expected.context,
+                    expected.case_sensitive as i32,
+                ],
+            )
+            .map_err(crate::error::LocustError::from)?;
+        if changed == 0 {
+            return Err(GlossarySaveError::Conflict);
+        }
+        Ok(())
+    }
+
     /// Merge by (term, lang_pair) atomically, preserving existing edits unless
     /// overwrite is requested. Identical entries never issue a write.
     pub fn merge_glossary_entries(
@@ -128,6 +169,165 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn baseline() -> GlossaryEntry {
+        GlossaryEntry {
+            term: "HP".into(),
+            translation: "PV".into(),
+            lang_pair: "en-es".into(),
+            context: None,
+            case_sensitive: false,
+        }
+    }
+
+    #[test]
+    fn glossary_guard_rejects_each_stale_field_without_writing() {
+        use crate::glossary::GlossarySaveError;
+        for field in [
+            "translation",
+            "context",
+            "clear-context",
+            "case",
+            "term",
+            "pair",
+        ] {
+            let db = Database::open_in_memory().unwrap();
+            let mut expected = baseline();
+            if field == "clear-context" {
+                expected.context = Some("Combat".into());
+            }
+            let mut current = expected.clone();
+            match field {
+                "translation" => current.translation = "Salud".into(),
+                "context" => current.context = Some(String::new()),
+                "clear-context" => current.context = None,
+                "case" => current.case_sensitive = true,
+                "term" => expected.term = "MP".into(),
+                "pair" => expected.lang_pair = "en-fr".into(),
+                _ => unreachable!(),
+            }
+            db.save_glossary_entry(&current).unwrap();
+            let draft = GlossaryEntry {
+                translation: "Vida".into(),
+                ..baseline()
+            };
+            let before = serde_json::to_value(db.get_glossary("en-es").unwrap()).unwrap();
+            let changes = || {
+                lock_connection(&db.conn)
+                    .query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))
+                    .unwrap()
+            };
+            let writes = changes();
+            assert!(
+                matches!(
+                    db.save_glossary_entry_guarded(&draft, Some(&expected)),
+                    Err(GlossarySaveError::Conflict)
+                ),
+                "{field}"
+            );
+            assert_eq!(changes(), writes, "{field}");
+            assert_eq!(
+                serde_json::to_value(db.get_glossary("en-es").unwrap()).unwrap(),
+                before,
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn glossary_guard_matching_baseline_updates_all_fields() {
+        let db = Database::open_in_memory().unwrap();
+        for context in [None, Some(String::new()), Some("  Combat\nMenu  ".into())] {
+            let expected = GlossaryEntry {
+                context,
+                ..baseline()
+            };
+            db.save_glossary_entry(&expected).unwrap();
+            let draft = GlossaryEntry {
+                translation: "Vida".into(),
+                context: Some("New context".into()),
+                case_sensitive: true,
+                ..baseline()
+            };
+            db.save_glossary_entry_guarded(&draft, Some(&expected))
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(db.get_glossary("en-es").unwrap()).unwrap(),
+                serde_json::json!([draft])
+            );
+        }
+    }
+
+    #[test]
+    fn glossary_guard_deleted_row_conflicts_without_resurrection() {
+        let db = Database::open_in_memory().unwrap();
+        let expected = baseline();
+        db.save_glossary_entry(&expected).unwrap();
+        db.delete_glossary_entry(&expected.term, &expected.lang_pair)
+            .unwrap();
+        assert!(matches!(
+            db.save_glossary_entry_guarded(&expected, Some(&expected)),
+            Err(crate::glossary::GlossarySaveError::Conflict)
+        ));
+        assert!(db.get_glossary("en-es").unwrap().is_empty());
+    }
+
+    #[test]
+    fn glossary_guard_without_baseline_keeps_unconditional_upsert() {
+        let db = Database::open_in_memory().unwrap();
+        db.save_glossary_entry_guarded(&baseline(), None).unwrap();
+        let draft = GlossaryEntry {
+            translation: "Vida".into(),
+            context: Some("Combat".into()),
+            case_sensitive: true,
+            ..baseline()
+        };
+        db.save_glossary_entry_guarded(&draft, None).unwrap();
+        assert_eq!(
+            serde_json::to_value(db.get_glossary("en-es").unwrap()).unwrap(),
+            serde_json::json!([draft])
+        );
+    }
+
+    #[test]
+    fn glossary_guard_concurrent_clients_allow_only_one_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("glossary.db");
+        let first = Database::open(&path).unwrap();
+        let second = Database::open(&path).unwrap();
+        first.save_glossary_entry(&baseline()).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = [first, second]
+            .into_iter()
+            .enumerate()
+            .map(|(i, db)| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let draft = GlossaryEntry {
+                        translation: format!("Winner {i}"),
+                        ..baseline()
+                    };
+                    barrier.wait();
+                    db.save_glossary_entry_guarded(&draft, Some(&baseline()))
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| matches!(r, Err(crate::glossary::GlossarySaveError::Conflict)))
+                .count(),
+            1
+        );
+        let entries = Database::open(&path)
+            .unwrap()
+            .get_glossary("en-es")
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].translation.starts_with("Winner "));
+    }
 
     #[test]
     fn test_glossary_add_and_get() {

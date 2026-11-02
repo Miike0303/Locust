@@ -26,6 +26,7 @@ export const INJECT_EMPTY_LANGUAGES_EN =
 	"inject requires at least one language (e.g. [\"es\"])";
 
 const EXACT: Record<string, MessageKey> = {
+  "glossary entry changed or was deleted since editing began; cancel and reopen the entry to review the latest version": "api.error.glossaryConflict",
   "backup error: cannot record a reference to a missing backup": "api.error.backupReferenceMissing",
   "translation changed since it was loaded": "api.error.translationConflict",
   "Configuration could not be loaded. The existing file is protected. Repair the configuration and restart Locust before saving settings.": "settings.configLoadFailed",

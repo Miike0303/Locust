@@ -5,6 +5,7 @@ import { SETTINGS_INPUT_CLASS } from "../../components/BufferedSetting";
 import ConfirmDialog from "../../components/ConfirmDialog";
 import type { GlossaryEntry } from "../../lib/api";
 import { addGlossaryEntry, deleteGlossaryEntry, getConfig, getGlossary } from "../../lib/api";
+import { ApiError } from "../../lib/apiError";
 import { useT } from "../../lib/i18n";
 import { settingsQueryState } from "../../lib/settingsQueryState";
 import { useProjectStore } from "../../stores/projectStore";
@@ -38,6 +39,7 @@ export default function GlossarySection() {
   const [saving, setSaving] = useState(false);
   const [entryToEdit, setEntryToEdit] = useState<{
     entry: GlossaryEntry;
+    expectedEntry: GlossaryEntry;
     projectScope: string | null;
     expectedDatabase: string;
   } | null>(null);
@@ -83,17 +85,24 @@ export default function GlossarySection() {
     });
   };
 
+  const editing = entryToEdit?.projectScope === projectScope && entryToEdit.entry.lang_pair === activePair
+    ? entryToEdit.entry : null;
   const filtered = useMemo(() => {
-    const list = entries ?? [];
+    const list = [...(entries ?? [])];
+    // A refreshed deletion must not remove the user's unsaved editor.
+    if (editing && !list.some((e) => e.term === editing.term && e.lang_pair === editing.lang_pair)) {
+      list.push(editing);
+    }
     const q = filter.trim().toLowerCase();
     if (!q) return list;
     return list.filter(
       (e) =>
+        (e.term === editing?.term && e.lang_pair === editing.lang_pair) ||
         e.term.toLowerCase().includes(q) ||
         e.translation.toLowerCase().includes(q) ||
         (e.context?.toLowerCase().includes(q) ?? false)
     );
-  }, [entries, filter]);
+  }, [entries, filter, editing]);
 
   const handleAdd = async () => {
     if (!canSubmit(projectScope)) return;
@@ -153,13 +162,16 @@ export default function GlossarySection() {
         ...pending.entry,
         translation: tr,
         context: pending.entry.context?.trim() ? pending.entry.context : null,
-      }, pending.expectedDatabase);
+      }, pending.expectedDatabase, pending.expectedEntry);
       if (editRequest.current === request && isCurrentProject(pending.projectScope)) {
         setEntryToEdit((current) => current === pending ? null : current);
       }
       invalidateGlossary(pending.projectScope);
     } catch (e: any) {
       addToast("error", t("settings.glossary.toast.saveFailed", { error: e.message }));
+      if (e instanceof ApiError && e.key === "api.error.glossaryConflict") {
+        invalidateGlossary(pending.projectScope);
+      }
     } finally {
       // A late response must not close or unlock another project's/pair's edit.
       if (editRequest.current === request) {
@@ -273,7 +285,12 @@ export default function GlossarySection() {
         <h3 className="text-section font-semibold mb-3">
           {entries ? t("settings.glossary.entries", { count: filtered.length }) : t("settings.glossary.entriesBare")}
         </h3>
-        {isLoading ? (
+        {queryState === "failed" && (
+          <p role="alert" className="text-body text-danger">
+            {t("settings.glossary.loadFailed", { error: error?.message ?? "" })}
+          </p>
+        )}
+        {isLoading && !editing ? (
           <p className="text-body text-text-muted flex items-center gap-2">
             <Loader size={14} className="animate-spin" /> {t("common.loading")}
           </p>
@@ -281,11 +298,7 @@ export default function GlossarySection() {
           <p role="status" className="text-body text-text-muted">
             {t("settings.glossary.noProject")}
           </p>
-        ) : queryState === "failed" ? (
-          <p role="alert" className="text-body text-danger">
-            {t("settings.glossary.loadFailed", { error: error?.message ?? "" })}
-          </p>
-        ) : filtered.length === 0 ? (
+        ) : queryState === "failed" && !editing ? null : filtered.length === 0 ? (
           <p className="text-body text-text-muted">
             {filter
               ? t("settings.glossary.emptyFilter")
@@ -385,7 +398,7 @@ export default function GlossarySection() {
                       ) : (
                         <>
                           <button
-                            onClick={() => setEntryToEdit({ entry: { ...e }, projectScope, expectedDatabase })}
+                            onClick={() => setEntryToEdit({ entry: { ...e }, expectedEntry: { ...e }, projectScope, expectedDatabase })}
                             disabled={entryToEdit !== null || saving || editSaving}
                             aria-label={t("settings.glossary.editTitle")}
                             title={t("settings.glossary.editTitle")}

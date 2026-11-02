@@ -373,6 +373,15 @@ impl PreparedGlossary {
     }
 }
 
+/// An optimistic glossary save distinguishes stale edits from storage failures.
+#[derive(Debug, thiserror::Error)]
+pub enum GlossarySaveError {
+    #[error("glossary entry changed or was deleted since editing began; cancel and reopen the entry to review the latest version")]
+    Conflict,
+    #[error(transparent)]
+    Storage(#[from] crate::error::LocustError),
+}
+
 pub struct Glossary {
     db: Arc<Database>,
     #[cfg(test)]
@@ -409,6 +418,15 @@ impl Glossary {
     /// Save an entry with its context and case-sensitivity setting intact.
     pub fn add_entry(&self, entry: &GlossaryEntry) -> Result<()> {
         self.db.save_glossary_entry(entry)
+    }
+
+    /// Save an edit only while its full original entry is still current.
+    pub fn add_entry_guarded(
+        &self,
+        entry: &GlossaryEntry,
+        expected: Option<&GlossaryEntry>,
+    ) -> std::result::Result<(), GlossarySaveError> {
+        self.db.save_glossary_entry_guarded(entry, expected)
     }
 
     pub fn get_all(&self, lang_pair: &str) -> Result<Vec<GlossaryEntry>> {

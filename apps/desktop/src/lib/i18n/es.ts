@@ -1477,6 +1477,7 @@ export const es: Record<keyof typeof en, string> = {
     "Ya se está aplicando un parche a esta carpeta de juego. Espere a que termine o cancele antes de iniciar otro.",
   "api.error.projectBusy":
     "Todavía hay una operación de proyecto en curso. Espere a que termine antes de abrir otro proyecto.",
+  "api.error.glossaryConflict": "La entrada del glosario cambió o se eliminó mientras la editaba. Se conserva su borrador. Cancele la edición y vuelva a abrir la entrada para revisar la versión más reciente.",
   "api.error.noProjectOpen": "No hay ningún proyecto abierto.",
   "api.error.pathNotFound": "No se encontró la ruta.",
   "api.error.entryNotFound": "No se encontró la entrada.",

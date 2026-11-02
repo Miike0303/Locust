@@ -763,10 +763,14 @@ export const getGlossary = (langPair: string): Promise<GlossaryEntry[]> =>
     ? tauriInvoke("get_glossary", { langPair })
     : request(`/glossary?lang_pair=${encodeURIComponent(langPair)}`);
 
-export const addGlossaryEntry = (entry: GlossaryEntry, expectedDatabase?: string): Promise<void> =>
+export const addGlossaryEntry = (entry: GlossaryEntry, expectedDatabase?: string, expectedEntry?: GlossaryEntry): Promise<void> =>
   IS_TAURI
-    ? tauriInvoke("add_glossary_entry", { entry, ...(expectedDatabase === undefined ? {} : { expectedDatabase }) })
-    : request("/glossary", { method: "POST", body: JSON.stringify({ ...entry, expected_database: expectedDatabase }) });
+    ? tauriInvoke("add_glossary_entry", {
+      entry,
+      ...(expectedDatabase === undefined ? {} : { expectedDatabase }),
+      ...(expectedEntry === undefined ? {} : { expectedEntry }),
+    })
+    : request("/glossary", { method: "POST", body: JSON.stringify({ ...entry, expected_database: expectedDatabase, expected_entry: expectedEntry }) });
 
 export const deleteGlossaryEntry = (term: string, langPair: string, expectedDatabase?: string) => {
   const expected = expectedDatabase === undefined ? "" : `&expected_database=${encodeURIComponent(expectedDatabase)}`;

@@ -988,15 +988,23 @@ async fn apply_get_glossary(s: &AppState, lang_pair: &str) -> Result<Vec<Glossar
 pub async fn add_glossary_entry(
     entry: GlossaryEntry,
     expected_database: Option<PathBuf>,
+    expected_entry: Option<GlossaryEntry>,
     state: State<'_, AppStateWrapper>,
 ) -> Result<(), String> {
-    apply_add_glossary_entry(&state.0, &entry, expected_database.as_deref()).await
+    apply_add_glossary_entry(
+        &state.0,
+        &entry,
+        expected_database.as_deref(),
+        expected_entry.as_ref(),
+    )
+    .await
 }
 
 async fn apply_add_glossary_entry(
     s: &AppState,
     entry: &GlossaryEntry,
     expected_database: Option<&Path>,
+    expected_entry: Option<&GlossaryEntry>,
 ) -> Result<(), String> {
     let _guard = try_project_operation(s)?;
     let project_guard = s.current_project.read().await;
@@ -1012,7 +1020,9 @@ async fn apply_add_glossary_entry(
             return Err("project changed before glossary mutation; retry".into());
         }
     }
-    s.glossary.add_entry(entry).map_err(|e| e.to_string())
+    s.glossary
+        .add_entry_guarded(entry, expected_entry)
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -3096,6 +3106,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn glossary_entry_baseline_rejects_stale_or_deleted_and_accepts_matching() {
+        let state = locust_server::create_test_state();
+        *state.current_project.write().await = Some(ProjectInfo::default());
+        let expected = glossary_entry();
+        let draft = GlossaryEntry {
+            translation: "Vida".into(),
+            context: None,
+            case_sensitive: false,
+            ..expected.clone()
+        };
+        for field in ["translation", "context", "case", "deleted"] {
+            let mut current = expected.clone();
+            match field {
+                "translation" => current.translation = "Salud".into(),
+                "context" => current.context = None,
+                "case" => current.case_sensitive = false,
+                "deleted" => {}
+                _ => unreachable!(),
+            }
+            state.glossary.add_entry(&current).unwrap();
+            if field == "deleted" {
+                state.glossary.delete("HP", "en-es").unwrap();
+            }
+            let before = serde_json::to_value(state.glossary.get_all("en-es").unwrap()).unwrap();
+            assert_eq!(apply_add_glossary_entry(&state, &draft, Some(Path::new(":memory:")), Some(&expected)).await.unwrap_err(),
+                "glossary entry changed or was deleted since editing began; cancel and reopen the entry to review the latest version");
+            assert_eq!(
+                serde_json::to_value(state.glossary.get_all("en-es").unwrap()).unwrap(),
+                before,
+                "{field}"
+            );
+        }
+        state.glossary.add_entry(&expected).unwrap();
+        for entry in [&expected, &draft] {
+            apply_add_glossary_entry(&state, entry, None, Some(&expected))
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(state.glossary.get_all("en-es").unwrap()).unwrap(),
+                serde_json::json!([entry])
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn glossary_add_preserves_case_sensitive_and_context() {
         let state = locust_server::create_test_state();
         *state.current_project.write().await = Some(ProjectInfo::default());
@@ -3107,7 +3162,7 @@ mod tests {
                 context: context.map(str::to_owned),
                 case_sensitive: true,
             };
-            apply_add_glossary_entry(&state, &entry, None)
+            apply_add_glossary_entry(&state, &entry, None, None)
                 .await
                 .unwrap();
             let entries = apply_get_glossary(&state, "en-es").await.unwrap();
@@ -3174,7 +3229,7 @@ mod tests {
                 .database_path = Some(b.clone());
         }
         assert_eq!(
-            apply_add_glossary_entry(&state, &glossary_entry(), Some(&a))
+            apply_add_glossary_entry(&state, &glossary_entry(), Some(&a), None)
                 .await
                 .unwrap_err(),
             "project changed before glossary mutation; retry"
@@ -3196,7 +3251,7 @@ mod tests {
             }
             for expected in [Some(a.as_path()), None] {
                 assert_eq!(
-                    apply_add_glossary_entry(&state, &glossary_entry(), expected)
+                    apply_add_glossary_entry(&state, &glossary_entry(), expected, None)
                         .await
                         .unwrap_err(),
                     locust_server::PROJECT_BUSY_MESSAGE
@@ -3215,7 +3270,7 @@ mod tests {
         for expected in [Some(a.as_path()), None] {
             let mut entry = glossary_entry();
             entry.translation = format!("Updated {expected:?}");
-            apply_add_glossary_entry(&state, &entry, expected)
+            apply_add_glossary_entry(&state, &entry, expected, None)
                 .await
                 .unwrap();
             assert_eq!(
@@ -3236,7 +3291,7 @@ mod tests {
         state.db.reopen(&b).unwrap();
         for expected in [a.as_path(), b.as_path()] {
             assert_eq!(
-                apply_add_glossary_entry(&state, &glossary_entry(), Some(expected))
+                apply_add_glossary_entry(&state, &glossary_entry(), Some(expected), None)
                     .await
                     .unwrap_err(),
                 "project changed before glossary mutation; retry"
@@ -3269,7 +3324,7 @@ mod tests {
             "no project open"
         );
         assert_eq!(
-            apply_add_glossary_entry(&state, &new_entry, None)
+            apply_add_glossary_entry(&state, &new_entry, None, None)
                 .await
                 .unwrap_err(),
             "no project open"

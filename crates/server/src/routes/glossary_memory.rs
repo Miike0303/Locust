@@ -3,6 +3,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use locust_core::database::{Database, GlobalMemoryDb, GlossaryEntry};
 use locust_core::fuzzy::{prepare, similarity_prepared};
+use locust_core::glossary::GlossarySaveError;
 use locust_core::models::StringEntry;
 use serde::{Deserialize, Serialize};
 use std::collections::{hash_map::Entry, HashMap};
@@ -40,6 +41,8 @@ pub(crate) struct AddGlossaryRequest {
     #[serde(default)]
     case_sensitive: bool,
     #[serde(default)]
+    expected_entry: Option<GlossaryEntry>,
+    #[serde(default)]
     expected_database: Option<std::path::PathBuf>,
 }
 
@@ -51,15 +54,28 @@ pub(crate) async fn add_glossary(
     check_glossary_project(&state, entry.expected_database.as_deref()).await?;
     state
         .glossary
-        .add_entry(&GlossaryEntry {
-            term: entry.term,
-            translation: entry.translation,
-            lang_pair: entry.lang_pair,
-            context: entry.context,
-            case_sensitive: entry.case_sensitive,
-        })
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    Ok(StatusCode::CREATED)
+        .add_entry_guarded(
+            &GlossaryEntry {
+                term: entry.term,
+                translation: entry.translation,
+                lang_pair: entry.lang_pair,
+                context: entry.context,
+                case_sensitive: entry.case_sensitive,
+            },
+            entry.expected_entry.as_ref(),
+        )
+        .map_err(|e| {
+            let status = match &e {
+                GlossarySaveError::Conflict => StatusCode::CONFLICT,
+                GlossarySaveError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            err(status, e)
+        })?;
+    Ok(if entry.expected_entry.is_some() {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    })
 }
 
 pub(crate) async fn delete_glossary(
@@ -1024,6 +1040,74 @@ mod tests {
             client().post(format!("{url}/api/glossary")).json(&body)
         };
         request.send().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn glossary_entry_baseline_rejects_stale_or_deleted_and_accepts_matching() {
+        let (url, server, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        let expected = GlossaryEntry {
+            term: "HP".into(),
+            translation: "PV".into(),
+            lang_pair: "en-es".into(),
+            context: None,
+            case_sensitive: false,
+        };
+        let draft = GlossaryEntry {
+            translation: "Vida".into(),
+            context: Some("Draft".into()),
+            case_sensitive: true,
+            ..expected.clone()
+        };
+        let mut body = serde_json::to_value(&draft).unwrap();
+        body["expected_entry"] = serde_json::json!(&expected);
+        body["expected_database"] = serde_json::json!(state.db.path());
+        for field in ["translation", "context", "case", "deleted"] {
+            let mut current = expected.clone();
+            match field {
+                "translation" => current.translation = "Salud".into(),
+                "context" => current.context = Some(String::new()),
+                "case" => current.case_sensitive = true,
+                "deleted" => {}
+                _ => unreachable!(),
+            }
+            state.glossary.add_entry(&current).unwrap();
+            if field == "deleted" {
+                state.glossary.delete("HP", "en-es").unwrap();
+            }
+            let before = serde_json::to_value(state.glossary.get_all("en-es").unwrap()).unwrap();
+            let response = client()
+                .post(format!("{url}/api/glossary"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{field}");
+            assert_eq!(response.text().await.unwrap(), "glossary entry changed or was deleted since editing began; cancel and reopen the entry to review the latest version");
+            assert_eq!(
+                serde_json::to_value(state.glossary.get_all("en-es").unwrap()).unwrap(),
+                before,
+                "{field}"
+            );
+        }
+        state.glossary.add_entry(&expected).unwrap();
+        // An identical save also counts as matching, not a conflict.
+        for entry in [&expected, &draft] {
+            let mut body = serde_json::to_value(entry).unwrap();
+            body["expected_entry"] = serde_json::json!(&expected);
+            let response = client()
+                .post(format!("{url}/api/glossary"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                serde_json::to_value(state.glossary.get_all("en-es").unwrap()).unwrap(),
+                serde_json::json!([entry])
+            );
+        }
+        server.abort();
     }
 
     #[tokio::test]

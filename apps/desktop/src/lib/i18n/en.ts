@@ -1506,6 +1506,7 @@ export const en = {
     "A patch is already being applied to this game folder. Wait for it to finish or cancel it before starting another.",
   "api.error.projectBusy":
     "A project operation is still running. Wait for it to finish before opening another project.",
+  "api.error.glossaryConflict": "The glossary entry changed or was deleted while you were editing. Your draft is preserved. Cancel and reopen the entry to review the latest version.",
   "api.error.noProjectOpen": "No project is open.",
   "api.error.pathNotFound": "Path not found.",
   "api.error.entryNotFound": "Entry not found.",

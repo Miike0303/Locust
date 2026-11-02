@@ -1195,3 +1195,20 @@ test("unverified backup refusal has an exact localized identity", () => {
     }
   }
 });
+
+
+test("glossary conflict keeps its typed identity and localizes HTTP and Tauri errors in EN/ES", () => {
+  const raw = "glossary entry changed or was deleted since editing began; cancel and reopen the entry to review the latest version";
+  for (const locale of ["en", "es"] as const) {
+    setLocale(locale);
+    const expected = locale === "es"
+      ? "La entrada del glosario cambió o se eliminó mientras la editaba. Se conserva su borrador. Cancele la edición y vuelva a abrir la entrada para revisar la versión más reciente."
+      : "The glossary entry changed or was deleted while you were editing. Your draft is preserved. Cancel and reopen the entry to review the latest version.";
+    for (const frame of ["", "409: "]) {
+      const error = new ApiError(frame + raw);
+      assert.equal(error.key, "api.error.glossaryConflict");
+      assert.equal(error.message, expected);
+      assert.equal(error.raw, frame + raw);
+    }
+  }
+});

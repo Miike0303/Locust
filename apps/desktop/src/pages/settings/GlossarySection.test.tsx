@@ -4,6 +4,7 @@ import { after, beforeEach, test } from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import { QueryClient } from "@tanstack/react-query";
 import type { GlossaryEntry, ProjectInfo } from "../../lib/api.ts";
+import { ApiError } from "../../lib/apiError.ts";
 import { setLocale, t, type TranslateKey } from "../../lib/i18n/index.ts";
 
 const project: ProjectInfo = { database_path: "C:/demo.db", path: "C:/game", format_id: "renpy", name: "Demo" };
@@ -15,8 +16,8 @@ const label = (key: string) => t(key as TranslateKey); // The parent adds the ne
 const h = {
   t, project: project as ProjectInfo | null,
   slots: [] as any[], cursor: 0, dirty: false, effects: [] as (() => void)[],
-  calls: [] as GlossaryEntry[], identities: [] as (string | undefined)[], deletes: [] as unknown[][], toasts: [] as unknown[][], invalidations: [] as any[],
-  fail: false, failure: "write failed", waitForSave: null as Promise<void> | null,
+  baselines: [] as (GlossaryEntry | undefined)[], calls: [] as GlossaryEntry[], identities: [] as (string | undefined)[], deletes: [] as unknown[][], toasts: [] as unknown[][], invalidations: [] as any[],
+  queryError: null as Error | null, failureError: null as Error | null, fail: false, failure: "write failed", waitForSave: null as Promise<void> | null,
   state(initial: any) {
     const slots = h.slots, index = h.cursor++;
     if (!(index in slots)) slots[index] = typeof initial === "function" ? initial() : initial;
@@ -34,16 +35,17 @@ const h = {
   },
   query(options: any) {
     const state = client.getQueryState(options.queryKey);
-    return { data: state?.data, isLoading: false, isError: false, error: null };
+    const error = options.queryKey[0] === "glossary" ? h.queryError : null;
+    return { data: state?.data, isLoading: false, isError: error !== null, error };
   },
-  async save(entry: GlossaryEntry, expectedDatabase?: string) {
-    h.calls.push(entry); h.identities.push(expectedDatabase);
+  async save(entry: GlossaryEntry, expectedDatabase?: string, expectedEntry?: GlossaryEntry) {
+    h.calls.push(entry); h.identities.push(expectedDatabase); h.baselines.push(expectedEntry);
     if (h.waitForSave) await h.waitForSave;
-    if (h.fail) throw new Error(h.failure);
+    if (h.fail) throw h.failureError ?? new Error(h.failure);
   },
   async delete(...args: unknown[]) {
     h.deletes.push(args);
-    if (h.fail) throw new Error(h.failure);
+    if (h.fail) throw h.failureError ?? new Error(h.failure);
   },
 };
 (globalThis as any).__glossaryEditTest = h;
@@ -103,8 +105,8 @@ function caseSensitive(value: boolean) { change(control("settings.glossary.caseS
 function save() { return action("settings.glossary.save", row()).props.onClick(); }
 
 beforeEach(() => {
-  client.clear(); h.project = project; h.slots = []; h.effects = []; h.calls = []; h.identities = []; h.deletes = []; h.toasts = []; h.invalidations = [];
-  h.fail = false; h.failure = "write failed"; h.waitForSave = null; setLocale("en");
+  client.clear(); h.project = project; h.slots = []; h.effects = []; h.calls = []; h.identities = []; h.baselines = []; h.deletes = []; h.toasts = []; h.invalidations = [];
+  h.queryError = null; h.failureError = null; h.fail = false; h.failure = "write failed"; h.waitForSave = null; setLocale("en");
   client.setQueryData(["config"], { default_source_lang: "en", default_target_lang: "es" });
   client.setQueryData(["glossary", project.database_path, "en-es"], [{ ...original }]);
 });
@@ -117,6 +119,7 @@ test("creating US → EE.UU. sends case sensitivity and the optional note", asyn
   change(control("settings.glossary.note"), "Country abbreviation");
   await action("settings.glossary.addEntry").props.onClick();
   assert.deepEqual(h.calls, [original]);
+  assert.deepEqual(h.baselines, [undefined]);
   assert.equal(control("settings.glossary.caseSensitive").props.checked, false);
   assert.equal(control("settings.glossary.note").props.value, "");
 });
@@ -166,6 +169,73 @@ for (const value of ["Use for the country", "   "]) {
     assert.deepEqual(h.calls, [{ ...original, context: value.trim() || null }]);
   });
 }
+
+test("editing sends the full original baseline separately from every draft field", async () => {
+  startEdit(); translation("Draft translation"); note("Draft note"); caseSensitive(false);
+  // A background refresh must not silently advance the editor's baseline.
+  client.setQueryData(["glossary", project.database_path, "en-es"], [{ ...original, translation: "Newer translation", context: null, case_sensitive: false }]);
+  await save();
+  assert.deepEqual(h.calls, [{ ...original, translation: "Draft translation", context: "Draft note", case_sensitive: false }]);
+  assert.deepEqual(h.baselines, [original]);
+});
+
+const glossaryConflict = "glossary entry changed or was deleted since editing began; cancel and reopen the entry to review the latest version";
+for (const locale of ["en", "es"] as const) {
+  for (const deleted of [false, true]) {
+    test(`${locale} stale-entry conflict refetches and retains the full draft after ${deleted ? "deletion" : "an update"}`, async () => {
+      setLocale(locale);
+      startEdit(); translation("Keep my draft"); note("Keep my note"); caseSensitive(false);
+      h.fail = true; h.failureError = new ApiError(`${deleted ? "" : "409: "}${glossaryConflict}`);
+      await save();
+      assert.deepEqual(h.invalidations, [{ queryKey: ["glossary", project.database_path], refetchType: "active" }]);
+      const refreshed = deleted ? [] : [{ ...original, translation: "Newer translation" }];
+      client.setQueryData(["glossary", project.database_path, "en-es"], refreshed);
+      assert.equal(control("settings.glossary.translation", row()).props.value, "Keep my draft");
+      assert.equal(control("settings.glossary.note", row()).props.value, "Keep my note");
+      assert.equal(control("settings.glossary.caseSensitive", row()).props.checked, false);
+      assert.equal(action("settings.glossary.save", row()).props.disabled, false);
+      assert.deepEqual(h.toasts, [["error", t("settings.glossary.toast.saveFailed" as TranslateKey, { error: label("api.error.glossaryConflict") })]]);
+      // Retrying cannot overwrite the newer version or resurrect a deleted entry.
+      await save();
+      assert.deepEqual(h.baselines, [original, original]);
+      action("common.cancel", row()).props.onClick();
+      assert.deepEqual(client.getQueryData(["glossary", project.database_path, "en-es"]), refreshed);
+      if (!deleted) {
+        startEdit(); translation("Reviewed draft"); h.fail = false; await save();
+        assert.deepEqual(h.baselines[2], refreshed[0]);
+      }
+    });
+  }
+}
+
+test("a failed conflict refetch keeps the draft visible alongside the load error", async () => {
+  startEdit(); translation("Keep this draft");
+  h.fail = true; h.failureError = new ApiError(glossaryConflict);
+  await save();
+  h.queryError = new Error("Refresh failed");
+  assert.equal(control("settings.glossary.translation", row()).props.value, "Keep this draft");
+  assert.ok(renderToStaticMarkup(tree()).includes(t("settings.glossary.loadFailed", { error: "Refresh failed" })));
+});
+
+test("a refreshed row that no longer matches the filter keeps its editor visible", async () => {
+  change(find(node => node.props?.placeholder === t("settings.glossary.filterPlaceholder")), "EE.UU.");
+  startEdit(); translation("Keep this draft");
+  h.fail = true; h.failureError = new ApiError(glossaryConflict);
+  await save();
+  client.setQueryData(["glossary", project.database_path, "en-es"], [{ ...original, translation: "Newer translation" }]);
+  assert.equal(control("settings.glossary.translation", row()).props.value, "Keep this draft");
+});
+
+test("a conflict arriving after a project switch never refetches the new project's glossary", async () => {
+  startEdit(); translation("Pending A");
+  let finish!: () => void;
+  h.waitForSave = new Promise<void>(resolve => { finish = resolve; });
+  h.fail = true; h.failureError = new ApiError(glossaryConflict);
+  const pending = save();
+  h.project = { ...project, database_path: "C:/other.db" };
+  tree(); finish(); await pending;
+  assert.deepEqual(h.invalidations, [{ queryKey: ["glossary", project.database_path], refetchType: "none" }]);
+});
 
 test("cancel sends nothing, restores the row and discards all draft changes", () => {
   startEdit(); translation("Draft"); note("Draft note"); caseSensitive(false);
@@ -348,6 +418,18 @@ for (const tauri of [true, false]) {
       assert.deepEqual(transport.calls, tauri
         ? [["add_glossary_entry", expected === undefined ? { entry: original } : { entry: original, expectedDatabase: expected }]]
         : [["http://localhost:7842/api/glossary", "POST", expected === undefined ? original : { ...original, expected_database: expected }]]);
+    }
+  });
+
+  test(`${tauri ? "Tauri" : "HTTP"} glossary edit carries the full expected entry with or without a project binding`, async () => {
+    transport.setTauri(tauri);
+    const draft = { ...original, translation: "Updated", context: null, case_sensitive: false };
+    for (const expected of [undefined, "C:/project A & B.locust.db"]) {
+      transport.calls = [];
+      await realApi.addGlossaryEntry(draft, expected, original);
+      assert.deepEqual(transport.calls, tauri
+        ? [["add_glossary_entry", { entry: draft, expectedEntry: original, ...(expected === undefined ? {} : { expectedDatabase: expected }) }]]
+        : [["http://localhost:7842/api/glossary", "POST", { ...draft, expected_entry: original, ...(expected === undefined ? {} : { expected_database: expected }) }]]);
     }
   });
 
