@@ -11,7 +11,7 @@ Configured in `apps/desktop/src-tauri/tauri.conf.json` → `plugins.updater.endp
 https://github.com/Miike0303/Locust/releases/latest/download/latest.json
 ```
 
-`/releases/latest/download/…` always follows the newest non-prerelease GitHub release.
+`/releases/latest/download/…` follows the published release GitHub designates latest.
 The app checks this URL on launch (`UpdateChecker`). Tauri compares `latest.json`'s
 `version` to the running app and, if newer, offers Download & install.
 
@@ -19,17 +19,36 @@ The app checks this URL on launch (`UpdateChecker`). Tauri compares `latest.json
 
 On each `v*` tag (and `workflow_dispatch`), `.github/workflows/release.yml`:
 
-1. **Desktop job** — builds Windows (x64 + ARM64), macOS (arm64 + x64) and Linux
-   x64 bundles with `tauri-apps/tauri-action`. `bundle.createUpdaterArtifacts: true`
-   explicitly requests updater artifacts signed through the existing
-   `TAURI_SIGNING_PRIVATE_KEY` configuration, alongside the release installers.
-2. **CLI job** — builds and uploads `locust` binaries (not part of the updater
-   manifest). See [USAGE.md](../USAGE.md#7-applying-a-patch).
-3. **`update-manifest` job** — runs `scripts/generate-updater-manifest.sh <tag>`.
-   The shell entrypoint delegates to Python 3 stdlib, using `gh` to read release
-   assets and `curl --fail --silent --show-error --location` to fetch signatures.
-   Python is explicitly provisioned in this job. After success the workflow runs
-   `gh release upload … latest.json --clobber`.
+1. **`validate` job** — requires a stable `refs/tags/vX.Y.Z` ref, equality with
+   the Cargo workspace, desktop package and Tauri versions, and exactly one
+   nonempty `## [X.Y.Z]` CHANGELOG section. Manual dispatch from a branch is
+   refused. It creates a draft with those notes and the exact candidate SHA, or
+   reuses a matching draft. Public releases, prereleases and a different target
+   SHA are refused; same-ref runs are serialized.
+2. **Desktop matrix** — builds Windows (x64 + ARM64), macOS (arm64 + x64) and Linux
+   x64 bundles with `tauri-apps/tauri-action`, uploading to the existing **draft**
+   by release ID with `releaseDraft: true`. `bundle.createUpdaterArtifacts: true`
+   requests signed updater artifacts using the existing signing secrets. Action
+   `args: ... -- --locked` passes `--locked` through Tauri to Cargo.
+3. **CLI matrix** — builds and uploads all four `locust` binaries to the draft
+   (not part of the updater manifest), with locked Cargo resolution.
+   See [USAGE.md](../USAGE.md#7-applying-a-patch).
+4. **`publish` job** — runs only after all five desktop and all four CLI builds
+   succeed. It rechecks the tag/source SHA and draft, then runs
+   `bash scripts/generate-updater-manifest.sh <tag>` in strict mode. The shell
+   entrypoint delegates to Python stdlib, using `gh` for release metadata and
+   authenticated draft signature downloads (`gh release download`). Public
+   release recovery uses `curl --fail --silent --show-error --location`.
+5. After uploading `latest.json`, the finalizer downloads it and verifies all
+   five desktop pairs, four CLI binaries and the manifest are present/nonempty.
+   It checks all platform keys, exact URLs/signatures, version, CHANGELOG notes
+   and draft/tag/candidate SHA. Only then does it publish the draft as latest.
+   A failed, skipped or cancelled build or a failed verification leaves the
+   draft unpublished and does not replace the current public latest.
+
+The release gate requires Python 3.11+ (`tomllib`); workflow jobs provision 3.12.
+The required CLI assets are `locust-x86_64-windows.exe`, `locust-aarch64-macos`,
+`locust-x86_64-macos` and `locust-x86_64-linux`.
 
 Each artifact must have its **own exact filename plus `.sig`**. Asset ordering
 never selects a signature, and duplicate names or multiple artifacts for a target
@@ -43,10 +62,18 @@ are refused rather than guessed:
 | `darwin-x86_64`      | `*_x64.app.tar.gz` + exact `.sig` |
 | `linux-x86_64`       | `*_amd64.AppImage` + exact `.sig` |
 
-Platforms with no complete pair are omitted; the job is `if: always()` so a
-single OS failure does not block a manifest for the rest. **Zero complete pairs
-is a failure**, not an empty successful manifest. A manifest with fewer than five
-platforms is intentionally supported and is not proof of a complete release.
+The default is strict: **all five complete pairs are required** before any
+signature download or manifest replacement. For explicit recovery only:
+
+```bash
+bash scripts/generate-updater-manifest.sh --allow-partial <tag>
+```
+
+Recovery permits a nonempty subset, omitting platforms with no complete pair.
+It still refuses zero pairs, ambiguity and invalid signatures. The command only
+writes a local manifest; it does not upload or publish a release. The workflow
+never passes this flag, and its final inventory gate always requires all five
+platforms and all four CLI binaries.
 
 HTTP/download failures, empty/HTML/invalid signatures and ambiguous metadata fail
 closed without retries. Signatures must be base64-encoded minisign documents
@@ -57,8 +84,9 @@ preserves the old file, leaves no scratch file and emits no manifest/raw network
 response. The repository is `GITHUB_REPOSITORY` (default `Miike0303/Locust`); no
 alternate endpoint or output destination is introduced.
 
-`tauri-action` is also invoked with `includeUpdaterJson: true`; the dedicated
-script is the source of truth because it overwrites `latest.json` on the release.
+`tauri-action` uses `includeUpdaterJson: false`; the finalizer's strict generator
+is the sole source of `latest.json`. Its platform URLs are the eventual public
+release URLs, even while signature files are downloaded from the private draft.
 
 ## `latest.json` shape
 
@@ -67,7 +95,7 @@ Tauri updater JSON (example — URLs and signatures come from the release assets
 ```json
 {
   "version": "0.2.0",
-  "notes": "See CHANGELOG for details. The app will auto-update from this release.",
+  "notes": "## [0.2.0] - 2026-10-17\n\n<release CHANGELOG section>",
   "pub_date": "2026-08-14T00:00:00Z",
   "platforms": {
     "windows-x86_64": {
@@ -94,8 +122,10 @@ Tauri updater JSON (example — URLs and signatures come from the release assets
 }
 ```
 
-`notes` is the GitHub release body (`release.yml` currently sets that body to
-“See CHANGELOG for details…”). `pub_date` is UTC now at manifest generation.
+`notes` is the GitHub release body, extracted from the tagged version's
+`## [X.Y.Z]` CHANGELOG section, including its heading and stopping before the
+next level-two heading. A missing, empty or duplicate section fails validation.
+`pub_date` is UTC now at manifest generation.
 
 There is no “204 No Content” path: the file is always a JSON document. If the
 running version is already current, the Tauri plugin simply does not prompt.
@@ -105,10 +135,15 @@ running version is already current, the Tauri plugin simply does not prompt.
 **Tauri updater signatures** (minisign): configured. The public key lives in
 `tauri.conf.json` → `plugins.updater.pubkey`. The private key is the GitHub
 secret `TAURI_SIGNING_PRIVATE_KEY` (optional password:
-`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`). Configuration alone does not prove that
-secrets are available or correspond to the configured public key. Inspect actual
-signed assets and verify key correspondence before claiming updater acceptance;
-ordinary release preparation must not read secrets or rotate keys. Follow the
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`). **Owner prerequisite:** restore/validate
+a usable existing private key and matching password corresponding to the
+configured public key before delivery. All five v0.2.0 signing jobs failed to
+decode the configured credentials; the owner dependency is recorded in
+[`odd/tasks/release-v0.2.0.md`, L15–L17](../odd/tasks/release-v0.2.0.md).
+Configuration and signature shape/equality checks alone do not prove key
+correspondence. Verify signed assets against that public key and test an older
+installation before claiming updater acceptance. Ordinary release preparation
+must not read/print secrets, rotate keys or disable signing. Follow the
 [release checklist](../RELEASE.md).
 
 **OS code-signing is not configured.** In `tauri.conf.json`:

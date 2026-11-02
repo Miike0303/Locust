@@ -9,8 +9,55 @@ on:
 permissions:
   contents: write
 
+# Serialize reruns for the same tag; never mutate a release while another run publishes.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.ref_name }}
+  RELEASE_REF: ${{ github.ref }}
+  RELEASE_SHA: ${{ github.sha }}
+
 jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.draft.outputs.release_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Check version tag, application versions and CHANGELOG
+        run: |
+          python scripts/release-gate.py prepare --ref "$RELEASE_REF" > release-notes.md
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+
+      - name: Create or reuse the candidate draft
+        id: draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq .sha)" = "$RELEASE_SHA"
+          if ! gh release view "$RELEASE_TAG" --json tagName,targetCommitish,isDraft,isPrerelease > release.json; then
+            gh release create "$RELEASE_TAG" --verify-tag --draft --target "$RELEASE_SHA" \
+              --title "Project Locust $RELEASE_TAG" --notes-file release-notes.md
+            gh release view "$RELEASE_TAG" --json tagName,targetCommitish,isDraft,isPrerelease > release.json
+          fi
+          python scripts/release-gate.py draft --tag "$RELEASE_TAG" --sha "$RELEASE_SHA" --metadata release.json
+          gh release edit "$RELEASE_TAG" --notes-file release-notes.md
+          release_id="$(gh release view "$RELEASE_TAG" --json databaseId --jq .databaseId)"
+          test -n "$release_id"
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: validate
     strategy:
       fail-fast: false
       matrix:
@@ -39,6 +86,8 @@ jobs:
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       - name: Install dependencies (Ubuntu)
         if: matrix.platform == 'ubuntu-22.04'
@@ -66,7 +115,7 @@ jobs:
         working-directory: apps/desktop
         run: npm ci
 
-      - name: Build and release
+      - name: Build and upload to draft
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -74,19 +123,21 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: apps/desktop
+          releaseId: ${{ needs.validate.outputs.release_id }}
           tagName: ${{ github.ref_name }}
           releaseName: 'Project Locust ${{ github.ref_name }}'
-          releaseBody: 'See CHANGELOG for details. The app will auto-update from this release.'
-          releaseDraft: false
+          releaseDraft: true
           prerelease: false
-          includeUpdaterJson: true
-          args: ${{ matrix.args }}
+          # Only the finalizer writes latest.json after every build succeeded.
+          includeUpdaterJson: false
+          # tauri-action forwards args to tauri build; after -- they reach Cargo.
+          args: ${{ matrix.args }} -- --locked
 
   # The CLI is the apply-only product: `locust apply <game> --url <patch.zip>`
   # needs no desktop install. Ship it on every release so players who only
   # want to APPLY a patch never have to build from source.
   cli:
-    needs: build
+    needs: validate
     strategy:
       fail-fast: false
       matrix:
@@ -111,6 +162,8 @@ jobs:
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       # `locust-providers` pulls reqwest with default features (native-tls),
       # so the CLI needs OpenSSL headers on Linux even though the CLI's own
@@ -142,33 +195,44 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ github.ref_name }}" "${{ matrix.asset }}" --clobber
+        run: gh release upload "$RELEASE_TAG" "${{ matrix.asset }}" --clobber
 
-  # The update-manifest job does NOT depend on all builds succeeding —
-  # if one platform fails to upload (e.g. AppImage timeout), we still want
-  # latest.json generated for the platforms that succeeded.
-  update-manifest:
-    if: always()
-    needs: build
+  # This is the only publisher. Failed/skipped/cancelled matrix jobs leave a draft.
+  publish:
+    needs: [validate, build, cli]
+    if: ${{ needs.validate.result == 'success' && needs.build.result == 'success' && needs.cli.result == 'success' }}
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Generate latest.json from uploaded signatures
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ github.ref_name }}
+      - name: Recheck candidate draft and release notes
         run: |
-          chmod +x scripts/generate-updater-manifest.sh
-          bash scripts/generate-updater-manifest.sh "$RELEASE_TAG"
+          python scripts/release-gate.py prepare --ref "$RELEASE_REF" > release-notes.md
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq .sha)" = "$RELEASE_SHA"
+          gh release view "$RELEASE_TAG" --json tagName,targetCommitish,isDraft,isPrerelease > release.json
+          python scripts/release-gate.py draft --tag "$RELEASE_TAG" --sha "$RELEASE_SHA" --metadata release.json
 
-      - name: Upload latest.json to release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Generate and upload strict five-platform manifest
         run: |
-          gh release upload "${{ github.ref_name }}" latest.json --clobber
+          bash scripts/generate-updater-manifest.sh "$RELEASE_TAG"
+          gh release upload "$RELEASE_TAG" latest.json --clobber
+
+      - name: Verify uploaded desktop, signature, CLI and manifest inventory
+        run: |
+          gh release view "$RELEASE_TAG" --json tagName,targetCommitish,isDraft,isPrerelease,assets,body > release.json
+          gh release download "$RELEASE_TAG" --pattern latest.json --output uploaded-latest.json
+          python scripts/release-gate.py verify --tag "$RELEASE_TAG" --sha "$RELEASE_SHA" \
+            --metadata release.json --manifest uploaded-latest.json --expected-manifest latest.json \
+            --notes-file release-notes.md
+
+      - name: Publish verified draft as latest
+        run: gh release edit "$RELEASE_TAG" --draft=false --latest

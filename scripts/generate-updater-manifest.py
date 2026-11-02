@@ -50,7 +50,7 @@ def validate_signature(text):
     return text
 
 
-def release_pairs(raw):
+def release_pairs(raw, allow_partial=False):
     try:
         release = json.loads(raw)
         assets, notes = release["assets"], release.get("body")
@@ -74,18 +74,28 @@ def release_pairs(raw):
             pairs[target] = candidates[0]
     if not pairs:
         raise Refused("no complete updater artifact/signature pairs")
+    missing = sorted(set(PATTERNS) - set(pairs))
+    if missing and not allow_partial:
+        raise Refused("incomplete updater platform set: " + ", ".join(missing))
     return pairs, notes
 
 
-def generate(tag, repo):
-    raw = run(["gh", "release", "view", tag, "--repo", repo, "--json", "assets,body"],
+def generate(tag, repo, allow_partial=False):
+    raw = run(["gh", "release", "view", tag, "--repo", repo, "--json", "assets,body,isDraft"],
               "release lookup failed")
-    pairs, notes = release_pairs(raw)
+    pairs, notes = release_pairs(raw, allow_partial=allow_partial)
+    draft = json.loads(raw).get("isDraft", False)
     base = f"https://github.com/{repo}/releases/download/{quote(tag, safe='')}/"
     platforms = {}
     for target, artifact in pairs.items():
-        text = run(["curl", "--fail", "--silent", "--show-error", "--location", "--",
-                    base + quote(artifact + ".sig", safe="")], "signature download failed")
+        if draft:
+            # Draft assets are private; their eventual public download URLs return 404.
+            command = ["gh", "release", "download", tag, "--repo", repo,
+                       "--pattern", artifact + ".sig", "--output", "-"]
+        else:
+            command = ["curl", "--fail", "--silent", "--show-error", "--location", "--",
+                       base + quote(artifact + ".sig", safe="")]
+        text = run(command, "signature download failed")
         platforms[target] = {"signature": validate_signature(text),
                              "url": base + quote(artifact, safe="")}
     return {"version": tag.removeprefix("v"), "notes": notes,
@@ -95,15 +105,18 @@ def generate(tag, repo):
 
 def main(argv=None):
     args = sys.argv[1:] if argv is None else argv
+    allow_partial = bool(args and args[0] == "--allow-partial")
+    if allow_partial:
+        args = args[1:]
     if len(args) != 1 or not args[0]:
-        print("Usage: generate-updater-manifest.sh <tag>", file=sys.stderr)
+        print("Usage: generate-updater-manifest.sh [--allow-partial] <tag>", file=sys.stderr)
         return 1
     repo = os.environ.get("GITHUB_REPOSITORY") or "Miike0303/Locust"
     temporary = None
     try:
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) or not re.fullmatch(r"v?\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?(?:\+[A-Za-z0-9.-]+)?", args[0]):
             raise Refused("invalid repository or version tag")
-        output = json.dumps(generate(args[0], repo), indent=2, ensure_ascii=False) + "\n"
+        output = json.dumps(generate(args[0], repo, allow_partial=allow_partial), indent=2, ensure_ascii=False) + "\n"
         # Validation and every download finish before touching an existing manifest.
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n",
                                          dir=".", prefix=".latest-", suffix=".json", delete=False) as stream:

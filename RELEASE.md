@@ -6,12 +6,19 @@ manifest job is **not** proof that every desktop or CLI platform shipped.
 ## Prerequisites
 
 - Use the existing Node/Rust/Python toolchains and release workflow. Manifest
-  generation needs Python 3, `gh` and `curl`; no `jq` dependency is required.
+  generation needs Python 3, `gh` and `curl`; the release gate needs Python 3.11+.
+  No `jq` dependency is required.
 - Tauri `bundle.createUpdaterArtifacts` must be `true`. Updater signing uses the
   existing `TAURI_SIGNING_PRIVATE_KEY` and optional
   `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` GitHub Actions secrets, with the public key
-  configured in `tauri.conf.json`. Do not print/read secrets or rotate keys as
-  part of an ordinary release. Missing signing configuration is a release issue,
+  configured in `tauri.conf.json`. **Owner prerequisite:** the private key and
+  password must be usable together and match that configured public key. The
+  v0.2.0 attempt failed all five desktop signing steps because the configured
+  credentials could not be decoded; see
+  [`odd/tasks/release-v0.2.0.md`, L15–L17](odd/tasks/release-v0.2.0.md).
+  The owner must repair the existing secrets before another delivery attempt.
+  Do not print/read secrets, rotate the identity or disable signing as part of
+  an ordinary release. Missing signing configuration is a release issue,
   not permission to publish unsigned updater bundles.
 - OS signing is separate: Apple notarization and Windows Authenticode signing
   are not configured. Unknown-publisher warnings may still appear.
@@ -44,22 +51,35 @@ The release owner performs these steps after candidate verification:
 1. Confirm remote `main` is an ancestor of the tested candidate. Advance `main`
    by fast-forward only and push normally, without force. Stop on divergence.
 2. Confirm the intended version tag does not already exist remotely. Create and
-   push `v0.2.0` at the **same tested SHA**, never by moving an existing tag.
-3. Observe `.github/workflows/release.yml` for that tag/SHA:
-   - Desktop matrix: Windows x64/ARM64, macOS ARM64/x64, Linux x64.
-   - CLI matrix: Windows x64, macOS ARM64/x64, Linux x64.
-   - Updater manifest: runs after desktop jobs even if some failed; uploads only
-     when at least one complete, valid artifact/signature pair exists.
-4. Inspect the actual release body and assets, not just job summaries. Check
-   versions, expected installers/CLI binaries, exact `.sig` companions and
-   `latest.json` URLs/platform keys against the uploaded files. Ensure notes
-   describe actual support limits and any missing platforms honestly.
+   push the intended `vX.Y.Z` at the **same tested SHA**, never by moving an
+   existing tag.
+3. Observe `.github/workflows/release.yml` for that tag/SHA. Manual dispatch
+   must also select the actual stable `vX.Y.Z` tag, not a branch:
+   - `validate` first checks the tag against `Cargo.toml`,
+     `apps/desktop/package.json` and `tauri.conf.json`, and requires one nonempty
+     `## [X.Y.Z]` CHANGELOG section for the release body.
+   - It creates a **draft** bound to the candidate SHA, or reuses a matching
+     draft. A public release, prerelease or different target SHA is refused.
+     Runs for the same ref are serialized.
+   - Desktop matrix: Windows x64/ARM64, macOS ARM64/x64, Linux x64. All upload to
+     that draft. Tauri action's `args: ... -- --locked` forwards `--locked` through
+     `tauri build` to Cargo; CLI builds also use `--locked`.
+   - CLI matrix: Windows x64, macOS ARM64/x64, Linux x64; uploads to the draft.
+   - Only `publish`, after **all nine builds succeed**, generates strict
+     `latest.json`, uploads it and downloads it again for verification.
+4. The finalizer requires all five desktop artifact families with exact `.sig`
+   companions, all four named CLI binaries and `latest.json`, each nonempty.
+   It checks draft/tag/source SHA, all five manifest platform keys, asset URLs,
+   signature shape/equality and changelog-derived notes. It then alone publishes
+   the draft and marks it latest. Any build, download or verification failure
+   leaves the draft unpublished; the existing public latest is unchanged.
+   Inspect the resulting release body/assets and record the finalizer outcome.
 5. Verify signatures against the configured public key using supported updater
-   tooling before claiming signing-key correspondence. Offline shape tests do
-   not prove cryptographic validity or that installed apps can update.
-6. Record source SHA, CI runs, release runs and observed assets separately. A
-   partial manifest may be useful, but never call it a complete five-platform
-   desktop/four-platform CLI release when required builds/assets are missing.
+   tooling before claiming signing-key correspondence. Offline shape/equality
+   tests do not prove cryptographic validity or that installed apps can update.
+6. Record source SHA, CI runs, release runs and observed assets separately.
+   Recovery from a failed run may reuse only the matching draft at the same
+   candidate SHA. Never move an existing tag or bypass the final inventory gate.
 
 ## Updater contract
 
@@ -69,12 +89,17 @@ The endpoint remains:
 https://github.com/Miike0303/Locust/releases/latest/download/latest.json
 ```
 
-`scripts/generate-updater-manifest.sh <tag>` writes `latest.json` in the current
+`bash scripts/generate-updater-manifest.sh <tag>` writes `latest.json` in the current
 directory and prints that JSON on success. It uses `GITHUB_REPOSITORY`, defaulting
 to `Miike0303/Locust`. A refusal exits nonzero, prints a sanitized reason to
 stderr, prints no manifest to stdout and preserves an existing file. There are
-no automatic network retries. See [updater details](docs/update-server.md) for
-pairing rules and the intentionally partial-platform policy.
+no automatic network retries. By default it requires **all five** platform pairs.
+An explicit recovery command,
+`bash scripts/generate-updater-manifest.sh --allow-partial <tag>`, permits a
+nonempty subset of valid pairs. This only generates a local manifest; it does
+not upload, publish or bypass the release gate, and the workflow never uses it.
+Draft signature downloads use authenticated `gh`; public release recovery uses
+`curl`. See [updater details](docs/update-server.md) for pairing rules.
 
 ## Manual updater acceptance
 
