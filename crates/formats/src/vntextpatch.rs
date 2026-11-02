@@ -3,7 +3,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use locust_core::error::{LocustError, Result};
-use locust_core::extraction::{FormatPlugin, FormatStability, InjectionReport};
+use locust_core::extraction::{Extraction, FormatPlugin, FormatStability, InjectionReport};
 use locust_core::models::{OutputMode, StringEntry};
 
 /// Visual-novel text via VNTextPatch (arcusmaximus/VNTranslationTools).
@@ -119,17 +119,28 @@ impl VnTextPatchPlugin {
     /// carry a "message" string field. Keying on "message" (not "name")
     /// avoids matching RPG Maker data files, whose array elements also have a
     /// "name" field.
+    /// Valid non-script JSON is distinct from a failed read or parse: only
+    /// the former can be silently skipped during an authoritative refresh.
+    fn read_vntp(path: &Path) -> Result<Option<Vec<serde_json::Value>>> {
+        let text = std::fs::read_to_string(path)?;
+        let value: serde_json::Value =
+            serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(&text)).map_err(|e| {
+                LocustError::ParseError {
+                    file: path.display().to_string(),
+                    message: e.to_string(),
+                }
+            })?;
+        let serde_json::Value::Array(arr) = value else {
+            return Ok(None);
+        };
+        let is_vntp = arr
+            .iter()
+            .any(|v| v.get("message").and_then(|m| m.as_str()).is_some());
+        Ok(is_vntp.then_some(arr))
+    }
+
     fn looks_like_vntp(path: &Path) -> bool {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return false;
-        };
-        let Ok(serde_json::Value::Array(arr)) = serde_json::from_str::<serde_json::Value>(
-            text.strip_prefix('\u{feff}').unwrap_or(&text),
-        ) else {
-            return false;
-        };
-        arr.iter()
-            .any(|v| v.get("message").and_then(|m| m.as_str()).is_some())
+        Self::read_vntp(path).is_ok_and(|arr| arr.is_some())
     }
 }
 
@@ -177,25 +188,32 @@ impl FormatPlugin for VnTextPatchPlugin {
     }
 
     fn extract(&self, path: &Path) -> Result<Vec<StringEntry>> {
-        let files = if path.is_file() {
+        Ok(self.extract_with_diagnostics(path)?.entries)
+    }
+
+    fn extract_with_diagnostics(&self, path: &Path) -> Result<Extraction> {
+        let single_file = path.is_file();
+        let files = if single_file {
             vec![path.to_path_buf()]
         } else {
             Self::json_files(path)
         };
 
         let mut entries = Vec::new();
+        let mut warnings = Vec::new();
         for file in &files {
-            if !Self::looks_like_vntp(file) {
-                continue;
-            }
-            let text = std::fs::read_to_string(file)?;
-            let arr: Vec<serde_json::Value> = serde_json::from_str(
-                text.strip_prefix('\u{feff}').unwrap_or(&text),
-            )
-            .map_err(|e| LocustError::ParseError {
-                file: file.display().to_string(),
-                message: e.to_string(),
-            })?;
+            let arr = match Self::read_vntp(file) {
+                Ok(Some(arr)) => arr,
+                Ok(None) => continue,
+                Err(e) if single_file => return Err(e),
+                Err(e) => {
+                    warnings.push(format!(
+                        "skipped VNTextPatch JSON file {}: {e}",
+                        file.strip_prefix(path).unwrap_or(file).display()
+                    ));
+                    continue;
+                }
+            };
             let fname = file.file_name().unwrap_or_default().to_string_lossy();
 
             for (idx, obj) in arr.iter().enumerate() {
@@ -218,7 +236,11 @@ impl FormatPlugin for VnTextPatchPlugin {
                 }
             }
         }
-        Ok(entries)
+        Ok(Extraction {
+            complete: warnings.is_empty(),
+            entries,
+            warnings,
+        })
     }
 
     fn inject(&self, path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
