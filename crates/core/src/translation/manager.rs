@@ -841,12 +841,41 @@ impl TranslationManager {
     async fn translate_entries_accounted(
         &self,
         entries: Vec<StringEntry>,
+        opts: TranslationOptions,
+        tx: mpsc::Sender<ProgressEvent>,
+        job_id: String,
+        cancel: CancellationToken,
+        emit_lifecycle: bool,
+        cumulative_cost: &mut ObservedCost,
+        notes: &CharacterNotes,
+        job_glossary: &OnceLock<JobGlossary>,
+    ) -> Result<()> {
+        self.translate_entries_accounted_with_progress(
+            entries,
+            opts,
+            tx,
+            job_id,
+            cancel,
+            emit_lifecycle,
+            cumulative_cost,
+            &mut 0,
+            notes,
+            job_glossary,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn translate_entries_accounted_with_progress(
+        &self,
+        entries: Vec<StringEntry>,
         mut opts: TranslationOptions,
         tx: mpsc::Sender<ProgressEvent>,
         job_id: String,
         cancel: CancellationToken,
         emit_lifecycle: bool,
         cumulative_cost: &mut ObservedCost,
+        cumulative_completed: &mut usize,
         notes: &CharacterNotes,
         job_glossary: &OnceLock<JobGlossary>,
     ) -> Result<()> {
@@ -2099,6 +2128,7 @@ impl TranslationManager {
             observed_cost.complete &= self.provider.is_free();
         }
         cumulative_cost.add(observed_cost);
+        *cumulative_completed += completed;
 
         // 6. Send Completed and record the run in the project ledger
         let duration = start.elapsed().as_secs_f64();
@@ -2275,7 +2305,7 @@ pub async fn run_fallback_chain(
             pass_opts.cost_limit_usd = Some((limit - cumulative_cost.amount).max(0.0));
         }
         if let Err(e) = manager
-            .translate_entries_accounted(
+            .translate_entries_accounted_with_progress(
                 pending,
                 pass_opts,
                 tx.clone(),
@@ -2283,6 +2313,7 @@ pub async fn run_fallback_chain(
                 cancel.clone(),
                 false,
                 &mut cumulative_cost,
+                &mut cumulative_completed,
                 &notes,
                 &job_glossary,
             )
@@ -2310,7 +2341,6 @@ pub async fn run_fallback_chain(
             return Ok(());
         }
         let after = opts.pending_entries(&db)?.len();
-        cumulative_completed += before.saturating_sub(after);
 
         if after == 0 {
             break;
@@ -2325,9 +2355,9 @@ pub async fn run_fallback_chain(
     }
 
     let remaining = opts.pending_entries(&db)?.len();
-    let total_translated = initial_total
-        .saturating_sub(remaining)
-        .max(cumulative_completed);
+    // A concurrent manual edit can remove a row from the pending set without
+    // this job saving it. Count only committed receipts and shortcut saves.
+    let total_translated = cumulative_completed;
 
     let _ = tx
         .send(ProgressEvent::Completed {

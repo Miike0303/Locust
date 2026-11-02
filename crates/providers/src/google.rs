@@ -1514,6 +1514,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn w4_04_scoped_partial_429_cools_shared_limiter_and_preserves_receipts() {
+        use locust_core::{
+            database::Database,
+            glossary::Glossary,
+            models::{ProgressEvent, StringEntry, StringStatus},
+            translation::{
+                RetryConfig, TranslationManager, TranslationOptions, GOOGLE_INITIAL_RPM,
+                GOOGLE_MAX_RPM, GOOGLE_MIN_RPM,
+            },
+        };
+
+        // Verify normal adapters share the registry limiter, then use an isolated
+        // shared instance so this test cannot cool down unrelated parallel tests.
+        assert!(Arc::ptr_eq(
+            &GoogleTranslateProvider::new().limiter,
+            &GoogleTranslateProvider::new().limiter
+        ));
+        assert_eq!(
+            (GOOGLE_INITIAL_RPM, GOOGLE_MIN_RPM, GOOGLE_MAX_RPM),
+            (60, 8, 140)
+        );
+        let server = MockServer::start();
+        let success = server.mock(|when, then| {
+            when.method(POST).body_contains("q=first");
+            then.status(200).json_body(json!(["Primero"]));
+        });
+        let blocked = server.mock(|when, then| {
+            when.method(POST).body_contains("q=second");
+            then.status(429).header("Retry-After", "90");
+        });
+        let peer_post = server.mock(|when, then| {
+            when.method(POST).body_contains("q=peer");
+            then.status(200).json_body(json!(["Otro"]));
+        });
+        let limiter = Arc::new(RateLimiter::google(None, None));
+        let provider = Arc::new(GoogleTranslateProvider {
+            limiter: limiter.clone(),
+            max_sources: 1,
+            concurrency: 1,
+            ..make_provider(&server)
+        });
+        let peer = GoogleTranslateProvider {
+            limiter: limiter.clone(),
+            ..make_provider(&server)
+        };
+        assert!(Arc::ptr_eq(&provider.limiter, &peer.limiter));
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let entries = vec![
+            StringEntry::new("a", "first", "selected.json".into()),
+            StringEntry::new("b", "second", "selected.json".into()),
+            StringEntry::new("out", "first", "excluded.json".into()),
+        ];
+        db.save_entries(&entries).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        TranslationManager::new(provider, db.clone(), Arc::new(Glossary::new(db.clone())))
+            .with_retry_config(RetryConfig {
+                max_attempts: 1,
+                ..Default::default()
+            })
+            .translate_entries(
+                entries,
+                TranslationOptions {
+                    source_lang: "en".into(),
+                    target_lang: "es".into(),
+                    file_paths: Some(vec!["selected.json".into()]),
+                    entry_ids: Some(vec!["a".into(), "b".into(), "out".into()]),
+                    use_memory: false,
+                    use_glossary: false,
+                    ..Default::default()
+                },
+                tx,
+                "w4-google-cooldown".into(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        success.assert_hits(1);
+        blocked.assert_hits(1);
+        assert_eq!(
+            db.get_entry("a").unwrap().unwrap().translation.as_deref(),
+            Some("Primero")
+        );
+        for id in ["b", "out"] {
+            let entry = db.get_entry(id).unwrap().unwrap();
+            assert_eq!(entry.status, StringStatus::Pending);
+            assert!(entry.translation.is_none());
+        }
+        let mut saved = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let ProgressEvent::StringTranslated { entry_id, .. } = event {
+                saved.push(entry_id);
+            }
+        }
+        assert_eq!(saved, ["a"]);
+        let runs = db.get_translation_runs().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            (
+                runs[0].strings_translated,
+                runs[0].cost_usd,
+                runs[0].cost_is_complete
+            ),
+            (1, 0.0, true)
+        );
+        let stats = limiter.google_stats();
+        assert_eq!(
+            (
+                stats.requests,
+                stats.successes,
+                stats.blocked,
+                stats.http_429
+            ),
+            (2, 1, 1, 1)
+        );
+        assert_eq!(limiter.requests_per_minute(), 31); // 60 -> 62 -> 31
+
+        tokio::time::pause();
+        let start = tokio::time::Instant::now();
+        let mut receipts = Vec::new();
+        // A separate adapter's subrequest is held by the same Retry-After,
+        // beyond the default 30-second cooldown. Dropping it cancels its queue wait.
+        assert!(tokio::time::timeout(
+            Duration::from_secs(80),
+            peer.translate_partial(&requests(&["peer"], "en"), &mut receipts)
+        )
+        .await
+        .is_err());
+        tokio::task::yield_now().await;
+        assert!(receipts.is_empty());
+        peer_post.assert_hits(0);
+        assert_eq!(limiter.google_stats().requests, 2);
+        assert!(limiter.acquire_http().await);
+        assert!(start.elapsed() >= Duration::from_secs(89));
+        assert_eq!(limiter.google_stats().requests, 3);
+    }
+
+    #[tokio::test]
     async fn mocked_success_grows_google_rate_and_429_halves_it() {
         let server = MockServer::start();
         let success = server.mock(|when, then| {
