@@ -231,3 +231,179 @@ fn compressed_modern_overlay_replacement_preserves_each_previous_generation() {
     assert_eq!(active.len(), 1);
     assert_eq!(active[0].source, "Third");
 }
+
+fn reset_fixture(path: &Path, separate_resources: bool) {
+    let mut first = LocresFile::parse(&locres(), "fixture").unwrap();
+    let second = LocresString {
+        key: "Goodbye".into(),
+        value: "Goodbye".into(),
+        source_string_hash: 8,
+        key_hash: 0,
+    };
+    let mut files = Vec::new();
+    if separate_resources {
+        let mut other = first.clone();
+        other.namespaces[0].strings = vec![second];
+        files.push(PakWriteFile {
+            name: "Game/Content/Localization/Other/en/Other.locres".into(),
+            data: other.serialize().unwrap(),
+        });
+    } else {
+        first.namespaces[0].strings.push(second);
+    }
+    files.push(PakWriteFile {
+        name: "Game/Content/Localization/Game/en/Game.locres".into(),
+        data: first.serialize().unwrap(),
+    });
+    fs::write(
+        path,
+        write_pak(DEFAULT_MOUNT_POINT, 8, &files, "fixture").unwrap(),
+    )
+    .unwrap();
+}
+
+fn active_values(plugin: &UnrealPlugin, root: &Path) -> Vec<String> {
+    let mut values: Vec<_> = plugin
+        .extract(root)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.source)
+        .collect();
+    values.sort();
+    values
+}
+
+fn assert_all_reset(kind: &str) {
+    let root = tempfile::tempdir().unwrap();
+    let source = containers::container(root.path(), kind, locres());
+    let original = fs::read(&source).unwrap();
+    let plugin = UnrealPlugin::new();
+    let mut entries = plugin.extract(&source).unwrap();
+    entries[0].translation = Some("Translated".into());
+    let first = plugin.inject(root.path(), &entries).unwrap();
+    assert_eq!(first.strings_written, 1);
+    let output = &first.files_written[0];
+    let previous = fs::read(output).unwrap();
+    assert_eq!(active_values(&plugin, root.path()), ["Translated"]);
+
+    entries[0].translation = Some(entries[0].source.clone());
+    let reset = plugin.inject(root.path(), &entries).unwrap();
+    assert_eq!(reset.strings_written, 0);
+    assert_eq!(reset.strings_skipped, 1);
+    assert_eq!(reset.skip_reasons.get("unchanged"), Some(&1));
+    // Re-extract the game with its active overlays, rather than only the base PAK.
+    assert_eq!(active_values(&plugin, root.path()), ["Hello"]);
+    let backup = reset
+        .warnings
+        .iter()
+        .find_map(|w| w.strip_prefix("previous overlay retained at "))
+        .unwrap();
+    assert_eq!(fs::read(backup).unwrap(), previous);
+    assert!(Path::new(backup).extension().is_none());
+    assert!(reset.files_written.is_empty());
+    assert!(!output.exists());
+    assert_eq!(fs::read(source).unwrap(), original);
+}
+
+#[test]
+fn all_reset_retires_classic_overlay() {
+    assert_all_reset("classic");
+}
+
+#[test]
+fn all_reset_retires_modern_overlay() {
+    assert_all_reset("modern");
+}
+
+fn assert_partial_reset(separate_resources: bool) {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("Game.pak");
+    reset_fixture(&source, separate_resources);
+    let original = fs::read(&source).unwrap();
+    let plugin = UnrealPlugin::new();
+    let mut entries = plugin.extract(&source).unwrap();
+    assert_eq!(entries.len(), 2);
+    for entry in &mut entries {
+        entry.translation = Some(format!("Translated {}", entry.source));
+    }
+    assert_eq!(
+        plugin
+            .inject(root.path(), &entries)
+            .unwrap()
+            .strings_written,
+        2
+    );
+    assert_eq!(
+        active_values(&plugin, root.path()),
+        ["Translated Goodbye", "Translated Hello"]
+    );
+    let reset = entries.iter_mut().find(|e| e.source == "Hello").unwrap();
+    reset.translation = Some(reset.source.clone());
+    let report = plugin.inject(root.path(), &entries).unwrap();
+    assert_eq!(report.strings_written, 1);
+    assert_eq!(report.strings_skipped, 1);
+    assert_eq!(report.skip_reasons.get("unchanged"), Some(&1));
+    assert_eq!(
+        active_values(&plugin, root.path()),
+        ["Hello", "Translated Goodbye"]
+    );
+    assert_eq!(fs::read(source).unwrap(), original);
+}
+
+#[test]
+fn partial_reset_in_same_resource_keeps_other_translation() {
+    assert_partial_reset(false);
+}
+
+#[test]
+fn reset_resource_keeps_other_resource_translated() {
+    assert_partial_reset(true);
+}
+
+#[test]
+fn source_equal_translations_without_overlay_create_nothing() {
+    for kind in ["classic", "modern"] {
+        let root = tempfile::tempdir().unwrap();
+        let source = containers::container(root.path(), kind, locres());
+        let original = fs::read(&source).unwrap();
+        let plugin = UnrealPlugin::new();
+        let mut entries = plugin.extract(&source).unwrap();
+        for entry in &mut entries {
+            entry.translation = Some(entry.source.clone());
+        }
+        let report = plugin.inject(root.path(), &entries).unwrap();
+        assert_eq!(report.strings_written, 0);
+        assert_eq!(report.strings_skipped, 1);
+        assert_eq!(report.skip_reasons.get("unchanged"), Some(&1));
+        assert!(report.files_written.is_empty());
+        assert!(report.warnings.is_empty());
+        assert!(!patch_pak_path(&source).exists());
+        assert_eq!(active_values(&plugin, root.path()), ["Hello"]);
+        assert_eq!(fs::read(source).unwrap(), original);
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+}
+
+#[test]
+fn empty_output_without_reset_preserves_existing_overlay() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("Game.pak");
+    fixture(&source);
+    let plugin = UnrealPlugin::new();
+    let mut entries = plugin.extract(&source).unwrap();
+    entries[0].translation = Some("Translated".into());
+    let first = plugin.inject(root.path(), &entries).unwrap();
+    let output = &first.files_written[0];
+    let previous = fs::read(output).unwrap();
+    for translation in [None, Some("Rejected".into())] {
+        entries[0].translation = translation;
+        entries[0]
+            .metadata
+            .insert("locres_source_hash".into(), serde_json::json!(999));
+        let report = plugin.inject(root.path(), &entries).unwrap();
+        assert_eq!(report.strings_written, 0);
+        assert!(report.files_written.is_empty());
+        assert_eq!(fs::read(output).unwrap(), previous);
+        assert_eq!(active_values(&plugin, root.path()), ["Translated"]);
+    }
+}

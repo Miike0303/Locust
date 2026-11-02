@@ -723,6 +723,7 @@ fn inject_embedded_locres_patch_pak(
 
     let mut pak_files: Vec<PakWriteFile> = Vec::new();
     let mut written = 0usize;
+    let mut unchanged = 0usize;
 
     let mut groups: Vec<(String, Vec<&StringEntry>)> = by_group.into_iter().collect();
     groups.sort_by(|a, b| a.0.cmp(&b.0));
@@ -788,6 +789,7 @@ fn inject_embedded_locres_patch_pak(
 
         let (map, reasons) = checked_locres_translations(&loc, &group, off);
         let pending = map.len();
+        unchanged += reasons.get("unchanged").copied().unwrap_or(0);
         for (reason, count) in reasons {
             skipped += count;
             *skip_reasons.entry(reason).or_default() += count;
@@ -851,7 +853,23 @@ fn inject_embedded_locres_patch_pak(
         });
     }
 
+    let candidate = unreal_pak::patch_pak_path(pak_path);
+    let out_path = if candidate == pak_path {
+        let stem = pak_path.file_stem().unwrap_or_default().to_string_lossy();
+        pak_path.with_file_name(format!("{stem}_NEXT_LOCUST_P.pak"))
+    } else {
+        candidate
+    };
     if pak_files.is_empty() {
+        // Only a fully processed source-equal submission resets the overlay.
+        // Other no-output cases (untranslated, stale or invalid rows) stay inert.
+        if unchanged > 0 && unchanged == entries.len() && out_path.try_exists()? {
+            update_overlay_with(game_root, &out_path, warnings, |_| Ok(None))?;
+            warnings.push(format!(
+                "removed localization patch pak {}",
+                out_path.display()
+            ));
+        }
         return Ok((written, skipped, None));
     }
 
@@ -863,13 +881,6 @@ fn inject_embedded_locres_patch_pak(
             message: e.message,
         })?;
 
-    let candidate = unreal_pak::patch_pak_path(pak_path);
-    let out_path = if candidate == pak_path {
-        let stem = pak_path.file_stem().unwrap_or_default().to_string_lossy();
-        pak_path.with_file_name(format!("{stem}_NEXT_LOCUST_P.pak"))
-    } else {
-        candidate
-    };
     write_overlay(game_root, &out_path, &patch_bytes, warnings)?;
     warnings.push(format!(
         "wrote localization patch pak {} (version {write_ver}, {} file(s))",
@@ -912,15 +923,29 @@ fn write_overlay(
     })
 }
 
-/// Caller holds GameLock from source validation through installation. The
-/// previous overlay is retained in an exclusively created, extensionless file
-/// so recursive PAK discovery never mounts a backup. Crash leftovers are never
-/// reclaimed by filename: only this live staging guard owns its children.
 fn write_overlay_with(
     game_root: &Path,
     output: &Path,
     warnings: &mut Vec<String>,
     write: impl FnOnce(&mut std::fs::File) -> Result<()>,
+) -> Result<()> {
+    update_overlay_with(game_root, output, warnings, |stage| {
+        let mut file = stage.create_file("overlay")?;
+        write(&mut file)?;
+        file.sync_all()?;
+        Ok(Some(stage.child("overlay")))
+    })
+}
+
+/// Caller holds GameLock from source validation through installation. The
+/// previous overlay is retained in an exclusively created, extensionless file
+/// so recursive PAK discovery never mounts a backup. Crash leftovers are never
+/// reclaimed by filename: only this live staging guard owns its children.
+fn update_overlay_with(
+    game_root: &Path,
+    output: &Path,
+    warnings: &mut Vec<String>,
+    prepare: impl FnOnce(&mut StagingDir) -> Result<Option<PathBuf>>,
 ) -> Result<()> {
     guard_unreal_target(game_root, output)?;
     let parent = output
@@ -928,10 +953,7 @@ fn write_overlay_with(
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     let mut stage = StagingDir::create_prepared(parent)?;
-    let mut file = stage.create_file("overlay")?;
-    write(&mut file)?;
-    file.sync_all()?;
-    drop(file);
+    let replacement = prepare(&mut stage)?;
     let previous = match std::fs::symlink_metadata(output) {
         Ok(meta) if meta.is_file() => {
             let mut source = std::fs::File::open(output)?;
@@ -948,9 +970,13 @@ fn write_overlay_with(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    // Recheck immediately before the shared move-aside/restore transaction.
+    // Recheck immediately before replacing or removing the active overlay.
     guard_unreal_target(game_root, output)?;
-    PatchStore::replace_file(&stage.child("overlay"), output)?;
+    if let Some(replacement) = replacement {
+        PatchStore::replace_file(&replacement, output)?;
+    } else if previous.is_some() {
+        std::fs::remove_file(output)?;
+    }
     if let Some(previous) = previous {
         stage.disarm();
         warnings.push(format!(
