@@ -987,14 +987,30 @@ async fn apply_get_glossary(s: &AppState, lang_pair: &str) -> Result<Vec<Glossar
 #[tauri::command]
 pub async fn add_glossary_entry(
     entry: GlossaryEntry,
+    expected_database: Option<PathBuf>,
     state: State<'_, AppStateWrapper>,
 ) -> Result<(), String> {
-    apply_add_glossary_entry(&state.0, &entry).await
+    apply_add_glossary_entry(&state.0, &entry, expected_database.as_deref()).await
 }
 
-async fn apply_add_glossary_entry(s: &AppState, entry: &GlossaryEntry) -> Result<(), String> {
-    if s.current_project.read().await.is_none() {
-        return Err("no project open".into());
+async fn apply_add_glossary_entry(
+    s: &AppState,
+    entry: &GlossaryEntry,
+    expected_database: Option<&Path>,
+) -> Result<(), String> {
+    let _guard = try_project_operation(s)?;
+    let project_guard = s.current_project.read().await;
+    let project = project_guard.as_ref().ok_or("no project open")?;
+    if let Some(expected) = expected_database {
+        let database = project
+            .database_path
+            .as_deref()
+            .unwrap_or(Path::new(":memory:"));
+        // The reservation prevents an open from swapping the connection between
+        // this identity check and the synchronous glossary write.
+        if expected != database || expected != s.db.path() {
+            return Err("project changed before glossary mutation; retry".into());
+        }
     }
     s.glossary.add_entry(entry).map_err(|e| e.to_string())
 }
@@ -3091,13 +3107,142 @@ mod tests {
                 context: context.map(str::to_owned),
                 case_sensitive: true,
             };
-            apply_add_glossary_entry(&state, &entry).await.unwrap();
+            apply_add_glossary_entry(&state, &entry, None)
+                .await
+                .unwrap();
             let entries = apply_get_glossary(&state, "en-es").await.unwrap();
             assert_eq!(entries.len(), 1);
             assert_eq!(
                 serde_json::to_value(&entries[0]).unwrap(),
                 serde_json::to_value(&entry).unwrap()
             );
+        }
+    }
+
+    async fn glossary_project_pair() -> (tempfile::TempDir, Arc<AppState>, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.locust.db");
+        let b = dir.path().join("b.locust.db");
+        let state = locust_server::create_test_state_with_db(&a);
+        state.glossary.add("HP", "A health", "en-es", None).unwrap();
+        locust_core::database::Database::open(&b)
+            .unwrap()
+            .save_glossary_entry(&glossary_entry())
+            .unwrap();
+        *state.current_project.write().await = Some(ProjectInfo {
+            database_path: Some(a),
+            ..Default::default()
+        });
+        (dir, state, b)
+    }
+
+    fn glossary_entry() -> GlossaryEntry {
+        GlossaryEntry {
+            term: "HP".into(),
+            translation: "B health".into(),
+            lang_pair: "en-es".into(),
+            context: Some("B only".into()),
+            case_sensitive: true,
+        }
+    }
+
+    fn glossary_snapshot(path: &Path) -> serde_json::Value {
+        serde_json::to_value(
+            locust_core::database::Database::open(path)
+                .unwrap()
+                .get_glossary("en-es")
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn glossary_stale_add_changes_neither_project() {
+        let (_dir, state, b) = glossary_project_pair().await;
+        let a = state.db.path();
+        let before_a = glossary_snapshot(&a);
+        let before_b = glossary_snapshot(&b);
+        {
+            let _opening = try_project_operation(&state).unwrap();
+            state.db.reopen(&b).unwrap();
+            state
+                .current_project
+                .write()
+                .await
+                .as_mut()
+                .unwrap()
+                .database_path = Some(b.clone());
+        }
+        assert_eq!(
+            apply_add_glossary_entry(&state, &glossary_entry(), Some(&a))
+                .await
+                .unwrap_err(),
+            "project changed before glossary mutation; retry"
+        );
+        assert_eq!(glossary_snapshot(&a), before_a);
+        assert_eq!(glossary_snapshot(&b), before_b);
+    }
+
+    #[tokio::test]
+    async fn glossary_reserved_add_including_legacy_changes_nothing() {
+        let (_dir, state, b) = glossary_project_pair().await;
+        let a = state.db.path();
+        let before_a = glossary_snapshot(&a);
+        let before_b = glossary_snapshot(&b);
+        let _opening = try_project_operation(&state).unwrap();
+        for swapped in [false, true] {
+            if swapped {
+                state.db.reopen(&b).unwrap();
+            }
+            for expected in [Some(a.as_path()), None] {
+                assert_eq!(
+                    apply_add_glossary_entry(&state, &glossary_entry(), expected)
+                        .await
+                        .unwrap_err(),
+                    locust_server::PROJECT_BUSY_MESSAGE
+                );
+                assert_eq!(glossary_snapshot(&a), before_a);
+                assert_eq!(glossary_snapshot(&b), before_b);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn glossary_matching_and_legacy_add_succeed() {
+        let (_dir, state, b) = glossary_project_pair().await;
+        let a = state.db.path();
+        let before_b = glossary_snapshot(&b);
+        for expected in [Some(a.as_path()), None] {
+            let mut entry = glossary_entry();
+            entry.translation = format!("Updated {expected:?}");
+            apply_add_glossary_entry(&state, &entry, expected)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(state.glossary.get_all("en-es").unwrap()).unwrap(),
+                serde_json::json!([entry])
+            );
+            assert_eq!(glossary_snapshot(&b), before_b);
+            assert!(try_project_operation(&state).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn glossary_identity_checks_the_live_database_before_add() {
+        let (_dir, state, b) = glossary_project_pair().await;
+        let a = state.db.path();
+        let before_a = glossary_snapshot(&a);
+        let before_b = glossary_snapshot(&b);
+        state.db.reopen(&b).unwrap();
+        for expected in [a.as_path(), b.as_path()] {
+            assert_eq!(
+                apply_add_glossary_entry(&state, &glossary_entry(), Some(expected))
+                    .await
+                    .unwrap_err(),
+                "project changed before glossary mutation; retry"
+            );
+            assert_eq!(glossary_snapshot(&a), before_a);
+            assert_eq!(glossary_snapshot(&b), before_b);
         }
     }
 
@@ -3124,7 +3269,7 @@ mod tests {
             "no project open"
         );
         assert_eq!(
-            apply_add_glossary_entry(&state, &new_entry)
+            apply_add_glossary_entry(&state, &new_entry, None)
                 .await
                 .unwrap_err(),
             "no project open"

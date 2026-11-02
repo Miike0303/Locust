@@ -763,13 +763,15 @@ export const getGlossary = (langPair: string): Promise<GlossaryEntry[]> =>
     ? tauriInvoke("get_glossary", { langPair })
     : request(`/glossary?lang_pair=${encodeURIComponent(langPair)}`);
 
-export const addGlossaryEntry = (entry: GlossaryEntry): Promise<void> =>
+export const addGlossaryEntry = (entry: GlossaryEntry, expectedDatabase?: string): Promise<void> =>
   IS_TAURI
-    ? tauriInvoke("add_glossary_entry", { entry })
-    : request("/glossary", { method: "POST", body: JSON.stringify(entry) });
+    ? tauriInvoke("add_glossary_entry", { entry, ...(expectedDatabase === undefined ? {} : { expectedDatabase }) })
+    : request("/glossary", { method: "POST", body: JSON.stringify({ ...entry, expected_database: expectedDatabase }) });
 
-export const deleteGlossaryEntry = (term: string, langPair: string) =>
-  request<void>(`/glossary/${encodeURIComponent(term)}?lang_pair=${encodeURIComponent(langPair)}`, { method: "DELETE" });
+export const deleteGlossaryEntry = (term: string, langPair: string, expectedDatabase?: string) => {
+  const expected = expectedDatabase === undefined ? "" : `&expected_database=${encodeURIComponent(expectedDatabase)}`;
+  return request<void>(`/glossary/${encodeURIComponent(term)}?lang_pair=${encodeURIComponent(langPair)}${expected}`, { method: "DELETE" });
+};
 
 export interface ExportScope {
   file?: string;

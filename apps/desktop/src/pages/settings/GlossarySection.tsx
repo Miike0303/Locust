@@ -14,6 +14,7 @@ export default function GlossarySection() {
   const t = useT();
   const project = useProjectStore((s) => s.project);
   const projectScope = project?.database_path ?? project?.path ?? null;
+  const expectedDatabase = project?.database_path ?? ":memory:";
   const { data: config } = useQuery({ queryKey: ["config"], queryFn: getConfig });
   const qc = useQueryClient();
   const configPair = config
@@ -38,12 +39,14 @@ export default function GlossarySection() {
   const [entryToEdit, setEntryToEdit] = useState<{
     entry: GlossaryEntry;
     projectScope: string | null;
+    expectedDatabase: string;
   } | null>(null);
   const [editSaving, setEditSaving] = useState(false);
   const editRequest = useRef<object | null>(null);
   const [entryToDelete, setEntryToDelete] = useState<{
     entry: GlossaryEntry;
     projectScope: string | null;
+    expectedDatabase: string;
   } | null>(null);
 
   useEffect(() => {
@@ -113,7 +116,7 @@ export default function GlossarySection() {
         context: note.trim() || null,
         case_sensitive: caseSensitive,
       };
-      await addGlossaryEntry(entry);
+      await addGlossaryEntry(entry, expectedDatabase);
       if (isCurrentProject(projectScope)) {
         setTerm("");
         setTranslation("");
@@ -150,7 +153,7 @@ export default function GlossarySection() {
         ...pending.entry,
         translation: tr,
         context: pending.entry.context?.trim() ? pending.entry.context : null,
-      });
+      }, pending.expectedDatabase);
       if (editRequest.current === request && isCurrentProject(pending.projectScope)) {
         setEntryToEdit((current) => current === pending ? null : current);
       }
@@ -171,7 +174,7 @@ export default function GlossarySection() {
     if (!canSubmit(pending.projectScope)) return;
     try {
       const { entry } = pending;
-      await deleteGlossaryEntry(entry.term, entry.lang_pair);
+      await deleteGlossaryEntry(entry.term, entry.lang_pair, pending.expectedDatabase);
       invalidateGlossary(pending.projectScope);
     } catch (e: any) {
       addToast("error", t("settings.glossary.toast.deleteFailed", { error: e.message }));
@@ -382,7 +385,7 @@ export default function GlossarySection() {
                       ) : (
                         <>
                           <button
-                            onClick={() => setEntryToEdit({ entry: { ...e }, projectScope })}
+                            onClick={() => setEntryToEdit({ entry: { ...e }, projectScope, expectedDatabase })}
                             disabled={entryToEdit !== null || saving || editSaving}
                             aria-label={t("settings.glossary.editTitle")}
                             title={t("settings.glossary.editTitle")}
@@ -391,7 +394,7 @@ export default function GlossarySection() {
                             <Pencil size={14} />
                           </button>
                           <button
-                            onClick={() => setEntryToDelete({ entry: e, projectScope })}
+                            onClick={() => setEntryToDelete({ entry: e, projectScope, expectedDatabase })}
                             disabled={editSaving}
                             className="inline-flex items-center justify-center rounded-md p-2 text-danger hover:bg-danger-muted disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-danger"
                             aria-label={t("settings.glossary.deleteTitle")}

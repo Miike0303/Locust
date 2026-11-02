@@ -15,8 +15,8 @@ const label = (key: string) => t(key as TranslateKey); // The parent adds the ne
 const h = {
   t, project: project as ProjectInfo | null,
   slots: [] as any[], cursor: 0, dirty: false, effects: [] as (() => void)[],
-  calls: [] as GlossaryEntry[], toasts: [] as unknown[][], invalidations: [] as any[],
-  fail: false, waitForSave: null as Promise<void> | null,
+  calls: [] as GlossaryEntry[], identities: [] as (string | undefined)[], deletes: [] as unknown[][], toasts: [] as unknown[][], invalidations: [] as any[],
+  fail: false, failure: "write failed", waitForSave: null as Promise<void> | null,
   state(initial: any) {
     const slots = h.slots, index = h.cursor++;
     if (!(index in slots)) slots[index] = typeof initial === "function" ? initial() : initial;
@@ -36,10 +36,14 @@ const h = {
     const state = client.getQueryState(options.queryKey);
     return { data: state?.data, isLoading: false, isError: false, error: null };
   },
-  async save(entry: GlossaryEntry) {
-    h.calls.push(entry);
+  async save(entry: GlossaryEntry, expectedDatabase?: string) {
+    h.calls.push(entry); h.identities.push(expectedDatabase);
     if (h.waitForSave) await h.waitForSave;
-    if (h.fail) throw new Error("write failed");
+    if (h.fail) throw new Error(h.failure);
+  },
+  async delete(...args: unknown[]) {
+    h.deletes.push(args);
+    if (h.fail) throw new Error(h.failure);
   },
 };
 (globalThis as any).__glossaryEditTest = h;
@@ -50,7 +54,7 @@ const hooks = registerHooks({
       const stubs: Record<string, string> = {
         react: "export const useState=h.state;export const useEffect=h.effect;export const useMemo=fn=>fn();export const useRef=x=>h.state(()=>({current:x}))[0];",
         "@tanstack/react-query": "export const useQuery=h.query;export const useQueryClient=()=>({invalidateQueries:async options=>{h.invalidations.push(options);}});",
-        "../../lib/api": "export const getConfig=()=>{};export const getGlossary=()=>{};export const addGlossaryEntry=h.save;export const deleteGlossaryEntry=()=>{throw Error('unexpected delete');};",
+        "../../lib/api": "export const getConfig=()=>{};export const getGlossary=()=>{};export const addGlossaryEntry=h.save;export const deleteGlossaryEntry=h.delete;",
         "../../lib/i18n": "export const useT=()=>h.t;",
         "../../stores/projectStore": "export const useProjectStore=Object.assign(select=>select(h),{getState:()=>h});",
         "../../stores/toastStore": "export const addToast=(...args)=>h.toasts.push(args);",
@@ -99,8 +103,8 @@ function caseSensitive(value: boolean) { change(control("settings.glossary.caseS
 function save() { return action("settings.glossary.save", row()).props.onClick(); }
 
 beforeEach(() => {
-  client.clear(); h.project = project; h.slots = []; h.effects = []; h.calls = []; h.toasts = []; h.invalidations = [];
-  h.fail = false; h.waitForSave = null; setLocale("en");
+  client.clear(); h.project = project; h.slots = []; h.effects = []; h.calls = []; h.identities = []; h.deletes = []; h.toasts = []; h.invalidations = [];
+  h.fail = false; h.failure = "write failed"; h.waitForSave = null; setLocale("en");
   client.setQueryData(["config"], { default_source_lang: "en", default_target_lang: "es" });
   client.setQueryData(["glossary", project.database_path, "en-es"], [{ ...original }]);
 });
@@ -238,3 +242,122 @@ test("switching language pairs discards a row draft instead of moving it to the 
   assert.equal(control("settings.glossary.translation", row()).props.value, "EE.UU.");
   assert.deepEqual(h.calls, []);
 });
+
+
+function fillAdd() {
+  change(find(node => node.props?.placeholder === t("settings.glossary.sourceTerm")), "US");
+  change(find(node => node.props?.placeholder === t("settings.glossary.preferredTranslation")), "EE.UU.");
+}
+function confirmDelete() {
+  action("settings.glossary.deleteTitle", row()).props.onClick();
+  return find(node => node.props?.open === true && typeof node.props?.onConfirm === "function").props.onConfirm();
+}
+
+for (const operation of ["add", "edit", "delete"]) {
+  test(`${operation} sends the database identity captured by the rendered section`, async () => {
+    if (operation === "add") {
+      fillAdd(); await action("settings.glossary.addEntry").props.onClick();
+    } else if (operation === "edit") {
+      startEdit(); translation("Updated"); await save();
+    } else {
+      await confirmDelete();
+    }
+    if (operation === "delete") assert.deepEqual(h.deletes, [["US", "en-es", project.database_path]]);
+    else assert.deepEqual(h.identities, [project.database_path]);
+  });
+
+  test(`${operation} conflict shows an error and does not report a successful mutation`, async () => {
+    h.fail = true; h.failure = "409: project changed before glossary mutation; retry";
+    if (operation === "add") {
+      fillAdd(); await action("settings.glossary.addEntry").props.onClick();
+      assert.equal(find(node => node.props?.placeholder === t("settings.glossary.sourceTerm")).props.value, "US");
+      assert.equal(find(node => node.props?.placeholder === t("settings.glossary.preferredTranslation")).props.value, "EE.UU.");
+    } else if (operation === "edit") {
+      startEdit(); translation("Retry me"); await save();
+      assert.equal(control("settings.glossary.translation", row()).props.value, "Retry me");
+    } else {
+      await confirmDelete();
+      assert.ok(renderToStaticMarkup(tree()).includes("EE.UU."));
+    }
+    const key = operation === "edit" ? "saveFailed" : operation === "add" ? "addFailed" : "deleteFailed";
+    assert.deepEqual(h.toasts, [["error", t(`settings.glossary.toast.${key}` as TranslateKey, { error: h.failure })]]);
+    assert.deepEqual(h.invalidations, []);
+    assert.deepEqual(client.getQueryData(["glossary", project.database_path, "en-es"]), [original]);
+  });
+}
+
+test("an in-flight save keeps A's identity and never invalidates B as active", async () => {
+  startEdit(); translation("Pending A");
+  let finish!: () => void;
+  h.waitForSave = new Promise<void>(resolve => { finish = resolve; });
+  const pending = save();
+  h.project = { ...project, database_path: "C:/other.db" };
+  client.setQueryData(["glossary", h.project.database_path, "en-es"], [original]);
+  tree();
+  finish(); await pending;
+  assert.deepEqual(h.identities, [project.database_path]);
+  assert.deepEqual(h.invalidations, [{ queryKey: ["glossary", project.database_path], refetchType: "none" }]);
+});
+
+
+test("an unsaved project uses the existing in-memory database identity", async () => {
+  h.project = { ...project, database_path: undefined };
+  fillAdd(); await action("settings.glossary.addEntry").props.onClick();
+  assert.deepEqual(h.identities, [":memory:"]);
+});
+
+// Exercise the real glossary transport functions as well as the section's API seam.
+const transport = { calls: [] as any[], setTauri: (_value: boolean) => {} };
+(globalThis as any).__glossaryApiTest = transport;
+const runtimeHook = registerHooks({
+  load(url, context, nextLoad) {
+    if (url.replace(/\\/g, "/").endsWith("/src/lib/runtime.ts")) {
+      return { format: "module", shortCircuit: true, source:
+        "export let IS_TAURI=true;export const isTauri=()=>IS_TAURI;globalThis.__glossaryApiTest.setTauri=value=>{IS_TAURI=value;};" };
+    }
+    return nextLoad(url, context);
+  },
+});
+const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+const previousFetch = globalThis.fetch;
+Object.defineProperty(globalThis, "window", { configurable: true, value: {
+  __TAURI_INTERNALS__: { invoke: async (command: string, args: any) => {
+    if (command === "get_server_port") return 7842;
+    transport.calls.push([command, args]);
+  } },
+} });
+globalThis.fetch = async (url, init) => {
+  transport.calls.push([String(url), init?.method, init?.body ? JSON.parse(String(init.body)) : null]);
+  return new Response(null, { status: 204 });
+};
+const realApi = await import("../../lib/api.ts");
+// Initialize the fallback URL using Tauri's existing port seam before testing HTTP.
+await realApi.deleteGlossaryEntry("bootstrap", "en-es");
+after(() => {
+  runtimeHook.deregister(); globalThis.fetch = previousFetch;
+  if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow);
+  else Reflect.deleteProperty(globalThis, "window");
+  Reflect.deleteProperty(globalThis, "__glossaryApiTest");
+});
+for (const tauri of [true, false]) {
+  test(`${tauri ? "Tauri" : "HTTP"} glossary add carries optional expected database without changing the entry`, async () => {
+    transport.setTauri(tauri);
+    for (const expected of [undefined, "C:/project A & B.locust.db"]) {
+      transport.calls = [];
+      await realApi.addGlossaryEntry(original, expected);
+      assert.deepEqual(transport.calls, tauri
+        ? [["add_glossary_entry", expected === undefined ? { entry: original } : { entry: original, expectedDatabase: expected }]]
+        : [["http://localhost:7842/api/glossary", "POST", expected === undefined ? original : { ...original, expected_database: expected }]]);
+    }
+  });
+
+  test(`${tauri ? "desktop fallback" : "HTTP"} glossary delete encodes the optional expected database`, async () => {
+    transport.setTauri(tauri);
+    for (const expected of [undefined, "C:/project A & B.locust.db"]) {
+      transport.calls = [];
+      await realApi.deleteGlossaryEntry("HP/MP", "en-es", expected);
+      const suffix = expected === undefined ? "" : `&expected_database=${encodeURIComponent(expected)}`;
+      assert.deepEqual(transport.calls, [[`http://localhost:7842/api/glossary/HP%2FMP?lang_pair=en-es${suffix}`, "DELETE", null]]);
+    }
+  });
+}

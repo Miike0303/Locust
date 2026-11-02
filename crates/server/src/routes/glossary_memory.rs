@@ -13,6 +13,8 @@ use crate::{err, run_owned_project_operation, try_project_operation, ApiError, A
 #[derive(Deserialize)]
 pub(crate) struct GlossaryQuery {
     lang_pair: String,
+    #[serde(default)]
+    expected_database: Option<std::path::PathBuf>,
 }
 
 pub(crate) async fn get_glossary(
@@ -37,15 +39,16 @@ pub(crate) struct AddGlossaryRequest {
     context: Option<String>,
     #[serde(default)]
     case_sensitive: bool,
+    #[serde(default)]
+    expected_database: Option<std::path::PathBuf>,
 }
 
 pub(crate) async fn add_glossary(
     State(state): State<Arc<AppState>>,
     Json(entry): Json<AddGlossaryRequest>,
 ) -> Result<StatusCode, ApiError> {
-    if state.current_project.read().await.is_none() {
-        return Err(err(StatusCode::BAD_REQUEST, "no project open"));
-    }
+    let _guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
+    check_glossary_project(&state, entry.expected_database.as_deref()).await?;
     state
         .glossary
         .add_entry(&GlossaryEntry {
@@ -64,14 +67,38 @@ pub(crate) async fn delete_glossary(
     AxumPath(term): AxumPath<String>,
     Query(q): Query<GlossaryQuery>,
 ) -> Result<StatusCode, ApiError> {
-    if state.current_project.read().await.is_none() {
-        return Err(err(StatusCode::BAD_REQUEST, "no project open"));
-    }
+    let _guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
+    check_glossary_project(&state, q.expected_database.as_deref()).await?;
     state
         .glossary
         .delete(&term, &q.lang_pair)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// Call only while holding the project reservation, which serializes this
+// check and the synchronous mutation with open-project connection replacement.
+async fn check_glossary_project(
+    state: &AppState,
+    expected_database: Option<&std::path::Path>,
+) -> Result<(), ApiError> {
+    let project_guard = state.current_project.read().await;
+    let project = project_guard
+        .as_ref()
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "no project open"))?;
+    if let Some(expected) = expected_database {
+        let database = project
+            .database_path
+            .as_deref()
+            .unwrap_or(std::path::Path::new(":memory:"));
+        if expected != database || expected != state.db.path() {
+            return Err(err(
+                StatusCode::CONFLICT,
+                "project changed before glossary mutation; retry",
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn memory_stats(
@@ -945,6 +972,166 @@ mod tests {
             response.text().await.unwrap(),
             crate::TRANSLATION_IN_FLIGHT_MESSAGE
         );
+    }
+
+    async fn glossary_project_pair() -> (tempfile::TempDir, Arc<AppState>, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.locust.db");
+        let b = dir.path().join("b.locust.db");
+        let state = crate::create_test_state_with_db(&a);
+        state.glossary.add("HP", "A health", "en-es", None).unwrap();
+        Database::open(&b)
+            .unwrap()
+            .save_glossary_entry(&GlossaryEntry {
+                term: "HP".into(),
+                translation: "B health".into(),
+                lang_pair: "en-es".into(),
+                context: Some("B only".into()),
+                case_sensitive: true,
+            })
+            .unwrap();
+        *state.current_project.write().await = Some(crate::ProjectInfo {
+            database_path: Some(a),
+            ..Default::default()
+        });
+        (dir, state, b)
+    }
+
+    fn glossary_snapshot(path: &std::path::Path) -> serde_json::Value {
+        serde_json::to_value(Database::open(path).unwrap().get_glossary("en-es").unwrap()).unwrap()
+    }
+
+    async fn glossary_mutation(
+        url: &str,
+        delete: bool,
+        expected: Option<&std::path::Path>,
+    ) -> reqwest::Response {
+        let request = if delete {
+            let mut request = client()
+                .delete(format!("{url}/api/glossary/HP"))
+                .query(&[("lang_pair", "en-es")]);
+            if let Some(path) = expected {
+                request = request.query(&[("expected_database", path.to_str().unwrap())]);
+            }
+            request
+        } else {
+            let mut body = serde_json::json!({
+                "term": "HP", "translation": "Changed", "lang_pair": "en-es", "context": null
+            });
+            if let Some(path) = expected {
+                body["expected_database"] = serde_json::json!(path);
+            }
+            client().post(format!("{url}/api/glossary")).json(&body)
+        };
+        request.send().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn glossary_stale_add_and_delete_change_neither_project() {
+        let (_dir, state, b) = glossary_project_pair().await;
+        let a = state.db.path();
+        let before_a = glossary_snapshot(&a);
+        let before_b = glossary_snapshot(&b);
+        {
+            let _opening = try_project_operation(&state).unwrap();
+            state.db.reopen(&b).unwrap();
+            state
+                .current_project
+                .write()
+                .await
+                .as_mut()
+                .unwrap()
+                .database_path = Some(b.clone());
+        }
+        let (url, server) = crate::start_test_server(state).await;
+        for delete in [false, true] {
+            let response = glossary_mutation(&url, delete, Some(&a)).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                response.text().await.unwrap(),
+                "project changed before glossary mutation; retry"
+            );
+            assert_eq!(glossary_snapshot(&a), before_a);
+            assert_eq!(glossary_snapshot(&b), before_b);
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn glossary_reserved_add_and_delete_including_legacy_change_nothing() {
+        let (_dir, state, b) = glossary_project_pair().await;
+        let a = state.db.path();
+        let before_a = glossary_snapshot(&a);
+        let before_b = glossary_snapshot(&b);
+        let (url, server) = crate::start_test_server(state.clone()).await;
+        // Cover both the live A connection and the connection/publication gap of an open.
+        let opening = try_project_operation(&state).unwrap();
+        for swapped in [false, true] {
+            if swapped {
+                state.db.reopen(&b).unwrap();
+            }
+            for expected in [Some(a.as_path()), None] {
+                for delete in [false, true] {
+                    let response = glossary_mutation(&url, delete, expected).await;
+                    assert_eq!(response.status(), StatusCode::CONFLICT);
+                    assert_eq!(response.text().await.unwrap(), crate::PROJECT_BUSY_MESSAGE);
+                    assert_eq!(glossary_snapshot(&a), before_a);
+                    assert_eq!(glossary_snapshot(&b), before_b);
+                }
+            }
+        }
+        drop(opening);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn glossary_matching_and_legacy_add_and_delete_succeed() {
+        let (_dir, state, b) = glossary_project_pair().await;
+        let a = state.db.path();
+        let before_b = glossary_snapshot(&b);
+        let (url, server) = crate::start_test_server(state.clone()).await;
+        for expected in [Some(a.as_path()), None] {
+            assert_eq!(
+                glossary_mutation(&url, false, expected).await.status(),
+                StatusCode::CREATED
+            );
+            assert_eq!(
+                state.glossary.get_all("en-es").unwrap()[0].translation,
+                "Changed"
+            );
+            assert!(try_project_operation(&state).is_ok());
+            assert_eq!(
+                glossary_mutation(&url, true, expected).await.status(),
+                StatusCode::NO_CONTENT
+            );
+            assert!(state.glossary.get_all("en-es").unwrap().is_empty());
+            assert_eq!(glossary_snapshot(&b), before_b);
+            assert!(try_project_operation(&state).is_ok());
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn glossary_identity_checks_the_live_database_before_mutation() {
+        let (_dir, state, b) = glossary_project_pair().await;
+        let a = state.db.path();
+        let before_a = glossary_snapshot(&a);
+        let before_b = glossary_snapshot(&b);
+        state.db.reopen(&b).unwrap();
+        let (url, server) = crate::start_test_server(state).await;
+        for expected in [a.as_path(), b.as_path()] {
+            for delete in [false, true] {
+                let response = glossary_mutation(&url, delete, Some(expected)).await;
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+                assert_eq!(
+                    response.text().await.unwrap(),
+                    "project changed before glossary mutation; retry"
+                );
+                assert_eq!(glossary_snapshot(&a), before_a);
+                assert_eq!(glossary_snapshot(&b), before_b);
+            }
+        }
+        server.abort();
     }
 
     #[tokio::test]
