@@ -183,6 +183,38 @@ impl Locator {
             .insert(LOCATOR_KEY.into(), serde_json::to_value(locator)?);
         Ok(row)
     }
+
+    fn character_row(
+        archive: &str,
+        member: &str,
+        md5: &[u8; 16],
+        name: &str,
+    ) -> Result<StringEntry> {
+        // Character identity is the member path and field, never its value or
+        // physical line. Keep the existing timeline locator/id scheme intact.
+        let locator = Self {
+            locator_version: 1,
+            archive: archive.into(),
+            member: member.into(),
+            original_md5: md5_hex(md5),
+            kind: "display_name".into(),
+            line: 0,
+            ordinal: 0,
+            translation_id: None,
+            speaker: None,
+        };
+        let mut row = StringEntry::new(
+            locator.id(),
+            name,
+            Path::new(archive).join(member.strip_prefix("res://").expect("validated PCK path")),
+        )
+        .with_format_id("godot-dialogic");
+        row.context = Some(format!("Character display name — {member}"));
+        row.tags = vec!["actor_name".into(), "speaker".into()];
+        row.metadata
+            .insert(LOCATOR_KEY.into(), serde_json::to_value(locator)?);
+        Ok(row)
+    }
 }
 
 /// Read and authenticate every character resource, even if another fails.
@@ -191,7 +223,8 @@ fn characters(
     file: &mut File,
     index: &PckIndex,
     warnings: &mut Vec<String>,
-) -> (CharacterSet, bool) {
+    mut names: Option<(&str, &mut Vec<StringEntry>)>,
+) -> Result<(CharacterSet, bool)> {
     let mut characters = CharacterSet::default();
     let mut stems = HashSet::new();
     let mut duplicate = false;
@@ -217,16 +250,31 @@ fn characters(
                 dialogic::parse_character(text)
             });
         match parsed {
-            Ok(_) if !duplicate => {
-                if let Err(e) = characters.insert_filename(&entry.path) {
-                    warn(warnings, &entry.path, e);
+            Ok(info) => {
+                if !duplicate {
+                    if let Err(e) = characters.insert_filename(&entry.path) {
+                        warn(warnings, &entry.path, e);
+                    }
+                }
+                if let Some((archive, rows)) = names.as_mut() {
+                    if let Some(name) = info
+                        .display_name
+                        .as_deref()
+                        .filter(|s| !s.trim().is_empty())
+                    {
+                        rows.push(Locator::character_row(
+                            archive,
+                            &entry.path,
+                            &entry.stored_md5,
+                            name,
+                        )?);
+                    }
                 }
             }
-            Ok(_) => {}
             Err(e) => warn(warnings, &entry.path, e),
         }
     }
-    (characters, duplicate)
+    Ok((characters, duplicate))
 }
 
 struct Target<'a> {
@@ -284,7 +332,17 @@ fn target<'a>(path: &Path, entries: &'a [StringEntry]) -> Result<Option<Target<'
                 "unsupported locator version, id disagreement or duplicate locator",
             ));
         }
-        locator.span_id()?;
+        if locator.kind == "display_name" {
+            if locator.line != 0
+                || locator.ordinal != 0
+                || locator.translation_id.is_some()
+                || locator.speaker.is_some()
+            {
+                return Err(refused("invalid character display_name locator"));
+            }
+        } else {
+            locator.span_id()?;
+        }
         if archive_name(Path::new(&locator.archive))? != locator.archive
             || Path::new(&locator.archive).components().count() != 1
         {
@@ -294,13 +352,20 @@ fn target<'a>(path: &Path, entries: &'a [StringEntry]) -> Result<Option<Target<'
             .member
             .strip_prefix("res://")
             .ok_or_else(|| refused("locator member must be canonical res:// path"))?;
-        if !tail.ends_with(".dtl")
+        let extension = if locator.kind == "display_name" {
+            ".dch"
+        } else {
+            ".dtl"
+        };
+        if !tail.ends_with(extension)
             || tail.contains('\\')
             || tail
                 .split('/')
                 .any(|s| s.is_empty() || s == "." || s == "..")
         {
-            return Err(refused("locator member must be a canonical .dtl path"));
+            return Err(refused(
+                "locator member must be a canonical path matching its span kind",
+            ));
         }
         zipsec::safe_entry_path(tail, tail)?;
         let relative = Path::new(&locator.archive).join(tail);
@@ -400,7 +465,13 @@ impl FormatPlugin for GodotDialogicPlugin {
         let archive = archive_name(path)?;
         let mut warnings = Vec::new();
         let mut entries = Vec::new();
-        let (characters, duplicate) = characters(&mut file, &index, &mut warnings);
+        let mut names = Vec::new();
+        let (characters, duplicate) = characters(
+            &mut file,
+            &index,
+            &mut warnings,
+            Some((&archive, &mut names)),
+        )?;
         for entry in index.entries.iter().filter(|e| e.path.ends_with(".dtl")) {
             let timeline =
                 godot_pck::read_member(&mut file, entry, dialogic::MAX_INPUT_BYTES as u64)
@@ -431,6 +502,7 @@ impl FormatPlugin for GodotDialogicPlugin {
                 Err(e) => warn(&mut warnings, &entry.path, e),
             }
         }
+        entries.extend(names);
         Ok(Extraction {
             complete: warnings.is_empty(),
             entries,
@@ -546,17 +618,48 @@ fn prepare_injection_from(
             || index.reserved != original.reserved
             || index.entries.len() != original.entries.len()
             || index.entries.iter().zip(&original.entries).any(|(a, b)| {
-                a.path != b.path
-                    || a.padded_path != b.padded_path
-                    || a.flags != b.flags
-                    || (a.path.ends_with(".dch")
-                        && (a.stored_md5 != b.stored_md5 || a.size != b.size))
+                a.path != b.path || a.padded_path != b.padded_path || a.flags != b.flags
             })
         {
             return Err(refused("revision archive structure/order or character authority differs from verified original"));
         }
+        // Authenticate every changed character, even when no name row is
+        // selected. Core verifies the prior output; exact reconstruction below
+        // proves that only a literal display_name changed since the original.
+        for (current_entry, base_entry) in index.entries.iter().zip(&original.entries) {
+            if !current_entry.path.ends_with(".dch")
+                || (current_entry.stored_md5 == base_entry.stored_md5
+                    && current_entry.size == base_entry.size)
+            {
+                continue;
+            }
+            let base = String::from_utf8(godot_pck::read_member(
+                original_file.as_mut().expect("revision original"),
+                base_entry,
+                dialogic::MAX_INPUT_BYTES as u64,
+            )?)
+            .map_err(|e| refused(format!("original character is not UTF-8: {e}")))?;
+            let current = String::from_utf8(godot_pck::read_member(
+                &mut file,
+                current_entry,
+                dialogic::MAX_INPUT_BYTES as u64,
+            )?)
+            .map_err(|e| refused(format!("current character is not UTF-8: {e}")))?;
+            let info = dialogic::parse_character(&base)?;
+            let current_info = dialogic::parse_character(&current)?;
+            let name = current_info
+                .display_name
+                .as_deref()
+                .ok_or_else(|| refused("revision character has no literal display_name"))?;
+            if dialogic::rebuild_character(&base, &info, name)? != current {
+                return Err(refused(format!(
+                    "revision character structure differs outside display_name: {}",
+                    current_entry.path
+                )));
+            }
+        }
     }
-    let (characters, duplicate) = characters(&mut file, &index, &mut report.warnings);
+    let (characters, duplicate) = characters(&mut file, &index, &mut report.warnings, None)?;
     if duplicate || !report.warnings.is_empty() {
         return Err(refused("character authority cannot be authenticated; re-extract after resolving character diagnostics"));
     }
@@ -611,8 +714,6 @@ fn prepare_injection_from(
                 continue;
             }
         };
-        let timeline = dialogic::parse_timeline(&original, &characters)?;
-        let mut translations = HashMap::new();
         let current = if revision.is_some() {
             let current_entry = index.entries.iter().find(|e| e.path == member).unwrap();
             let bytes =
@@ -622,6 +723,42 @@ fn prepare_injection_from(
         } else {
             original.clone()
         };
+        if member.ends_with(".dch") {
+            let info = dialogic::parse_character(&original)?;
+            let current_info = dialogic::parse_character(&current)?;
+            let name = info
+                .display_name
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| refused(format!("no literal display_name in {member}")))?;
+            for (row, locator) in rows {
+                if locator.kind != "display_name" || locator.speaker.is_some() || row.source != name
+                {
+                    return Err(refused(format!(
+                        "source/speaker disagrees with display_name in {member}"
+                    )));
+                }
+                let Some(translation) = &row.translation else {
+                    continue;
+                };
+                if current_info.display_name.as_ref() == Some(translation) {
+                    continue;
+                }
+                match dialogic::rebuild_character(&original, &info, translation) {
+                    Ok(rebuilt) => {
+                        report.strings_written += 1;
+                        replacements.push((member.to_owned(), rebuilt.into_bytes()));
+                    }
+                    Err(e) => {
+                        report.skip("invalid-translation", 1);
+                        warn(&mut report.warnings, member, e);
+                    }
+                }
+            }
+            continue;
+        }
+        let timeline = dialogic::parse_timeline(&original, &characters)?;
+        let mut translations = HashMap::new();
         let current_timeline = dialogic::parse_timeline(&current, &characters)?;
         if revision.is_some() {
             if timeline.diagnostics != current_timeline.diagnostics

@@ -1,6 +1,6 @@
 use locust_formats::dialogic::{
-    parse_character, parse_timeline, rebuild, CharacterSet, SpanKind, MAX_INPUT_BYTES,
-    MAX_LINE_BYTES,
+    parse_character, parse_timeline, rebuild, rebuild_character, CharacterSet, SpanKind,
+    MAX_INPUT_BYTES, MAX_LINE_BYTES,
 };
 use std::collections::{BTreeMap, HashMap};
 
@@ -407,7 +407,7 @@ fn character_variant_dictionary_is_inert() {
     let info = parse_character(source).unwrap();
     assert_eq!(info.display_name.as_deref(), Some("Aster \"Star\"\n★"));
     assert_eq!(info.nicknames, ["Ash", "Star"]);
-    assert_eq!(info.diagnostics.len(), 1);
+    assert!(info.diagnostics.is_empty());
     let mut set = CharacterSet::default();
     set.insert_filename("res://cast/FileName.dch").unwrap();
     let timeline = parse_timeline("FileName: Yes\nAsh: No\n", &set).unwrap();
@@ -416,11 +416,80 @@ fn character_variant_dictionary_is_inert() {
 }
 
 #[test]
+fn character_display_names_skip_nonliteral_expressions_and_empty_values() {
+    for value in [
+        "123",
+        "null",
+        "tr(\"Hero\")",
+        "\"Hero\" + suffix",
+        "[\"Hero\"]",
+    ] {
+        let source = format!("{{\"display_name\": {value}, \"nicknames\": [\"Alias\"]}}");
+        let info = parse_character(&source).unwrap();
+        assert!(info.display_name.is_none(), "{source}");
+        assert_eq!(info.nicknames, ["Alias"]);
+    }
+    assert_eq!(
+        parse_character(r#"{"display_name":""}"#)
+            .unwrap()
+            .display_name
+            .as_deref(),
+        Some("")
+    );
+}
+
+#[test]
+fn character_display_name_rebuild_only_replaces_the_literal_and_checks_provenance_and_bounds() {
+    let source = "{\r\n\t\"display_name\" : \"The \\u0057anderer\", \"nicknames\": [\"Alias\"],\r\n\t\"opaque\": Color(1, 0, 0, 1), \"custom\": {\"display_name\":\"Keep\"}\r\n}\r\n";
+    let info = parse_character(source).unwrap();
+    assert_eq!(
+        rebuild_character(source, &info, "The Wanderer").unwrap(),
+        source
+    );
+    let translation = "Viajero \"Azul\"\\\n\t★\u{0000}";
+    let output = rebuild_character(source, &info, translation).unwrap();
+    assert_eq!(
+        output,
+        source.replacen(
+            "\"The \\u0057anderer\"",
+            &serde_json::to_string(translation).unwrap(),
+            1
+        )
+    );
+    assert_eq!(
+        parse_character(&output).unwrap().display_name.as_deref(),
+        Some(translation)
+    );
+    assert_eq!(parse_character(&output).unwrap().nicknames, ["Alias"]);
+    assert!(rebuild_character(&source.replace("Alias", "Other"), &info, "Name").is_err());
+    let mut forged = info.clone();
+    forged.display_name = Some("forged".into());
+    assert!(rebuild_character(source, &forged, "Name").is_err());
+    for invalid in [
+        "".to_owned(),
+        "  ".to_owned(),
+        "a".repeat(MAX_LINE_BYTES),
+        "a".repeat(MAX_INPUT_BYTES + 1),
+    ] {
+        assert!(rebuild_character(source, &info, &invalid).is_err());
+    }
+    for unsupported in [
+        r#"{}"#,
+        r#"{"display_name":""}"#,
+        r#"{"display_name":tr("Hero")}"#,
+        r#"{"display_name":"Hero" + suffix}"#,
+    ] {
+        assert!(
+            rebuild_character(unsupported, &parse_character(unsupported).unwrap(), "Name").is_err()
+        );
+    }
+}
+
+#[test]
 fn malformed_character_fields_and_nesting_are_refused() {
     for text in [
         "[]",
         "{} trailing",
-        "{\"display_name\": 123}",
         "{\"nicknames\": [1]}",
         "{\"display_name\":\"a\",\"display_name\":\"b\"}",
         "{\"x\": Color(1,2]}",

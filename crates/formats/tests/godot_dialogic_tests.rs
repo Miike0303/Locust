@@ -155,7 +155,9 @@ fn godot_dialogic_4_4_detection_and_extraction() {
     let extraction = plugin.extract_with_diagnostics(&path).unwrap();
     assert!(extraction.complete);
     assert!(extraction.warnings.is_empty());
-    assert_eq!(extraction.entries.len(), 3);
+    // The fixture character hero.dch adds its display_name row.
+    assert_eq!(extraction.entries.len(), 4);
+    assert!(extraction.entries.iter().any(|row| row.source == "Hero"));
     assert_eq!(extraction.entries[0].source, "Hello [b]{player}[/b]!");
     assert_eq!(
         godot_pck::read_index(&mut Cursor::new(bytes))
@@ -173,7 +175,8 @@ fn godot_dialogic_rows_are_literal_versioned_and_complete() {
     let extraction = GodotDialogicPlugin.extract_with_diagnostics(&path).unwrap();
     assert!(extraction.complete, "{:?}", extraction.warnings);
     assert!(extraction.warnings.is_empty());
-    assert_eq!(extraction.entries.len(), 3);
+    assert_eq!(extraction.entries.len(), 4);
+    assert!(extraction.entries.iter().any(|row| row.source == "Hero"));
     let row = &extraction.entries[0];
     assert_eq!(row.source, "Hello [b]{player}[/b]!");
     assert!(!row.source.contains(['\u{e000}', '\u{e001}']));
@@ -206,7 +209,9 @@ fn godot_dialogic_incomplete_authentication_codec_and_character_authority() {
     std::fs::write(&path, bytes).unwrap();
     let result = GodotDialogicPlugin.extract_with_diagnostics(&path).unwrap();
     assert!(!result.complete);
-    assert_eq!(result.entries.len(), 1);
+    // The corrupted timeline is skipped; the authenticated character name remains.
+    assert_eq!(result.entries.len(), 2);
+    assert!(result.entries.iter().any(|row| row.source == "Hero"));
     assert!(result
         .warnings
         .iter()

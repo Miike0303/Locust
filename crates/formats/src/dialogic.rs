@@ -69,7 +69,8 @@
 //!   extracts just those two top-level fields. Unknown values (including calls,
 //!   NodePath, Color and nested containers) are balanced and skipped opaquely.
 //!   Known strings accept JSON string escapes; other escapes explicitly fail.
-//!   Character names are metadata only, NOT translatable spans in this unit.
+//!   Only a nonempty literal `display_name` is translatable; nicknames remain
+//!   metadata. Rebuild replaces that quoted value and preserves all other bytes.
 //!
 //! # Deliberate codec policy (not additional engine guarantees)
 //!
@@ -256,8 +257,9 @@ pub struct Timeline {
 pub struct CharacterInfo {
     pub display_name: Option<String>,
     pub nicknames: Vec<String>,
-    /// Explicitly records that character names are metadata only in GD-3.
     pub diagnostics: Vec<Unsupported>,
+    display_name_range: Option<Range<usize>>,
+    original: String,
 }
 
 struct Line {
@@ -1010,6 +1012,7 @@ pub fn parse_character(text: &str) -> Result<CharacterInfo> {
     let mut scanner = Scanner { text, at: 0 };
     scanner.take(b'{')?;
     let mut display_name = None;
+    let mut display_name_range = None;
     let mut nicknames = Vec::new();
     let mut seen = HashSet::new();
     loop {
@@ -1024,7 +1027,25 @@ pub fn parse_character(text: &str) -> Result<CharacterInfo> {
             return Err(invalid("duplicate character identity field"));
         }
         match key.as_str() {
-            "display_name" => display_name = Some(scanner.string()?),
+            "display_name" => {
+                scanner.whitespace();
+                let start = scanner.at;
+                scanner.skip_value()?;
+                let range = trimmed_range(text, start..scanner.at);
+                // A quoted prefix followed by an operator/call is an opaque
+                // expression, not a literal. Never evaluate Variant values.
+                if text[range.clone()].starts_with('"') {
+                    let mut literal = Scanner { text, at: start };
+                    let quoted = literal.string_end()?;
+                    if quoted == range {
+                        display_name = Some(
+                            serde_json::from_str(&text[quoted.clone()])
+                                .map_err(|_| invalid("unsupported character string escape"))?,
+                        );
+                        display_name_range = Some(quoted);
+                    }
+                }
+            }
             "nicknames" => {
                 scanner.take(b'[')?;
                 scanner.whitespace();
@@ -1055,9 +1076,52 @@ pub fn parse_character(text: &str) -> Result<CharacterInfo> {
     Ok(CharacterInfo {
         display_name,
         nicknames,
-        diagnostics: vec![diagnostic(
-            0,
-            "character names are metadata only (not emitted as spans)",
-        )],
+        diagnostics: Vec::new(),
+        display_name_range,
+        original: text.to_owned(),
     })
+}
+
+/// Replace only the top-level literal display_name using JSON string escaping.
+/// Original provenance, physical-line limits and output bounds are rechecked.
+pub fn rebuild_character(
+    original: &str,
+    character: &CharacterInfo,
+    translation: &str,
+) -> Result<String> {
+    if character.original != original || &parse_character(original)? != character {
+        return Err(invalid("character does not match original bytes/metadata"));
+    }
+    let range = character
+        .display_name_range
+        .clone()
+        .ok_or_else(|| invalid("character has no literal display_name"))?;
+    if character
+        .display_name
+        .as_ref()
+        .is_none_or(|name| name.trim().is_empty())
+        || translation.trim().is_empty()
+        || translation.len() > MAX_INPUT_BYTES
+    {
+        return Err(invalid("empty or oversized character display_name"));
+    }
+    if character.display_name.as_deref() == Some(translation) {
+        return Ok(original.to_owned());
+    }
+    let encoded = serde_json::to_string(translation).map_err(std::io::Error::other)?;
+    let size = original.len() - range.len() + encoded.len();
+    if size > MAX_INPUT_BYTES {
+        return Err(invalid("rebuilt character exceeds 4 MiB"));
+    }
+    let mut output = String::with_capacity(size);
+    output.push_str(&original[..range.start]);
+    output.push_str(&encoded);
+    output.push_str(&original[range.end..]);
+    let reparsed = parse_character(&output)?;
+    if reparsed.display_name.as_deref() != Some(translation)
+        || reparsed.nicknames != character.nicknames
+    {
+        return Err(invalid("translation changes character structure"));
+    }
+    Ok(output)
 }

@@ -77,11 +77,31 @@ struct Fixture {
 
 impl Fixture {
     fn for_engine(minor: u32) -> Self {
+        Self::from_original(pristine_for_engine(minor))
+    }
+
+    fn named_for_engine(minor: u32) -> Self {
+        let mut items = members(&pristine_for_engine(minor));
+        items[1] = (
+            "res://characters/hero.dch".into(),
+            NAMED_HERO.as_bytes().to_vec(),
+        );
+        items.push((
+            "res://characters/elder.dch".into(),
+            br#"{"display_name":"The Wanderer","nicknames":["Old one"]}"#.to_vec(),
+        ));
+        let refs = items
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_slice()))
+            .collect::<Vec<_>>();
+        Self::from_original(pack_for_engine(&refs, minor))
+    }
+
+    fn from_original(original: Vec<u8>) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("shared");
         fs::create_dir(&root).unwrap();
         let game = root.join("game.pck");
-        let original = pristine_for_engine(minor);
         fs::write(&game, &original).unwrap();
         fs::write(root.join("sibling.exe"), b"foreign executable").unwrap();
         fs::write(root.join("sibling.pck"), b"foreign pack").unwrap();
@@ -174,6 +194,214 @@ impl Fixture {
             b"foreign executable"
         );
         assert_eq!(fs::read(root.join("sibling.pck")).unwrap(), b"foreign pack");
+    }
+}
+
+const NAMED_HERO: &str = "{\r\n\t\"display_name\" : \"The Wanderer\", \"nicknames\": [\"Wanderer\", \"Alias\"],\r\n\t\"color\": Color(1, 0.5, 0, 1), \"custom\": {\"display_name\": \"Opaque\", \"calls\": [Dangerous(\"a,b}\"), NodePath(\".\")]}\r\n}\r\n";
+
+#[test]
+fn character_display_name_rows_are_literal_path_stable_and_keep_existing_timeline_ids() {
+    for minor in [0, 5] {
+        let baseline = Fixture::for_engine(minor);
+        let f = Fixture::named_for_engine(minor);
+        assert_eq!(f.rows.len(), 5);
+        assert_eq!(
+            f.rows[..3].iter().map(|r| &r.id).collect::<Vec<_>>(),
+            baseline.rows.iter().map(|r| &r.id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            f.rows[0].id,
+            "godot-dialogic:v1:[\"game.pck\",\"res://main.dtl\",0,\"text\",0,\"greet\"]"
+        );
+        for row in &f.rows[3..] {
+            assert_eq!(row.source, "The Wanderer");
+            assert_eq!(row.tags, ["actor_name", "speaker"]);
+            let locator = &row.metadata["godot_dialogic"];
+            assert_eq!(locator["kind"], "display_name");
+            assert_eq!(
+                row.id,
+                format!(
+                    "godot-dialogic:v1:{}",
+                    serde_json::json!(["game.pck", locator["member"], 0, "display_name", 0, null])
+                )
+            );
+        }
+        assert_ne!(f.rows[3].id, f.rows[4].id);
+        assert_eq!(
+            f.rows[3].file_path,
+            Path::new("game.pck/characters/hero.dch")
+        );
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let game = temp.path().join("game.pck");
+    fs::write(
+        &game,
+        pack_for_engine(
+            &[
+                ("res://main.dtl", b"Narration\n"),
+                ("res://literal.dch", br#"{"display_name":"The Wanderer"}"#),
+                ("res://empty.dch", br#"{"display_name":""}"#),
+                ("res://blank.dch", br#"{"display_name":"  "}"#),
+                ("res://number.dch", br#"{"display_name":123}"#),
+                ("res://call.dch", br#"{"display_name":tr("Hero")}"#),
+                (
+                    "res://expression.dch",
+                    br#"{"display_name":"Hero" + suffix}"#,
+                ),
+                (
+                    "res://nested.dch",
+                    br#"{"custom":{"display_name":"Nested"}}"#,
+                ),
+            ],
+            0,
+        ),
+    )
+    .unwrap();
+    let rows = GodotDialogicPlugin.extract(&game).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1].source, "The Wanderer");
+}
+
+#[test]
+fn character_display_name_direct_roundtrip_second_revision_and_partial_timeline_revision() {
+    for minor in [0, 5] {
+        let mut f = Fixture::named_for_engine(minor);
+        assert_eq!(f.rows.len(), 5);
+        let ids = f.rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+        let original_members = members(&f.original).into_iter().collect::<HashMap<_, _>>();
+        for name in [
+            "El viajero \"Azul\"\\N\n★",
+            "Otro viajero más largo",
+            "The Wanderer",
+        ] {
+            f.translate(&[None, None, None, Some(name), None]);
+            let report = f.direct().unwrap();
+            assert_eq!(report.strings_written, 1, "{report:?}");
+            let output = members(&fs::read(&f.game).unwrap())
+                .into_iter()
+                .collect::<HashMap<_, _>>();
+            let encoded = serde_json::to_string(name).unwrap();
+            assert_eq!(
+                output["res://characters/hero.dch"],
+                NAMED_HERO
+                    .replacen("\"The Wanderer\"", &encoded, 1)
+                    .as_bytes()
+            );
+            for (member, bytes) in &original_members {
+                if member != "res://characters/hero.dch" {
+                    assert_eq!(&output[member], bytes, "{member}");
+                }
+            }
+            let extracted = GodotDialogicPlugin
+                .extract_with_diagnostics(&f.game)
+                .unwrap();
+            assert!(extracted.complete, "{:?}", extracted.warnings);
+            assert_eq!(
+                extracted
+                    .entries
+                    .iter()
+                    .map(|r| r.id.clone())
+                    .collect::<Vec<_>>(),
+                ids
+            );
+            assert_eq!(extracted.entries[3].source, name);
+            assert_eq!(
+                extracted.entries[0].metadata["godot_dialogic"]["speaker"],
+                "hero"
+            );
+            let before = fs::read(&f.game).unwrap();
+            assert_eq!(f.direct().unwrap().strings_written, 0);
+            assert_eq!(fs::read(&f.game).unwrap(), before);
+        }
+        f.translate(&[None, None, None, Some("Viajero"), None]);
+        f.direct().unwrap();
+        f.translate(&[Some("Hola [b]{player}[/b]!"), None, None, None, None]);
+        assert_eq!(f.direct().unwrap().strings_written, 1);
+        let extracted = GodotDialogicPlugin
+            .extract_with_diagnostics(&f.game)
+            .unwrap();
+        assert!(extracted.complete);
+        assert_eq!(extracted.entries[0].source, "Hola [b]{player}[/b]!");
+        assert_eq!(extracted.entries[3].source, "Viajero");
+        f.siblings_unchanged(f.game.parent().unwrap());
+    }
+}
+
+#[test]
+fn character_display_name_revision_refuses_other_character_bytes_and_structure() {
+    for minor in [0, 5] {
+        for change in [
+            "nickname",
+            "opaque",
+            "whitespace",
+            "missing-name",
+            "empty-name",
+            "expression",
+            "duplicate-name",
+            "nested-name",
+            "add-field",
+            "untouched-character",
+            "order",
+            "member-set",
+            "stale-row",
+        ] {
+            let mut f = Fixture::named_for_engine(minor);
+            assert_eq!(f.rows.len(), 5);
+            f.translate(&[None, None, None, Some("Viajero"), None]);
+            f.direct().unwrap();
+            let provenance = f.recording().pristine_backup.unwrap();
+            let mut items = members(&fs::read(&f.game).unwrap());
+            let text = String::from_utf8(items[1].1.clone()).unwrap();
+            items[1].1 = match change {
+                "nickname" => text.replace("Alias", "Changed"),
+                "opaque" => text.replace("Opaque", "Changed"),
+                "whitespace" => text.replace(" : ", ": "),
+                "missing-name" => text.replace("\"display_name\" : \"Viajero\", ", ""),
+                "empty-name" => text.replace("\"Viajero\"", "\"\""),
+                "expression" => text.replace("\"Viajero\"", "tr(\"Viajero\")"),
+                "duplicate-name" => {
+                    text.replace("\"Viajero\"", "\"Viajero\", \"display_name\": \"Other\"")
+                }
+                "nested-name" => text.replace(
+                    "\"display_name\" : \"Viajero\"",
+                    "\"nested\" : {\"display_name\":\"Viajero\"}",
+                ),
+                "add-field" => text.replace("\"color\":", "\"extra\": 1, \"color\":"),
+                _ => text,
+            }
+            .into_bytes();
+            match change {
+                "untouched-character" => {
+                    items[4].1 =
+                        br#"{"display_name":"The Wanderer","nicknames":["Different"]}"#.to_vec()
+                }
+                "order" => items.swap(0, 1),
+                "member-set" => items.push(("res://added.dch".into(), b"{}".to_vec())),
+                "stale-row" => {
+                    f.rows[3].metadata.get_mut("godot_dialogic").unwrap()["original_md5"] =
+                        serde_json::json!("00000000000000000000000000000000")
+                }
+                _ => {}
+            }
+            let refs = items
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_slice()))
+                .collect::<Vec<_>>();
+            fs::write(&f.game, pack_for_engine(&refs, minor)).unwrap();
+            f.record_with(Some(&provenance), &[f.game.clone()]);
+            // Also validate all character resources when only a timeline is selected.
+            let values = if change == "stale-row" {
+                [None, None, None, Some("Segundo"), None]
+            } else {
+                [Some("Hola [b]{player}[/b]!"), None, None, None, None]
+            };
+            f.translate(&values);
+            let before = fs::read(&f.game).unwrap();
+            let recording = f.recording();
+            assert!(f.direct().is_err(), "{change}");
+            assert_eq!(fs::read(&f.game).unwrap(), before, "{change}");
+            assert_eq!(f.recording(), recording, "{change}");
+        }
     }
 }
 

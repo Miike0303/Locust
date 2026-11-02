@@ -890,7 +890,9 @@ async fn independent_v2_4_4_and_v3_fixtures_plugin_replace_direct_revisions_and_
         assert!(extraction.complete);
         assert!(extraction.warnings.is_empty());
         let mut rows = extraction.entries;
-        assert_eq!(rows.len(), 3);
+        // hero.dch contributes its display_name row after the timeline rows.
+        assert_eq!(rows.len(), 4);
+        assert!(rows.iter().any(|row| row.source == "Hero"));
         assert_eq!(rows[0].source, "Hello [b]{player}[/b]!");
         assert_eq!(
             rows[0].metadata["godot_dialogic"]["member"],
