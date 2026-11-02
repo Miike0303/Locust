@@ -57,10 +57,12 @@ impl GlobalMemoryDb {
     pub fn memory_candidates(
         &self,
         lang_pair: &str,
-        source_len: usize,
+        source: &str,
+        threshold: f64,
         max_rows: usize,
     ) -> Result<Vec<MemoryEntry>> {
-        self.db.memory_candidates(lang_pair, source_len, max_rows)
+        self.db
+            .memory_candidates(lang_pair, source, threshold, max_rows)
     }
 
     pub fn list_memory(
@@ -91,6 +93,20 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn global_memory_candidates_fuzzy_window_includes_longer_match() {
+        let global = GlobalMemoryDb::open_in_memory().unwrap();
+        global
+            .save_memory("longer", "Hello world again", "Hola de nuevo", "en-es")
+            .await
+            .unwrap();
+        let rows = global
+            .memory_candidates("en-es", "Hello world", 0.6, 3000)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source_hash, "longer");
+    }
+
+    #[tokio::test]
     async fn global_memory_candidates_use_the_same_filters_order_and_cap() {
         let global = GlobalMemoryDb::open_in_memory().unwrap();
         let items = (0..3001)
@@ -101,23 +117,33 @@ mod tests {
             .save_memory("hash1", &"界".repeat(10), "Popular", "en-es")
             .await
             .unwrap();
-        global
-            .save_memory("long", &"界".repeat(15), "Long", "en-es")
-            .await
-            .unwrap();
+        for _ in 0..3 {
+            global
+                .save_memory("long", &"界".repeat(18), "Long", "en-es")
+                .await
+                .unwrap();
+        }
         global
             .save_memory("other", &"界".repeat(10), "Other", "en-fr")
             .await
             .unwrap();
-        let rows = global.memory_candidates("en-es", 10, usize::MAX).unwrap();
+        let rows = global
+            .memory_candidates("en-es", &"界".repeat(10), 0.6, usize::MAX)
+            .unwrap();
         assert_eq!(rows.len(), 3000);
         assert_eq!(rows[0].source_hash, "hash1");
         assert!(rows
             .iter()
             .all(|row| row.lang_pair == "en-es" && row.source.chars().count() == 10));
-        assert!(global.memory_candidates("en-es", 10, 0).unwrap().is_empty());
+        assert!(global
+            .memory_candidates("en-es", &"界".repeat(10), 0.6, 0)
+            .unwrap()
+            .is_empty());
         assert_eq!(
-            global.memory_candidates("en-fr", 10, 1).unwrap()[0].source_hash,
+            global
+                .memory_candidates("en-fr", &"界".repeat(10), 0.6, 1)
+                .unwrap()[0]
+                .source_hash,
             "other"
         );
     }

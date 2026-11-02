@@ -97,10 +97,14 @@ async fn exact_hit_survives_fuzzy_cap(store: Store) {
         .save(&state, &entry.source, "Exact alternative", "en-es")
         .await;
     let candidates = match store {
-        Store::Project => state.db.memory_candidates("en-es", 16, usize::MAX),
-        Store::Global => state
-            .global_memory
-            .memory_candidates("en-es", 16, usize::MAX),
+        Store::Project => state
+            .db
+            .memory_candidates("en-es", &entry.source, 0.6, usize::MAX),
+        Store::Global => {
+            state
+                .global_memory
+                .memory_candidates("en-es", &entry.source, 0.6, usize::MAX)
+        }
     }
     .unwrap();
     assert_eq!(candidates.len(), 3000);
@@ -169,7 +173,10 @@ async fn exact_lookup_preserves_the_existing_deduplication_tie_winner() {
         .save(&state, "Hello", "Alternative", "en-es")
         .await;
     // Both project candidates score 1 with equal uses; the newer one wins.
-    let candidates = state.db.memory_candidates("en-es", 5, 3000).unwrap();
+    let candidates = state
+        .db
+        .memory_candidates("en-es", "Hello", 0.6, 3000)
+        .unwrap();
     assert_eq!(candidates[0].source, "HELLO");
     let before = snapshot(&state);
     let (base, server) = start_test_server(state.clone()).await;

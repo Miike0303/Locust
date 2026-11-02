@@ -4,33 +4,72 @@ use chrono::Utc;
 use rusqlite::{params, OptionalExtension};
 
 use crate::error::Result;
+use crate::fuzzy::{candidate_length_bounds, MAX_CHARS};
 
 use super::{lock_connection, Database, MemoryEntry};
 #[cfg(test)]
 use super::{MEMORY_LOOKUP_QUERIES, MEMORY_TRANSACTIONS};
 
 impl Database {
-    /// Bounded, length-prefiltered candidates for fuzzy TM suggestions. SQLite
-    /// length(TEXT) and source_len both count Unicode characters, not bytes.
+    /// Bounded, threshold-derived candidates for fuzzy TM suggestions.
     pub fn memory_candidates(
         &self,
         lang_pair: &str,
-        source_len: usize,
+        source: &str,
+        threshold: f64,
         max_rows: usize,
     ) -> Result<Vec<MemoryEntry>> {
-        let radius = source_len.saturating_mul(2).div_ceil(5).max(3);
-        let lower = source_len.saturating_sub(radius).min(i64::MAX as usize) as i64;
-        let upper = source_len.saturating_add(radius).min(i64::MAX as usize) as i64;
+        let Some((lower, upper)) = candidate_length_bounds(source, threshold) else {
+            return Ok(Vec::new());
+        };
+        if max_rows == 0 {
+            return Ok(Vec::new());
+        }
         let conn = lock_connection(&self.conn);
+        // Keep the raw length window for all scripts unless normalization can
+        // change the length: Unicode whitespace, edge/repeated spaces, or U+0130
+        // lowercase expansion. Also admit capped input and NUL, where SQLite's
+        // length(TEXT) stops early. Exhaustive Unicode tests guard these lists.
         let mut stmt = conn.prepare(
             "SELECT source_hash, lang_pair, source, translation, uses, last_used
              FROM translation_memory
-             WHERE lang_pair = ?1 AND length(source) BETWEEN ?2 AND ?3
-             ORDER BY uses DESC, last_used DESC LIMIT ?4",
+             WHERE lang_pair = ?1 AND (
+                 length(source) BETWEEN ?2 AND ?3
+                 OR length(source) > ?4
+                 OR instr(source, char(0x0009)) > 0
+                 OR instr(source, char(0x000A)) > 0
+                 OR instr(source, char(0x000B)) > 0
+                 OR instr(source, char(0x000C)) > 0
+                 OR instr(source, char(0x000D)) > 0
+                 OR instr(source, char(0x0085)) > 0
+                 OR instr(source, char(0x00A0)) > 0
+                 OR instr(source, char(0x1680)) > 0
+                 OR instr(source, char(0x2000)) > 0
+                 OR instr(source, char(0x2001)) > 0
+                 OR instr(source, char(0x2002)) > 0
+                 OR instr(source, char(0x2003)) > 0
+                 OR instr(source, char(0x2004)) > 0
+                 OR instr(source, char(0x2005)) > 0
+                 OR instr(source, char(0x2006)) > 0
+                 OR instr(source, char(0x2007)) > 0
+                 OR instr(source, char(0x2008)) > 0
+                 OR instr(source, char(0x2009)) > 0
+                 OR instr(source, char(0x200A)) > 0
+                 OR instr(source, char(0x2028)) > 0
+                 OR instr(source, char(0x2029)) > 0
+                 OR instr(source, char(0x202F)) > 0
+                 OR instr(source, char(0x205F)) > 0
+                 OR instr(source, char(0x3000)) > 0
+                 OR instr(source, char(0x0130)) > 0
+                 OR source != trim(source)
+                 OR instr(source, '  ') > 0
+                 OR instr(source, char(0)) > 0
+             )
+             ORDER BY uses DESC, last_used DESC LIMIT ?5",
         )?;
         let rows = stmt
             .query_map(
-                params![lang_pair, lower, upper, max_rows.min(3000)],
+                params![lang_pair, lower, upper, MAX_CHARS, max_rows.min(3000)],
                 |row| {
                     Ok(MemoryEntry {
                         source_hash: row.get(0)?,
@@ -292,6 +331,179 @@ mod tests {
     use super::*;
     use chrono::DateTime;
 
+    #[tokio::test]
+    async fn memory_candidates_fuzzy_window_includes_longer_match() {
+        let db = Database::open_in_memory().unwrap();
+        db.save_memory("longer", "Hello world again", "Hola de nuevo", "en-es")
+            .await
+            .unwrap();
+        // At t = 0.6, length 11 permits candidates up to 11 / t, not 11 * 1.4.
+        // The distance is 6, so this 17-character source scores 1 - 6/17 >= t.
+        assert!(
+            crate::fuzzy::similarity_at_threshold("Hello world", "Hello world again", 0.6)
+                .is_some()
+        );
+        let rows = db
+            .memory_candidates("en-es", "Hello world", 0.6, 3000)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source_hash, "longer");
+    }
+
+    #[tokio::test]
+    async fn memory_candidates_cjk_length_window_excludes_popular_far_rows() {
+        let db = Database::open_in_memory().unwrap();
+        let query = "界".repeat(10);
+        let near = "界".repeat(15);
+        let far = "界".repeat(40);
+        assert!(crate::fuzzy::similarity_at_threshold(&query, &near, 0.6).is_some());
+        assert!(crate::fuzzy::similarity_at_threshold(&query, &far, 0.6).is_none());
+        let mut items = (0..3000)
+            .map(|i| (format!("far{i}"), far.clone(), "Far".into()))
+            .collect::<Vec<_>>();
+        items.push(("near".into(), near, "Near".into()));
+        db.save_memory_batch(&items, "ja-en").await.unwrap();
+        lock_connection(&db.conn)
+            .execute(
+                "UPDATE translation_memory SET uses = 99 WHERE source_hash != 'near'",
+                [],
+            )
+            .unwrap();
+        let candidates = db.memory_candidates("ja-en", &query, 0.6, 3000).unwrap();
+        assert!(
+            candidates.iter().all(|row| row.source_hash == "near"),
+            "far-length, high-uses CJK rows must stay outside the length window"
+        );
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].source_hash, "near");
+    }
+
+    #[test]
+    fn memory_candidates_length_window_applies_to_all_scripts() {
+        let db = Database::open_in_memory().unwrap();
+        {
+            let conn = lock_connection(&db.conn);
+            for (i, ch) in ['a', '界', 'é', 'Ж', '🦀', '\u{200B}'].iter().enumerate() {
+                for (kind, len, uses) in [("near", 10, 1), ("far", 40, 99), ("tiny", 4, 99)] {
+                    conn.execute(
+                        "INSERT INTO translation_memory VALUES (?1, 'ja-en', ?2, 'translation', ?3, '2026-01-01')",
+                        params![format!("{kind}{i}"), ch.to_string().repeat(len), uses],
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        let candidates = db
+            .memory_candidates("ja-en", &"界".repeat(10), 0.6, 3000)
+            .unwrap();
+        assert_eq!(candidates.len(), 6);
+        assert!(candidates
+            .iter()
+            .all(|row| row.source_hash.starts_with("near")));
+    }
+
+    #[tokio::test]
+    async fn memory_candidates_keep_all_normalized_length_matches() {
+        let db = Database::open_in_memory().unwrap();
+        let mut sources = [
+            "",
+            "a",
+            "aa",
+            "aaaaaa",
+            "a a",
+            " a",
+            "a ",
+            "a  a",
+            "a\ta",
+            "a\na",
+            "\u{2003}a",
+            "a\u{2003}a",
+            "İ",
+            "İİİ",
+            "i\u{307}",
+            "i\u{307}i\u{307}i\u{307}",
+            "世界",
+            "界界界界",
+            "界界界界界界",
+            "ÉÉÉÉ",
+            "éééé",
+            "ДОМ",
+            "дом",
+            "a\0aaaaaa",
+            "\0aaaaaa",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        // Exercise every SQL whitespace exception outside its raw length bounds,
+        // including whitespace-only, edge, and repeated interior separators.
+        for whitespace in (0..=0x10FFFF)
+            .filter_map(char::from_u32)
+            .filter(|c| c.is_whitespace())
+        {
+            let padding = whitespace.to_string().repeat(8);
+            sources.extend([
+                padding.clone(),
+                format!("{padding}a{padding}"),
+                format!("a{padding}a"),
+            ]);
+        }
+        let capped = "a".repeat(MAX_CHARS);
+        sources.extend([capped.clone(), format!("{capped}ignored suffix")]);
+        let items = sources
+            .iter()
+            .enumerate()
+            .map(|(i, source)| (i.to_string(), source.clone(), "Translation".into()))
+            .collect::<Vec<_>>();
+        db.save_memory_batch(&items, "en-es").await.unwrap();
+        for source in &sources {
+            for threshold in [0.0, f64::from_bits(1), 0.6, 0.8, 1.0] {
+                let candidates = db
+                    .memory_candidates("en-es", source, threshold, 3000)
+                    .unwrap();
+                for (i, candidate) in sources.iter().enumerate() {
+                    if crate::fuzzy::similarity_at_threshold(source, candidate, threshold).is_some()
+                    {
+                        assert!(
+                            candidates
+                                .iter()
+                                .any(|row| row.source_hash == i.to_string()),
+                            "excluded {candidate:?} for {source:?} at {threshold}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_candidates_respect_thresholds_and_degenerate_values() {
+        let db = Database::open_in_memory().unwrap();
+        let items = [0, 5, 6, 8, 10, 13, 16, 17, 18]
+            .map(|len| (len.to_string(), "a".repeat(len), "Translation".into()));
+        db.save_memory_batch(&items, "en-es").await.unwrap();
+        for (threshold, expected) in [
+            (0.0, vec![0, 5, 6, 8, 10, 13, 16, 17, 18]),
+            (f64::MIN_POSITIVE, vec![0, 5, 6, 8, 10, 13, 16, 17, 18]),
+            (0.6, vec![6, 8, 10, 13, 16, 17]),
+            (0.8, vec![8, 10, 13]),
+            (1.0, vec![10]),
+            (-0.1, vec![]),
+            (1.1, vec![]),
+            (f64::NAN, vec![]),
+            (f64::NEG_INFINITY, vec![]),
+            (f64::INFINITY, vec![]),
+        ] {
+            let mut lengths = db
+                .memory_candidates("en-es", "aaaaaaaaaa", threshold, usize::MAX)
+                .unwrap()
+                .iter()
+                .map(|row| row.source.len())
+                .collect::<Vec<_>>();
+            lengths.sort_unstable();
+            assert_eq!(lengths, expected, "threshold {threshold}");
+        }
+    }
+
     #[test]
     fn memory_candidates_filter_character_lengths_languages_and_order() {
         let db = Database::open_in_memory().unwrap();
@@ -302,7 +514,8 @@ mod tests {
                 ("upper", "é".repeat(14), "en-es", 2, "2026-02-01"),
                 ("popular", "a".repeat(10), "en-es", 3, "2025-01-01"),
                 ("short", "a".repeat(5), "en-es", 99, "2026-01-01"),
-                ("long", "a".repeat(15), "en-es", 99, "2026-01-01"),
+                ("long", "界".repeat(15), "en-es", 99, "2026-01-01"),
+                ("too_long", "界".repeat(18), "en-es", 99, "2026-01-01"),
                 ("other", "a".repeat(10), "en-fr", 99, "2026-01-01"),
                 ("empty", String::new(), "en-es", 1, "2026-01-01"),
                 ("tiny", "界".repeat(4), "en-es", 1, "2026-01-01"),
@@ -315,19 +528,19 @@ mod tests {
             }
         }
         let hashes = |len, limit| {
-            db.memory_candidates("en-es", len, limit)
+            db.memory_candidates("en-es", &"a".repeat(len), 0.6, limit)
                 .unwrap()
                 .into_iter()
                 .map(|row| row.source_hash)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(hashes(10, 50), ["popular", "upper", "lower"]);
-        assert_eq!(hashes(10, 2), ["popular", "upper"]);
+        assert_eq!(hashes(10, 50), ["long", "popular", "upper", "lower"]);
+        assert_eq!(hashes(10, 2), ["long", "popular"]);
         assert!(hashes(10, 0).is_empty());
-        assert_eq!(hashes(1, 50), ["empty", "tiny"]);
+        assert_eq!(hashes(1, 50), ["empty"]);
         assert_eq!(hashes(0, 50), ["empty"]);
         assert!(db
-            .memory_candidates("' OR 1=1 --", 10, 50)
+            .memory_candidates("' OR 1=1 --", "aaaaaaaaaa", 0.6, 50)
             .unwrap()
             .is_empty());
     }
@@ -336,13 +549,21 @@ mod tests {
     async fn memory_candidates_cap_at_three_thousand() {
         let db = Database::open_in_memory().unwrap();
         let items = (0..3001)
-            .map(|i| (format!("hash{i}"), "Hello".into(), "Hola".into()))
+            .map(|i| (format!("hash{i}"), "Hello world".into(), "Hola".into()))
             .collect::<Vec<_>>();
         db.save_memory_batch(&items, "en-es").await.unwrap();
-        assert_eq!(
-            db.memory_candidates("en-es", 5, usize::MAX).unwrap().len(),
-            3000
-        );
+        // A newly eligible longer source competes for the same popularity cap.
+        for _ in 0..2 {
+            db.save_memory("longer", "Hello world again", "Longer", "en-es")
+                .await
+                .unwrap();
+        }
+        let candidates = db
+            .memory_candidates("en-es", "Hello world", 0.6, usize::MAX)
+            .unwrap();
+        assert_eq!(candidates.len(), 3000);
+        assert_eq!(candidates[0].source_hash, "longer");
+        assert_eq!(candidates[0].uses, 2);
     }
 
     #[test]

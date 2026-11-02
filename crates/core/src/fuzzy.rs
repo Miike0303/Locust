@@ -16,6 +16,23 @@ fn comparison_chars(s: &str) -> Vec<char> {
     normalize(&prefix).chars().take(MAX_CHARS).collect()
 }
 
+pub(crate) fn candidate_length_bounds(source: &str, threshold: f64) -> Option<(usize, usize)> {
+    if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+        return None;
+    }
+    if threshold == 0.0 {
+        return Some((0, MAX_CHARS));
+    }
+    let len = comparison_chars(source).len() as f64;
+    // d >= |a-b| and score = 1-d/max(a,b) require a*t <= b <= a/t.
+    // Round outward on comparison lengths. SQL must also admit raw strings
+    // whose lengths can change through normalization or the comparison cap.
+    Some((
+        (len * threshold).floor() as usize,
+        ((len / threshold).ceil() as usize).min(MAX_CHARS),
+    ))
+}
+
 /// 1 - Levenshtein distance / longest length, after normalization. Two empty
 /// strings score 1. Inputs are limited to their first 2000 Unicode characters.
 pub fn similarity(a: &str, b: &str) -> f64 {
@@ -72,6 +89,66 @@ pub fn similarity_at_threshold(a: &str, b: &str, threshold: f64) -> Option<f64> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fuzzy_sql_whitespace_exceptions_match_all_unicode_scalars() {
+        let whitespace = (0..=0x10FFFF)
+            .filter_map(char::from_u32)
+            .filter(|c| c.is_whitespace())
+            .collect::<Vec<_>>();
+        // Database::memory_candidates explicitly tests these except U+0020,
+        // which only changes length at an edge or next to another space.
+        assert_eq!(
+            whitespace,
+            [
+                '\u{0009}', '\u{000A}', '\u{000B}', '\u{000C}', '\u{000D}', '\u{0020}', '\u{0085}',
+                '\u{00A0}', '\u{1680}', '\u{2000}', '\u{2001}', '\u{2002}', '\u{2003}', '\u{2004}',
+                '\u{2005}', '\u{2006}', '\u{2007}', '\u{2008}', '\u{2009}', '\u{200A}', '\u{2028}',
+                '\u{2029}', '\u{202F}', '\u{205F}', '\u{3000}',
+            ],
+            "update the SQL whitespace exceptions when Rust's Unicode set changes"
+        );
+    }
+
+    #[test]
+    fn fuzzy_sql_lowercase_exceptions_match_all_unicode_scalars() {
+        let changes_length = (0..=0x10FFFF)
+            .filter_map(char::from_u32)
+            .filter(|c| c.to_lowercase().count() != 1)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            changes_length,
+            ['\u{0130}'],
+            "update the SQL lowercase exceptions when Rust's Unicode mappings change"
+        );
+    }
+
+    #[test]
+    fn fuzzy_candidate_bounds_use_comparison_lengths_and_round_outward() {
+        assert_eq!(candidate_length_bounds("Hello world", 0.6), Some((6, 19)));
+        assert_eq!(
+            candidate_length_bounds("  Hello\tworld  ", 0.6),
+            Some((6, 19))
+        );
+        assert_eq!(candidate_length_bounds("İ", 1.0), Some((2, 2)));
+        assert_eq!(candidate_length_bounds(" \t\n", 1.0), Some((0, 0)));
+        assert_eq!(
+            candidate_length_bounds(&"a".repeat(MAX_CHARS + 100), 1.0),
+            Some((MAX_CHARS, MAX_CHARS))
+        );
+        assert_eq!(
+            candidate_length_bounds(&"İ".repeat(MAX_CHARS), 1.0),
+            Some((MAX_CHARS, MAX_CHARS))
+        );
+        assert_eq!(candidate_length_bounds("Hello", 0.0), Some((0, MAX_CHARS)));
+        assert_eq!(
+            candidate_length_bounds("Hello", f64::from_bits(1)),
+            Some((0, MAX_CHARS))
+        );
+        for threshold in [-1.0, 1.1, f64::NEG_INFINITY, f64::INFINITY, f64::NAN] {
+            assert_eq!(candidate_length_bounds("Hello", threshold), None);
+        }
+    }
 
     #[test]
     fn fuzzy_identical_and_empty() {

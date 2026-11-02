@@ -164,7 +164,6 @@ fn fuzzy_suggestions(
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let source_len = entry.source.chars().count();
     let source_hash = entry.source_hash();
     let mut unique: HashMap<(String, String), MemorySuggestion> = HashMap::new();
     // Exact hits bypass the fuzzy cap and still share exclusion and deduplication.
@@ -172,12 +171,12 @@ fn fuzzy_suggestions(
         (
             "project",
             project_db.lookup_memory_entry(&source_hash, lang_pair)?,
-            project_db.memory_candidates(lang_pair, source_len, 3000)?,
+            project_db.memory_candidates(lang_pair, &entry.source, threshold, 3000)?,
         ),
         (
             "global",
             global_db.lookup_memory_entry(&source_hash, lang_pair)?,
-            global_db.memory_candidates(lang_pair, source_len, 3000)?,
+            global_db.memory_candidates(lang_pair, &entry.source, threshold, 3000)?,
         ),
     ] {
         for candidate in candidates.into_iter().chain(exact) {
