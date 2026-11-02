@@ -41,16 +41,27 @@ pub(crate) async fn list_backups(
     .map(Json)
 }
 
+#[derive(Default, Deserialize)]
+pub(crate) struct BackupRestoreQuery {
+    #[serde(default)]
+    dry_run: bool,
+}
+
 pub(crate) async fn restore_backup(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
+    Query(params): Query<BackupRestoreQuery>,
 ) -> Result<Json<locust_core::backup::RestorePreview>, ApiError> {
     let exclusive = try_project_operation(&state).map_err(|e| err(StatusCode::CONFLICT, e))?;
     let manager = state.backup_manager.clone();
     // The blocking task owns exclusion even if its HTTP caller disconnects.
     let report = tokio::task::spawn_blocking(move || {
         let _exclusive = exclusive;
-        manager.restore_with_report(&id)
+        if params.dry_run {
+            manager.preview_restore(&id)
+        } else {
+            manager.restore_with_report(&id)
+        }
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
@@ -128,6 +139,181 @@ mod tests {
     use super::*;
     use crate::routes::test_support::*;
     use crate::*;
+
+    fn game_hashes(
+        root: &std::path::Path,
+    ) -> std::collections::BTreeMap<std::path::PathBuf, String> {
+        walkdir::WalkDir::new(root)
+            .into_iter()
+            .map(|entry| entry.unwrap())
+            .map(|entry| {
+                let hash = if entry.file_type().is_file() {
+                    locust_core::database::sha256_path(entry.path()).unwrap()
+                } else {
+                    String::from("directory")
+                };
+                (entry.path().strip_prefix(root).unwrap().to_owned(), hash)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn backup_restore_dry_run_returns_core_preview_without_game_or_history_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("renpy");
+        std::fs::create_dir_all(game.join("game")).unwrap();
+        std::fs::write(
+            game.join("game/scripts.rpa"),
+            include_bytes!("../../../cli/tests/fixtures/c127-scripts.rpa"),
+        )
+        .unwrap();
+        std::fs::write(game.join("changed.bin"), b"original").unwrap();
+        std::fs::write(game.join("missing.bin"), b"recreate").unwrap();
+        let mut state = create_test_state_with_db(&temp.path().join("project.db"));
+        Arc::get_mut(&mut state).unwrap().backup_manager = Arc::new(
+            locust_core::backup::BackupManager::new(temp.path().join("backups")),
+        );
+        let mut entries = state
+            .format_registry
+            .get("renpy")
+            .unwrap()
+            .extract(&game)
+            .unwrap();
+        entries[0].translation = Some("Translated archive dialogue.".into());
+        entries[0].status = locust_core::models::StringStatus::Translated;
+        state.db.save_entries(&entries).unwrap();
+        locust_core::extraction::inject_direct(
+            &state.format_registry,
+            &state.db,
+            &state.backup_manager,
+            &game,
+            "renpy",
+            &["en".into()],
+        )
+        .unwrap();
+        let backup = state.backup_manager.list_backups().unwrap().remove(0);
+        std::fs::write(game.join("changed.bin"), b"modified").unwrap();
+        std::fs::remove_file(game.join("missing.bin")).unwrap();
+        std::fs::write(game.join("save.dat"), b"user save").unwrap();
+        let before = game_hashes(&game);
+        let history_before =
+            serde_json::to_value(state.db.get_injection(Some("en")).unwrap()).unwrap();
+        let status_before =
+            serde_json::to_value(locust_core::injection_transaction::game_status(&game).unwrap())
+                .unwrap();
+        let expected = state.backup_manager.preview_restore(&backup.id).unwrap();
+        assert_eq!(
+            expected.replaced,
+            vec![std::path::PathBuf::from("changed.bin")]
+        );
+        assert_eq!(
+            expected.recreated,
+            vec![std::path::PathBuf::from("missing.bin")]
+        );
+        assert_eq!(
+            expected.identical,
+            vec![std::path::PathBuf::from("game/scripts.rpa")]
+        );
+        assert_eq!(
+            expected.removed,
+            vec![std::path::PathBuf::from("game/scripts/story.rpy")]
+        );
+        assert!(!expected.removed_directories.is_empty());
+        assert!(expected
+            .kept
+            .iter()
+            .any(|entry| entry.path == std::path::Path::new("save.dat")
+                && entry.reason.contains("no recorded")));
+        let (url, server) = start_test_server(state.clone()).await;
+        let response = client()
+            .post(format!(
+                "{url}/api/backups/{}/restore?dry_run=true",
+                backup.id
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let actual: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(actual, serde_json::to_value(expected).unwrap());
+        assert_eq!(
+            game_hashes(&game),
+            before,
+            "preview changed game bytes or paths (including the injection journal)"
+        );
+        assert_eq!(
+            serde_json::to_value(state.db.get_injection(Some("en")).unwrap()).unwrap(),
+            history_before
+        );
+        assert_eq!(
+            serde_json::to_value(locust_core::injection_transaction::game_status(&game).unwrap())
+                .unwrap(),
+            status_before
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn backup_restore_default_and_explicit_false_still_write() {
+        for suffix in ["", "?dry_run=false"] {
+            let temp = tempfile::tempdir().unwrap();
+            let game = temp.path().join("game");
+            std::fs::create_dir(&game).unwrap();
+            std::fs::write(game.join("story.txt"), b"original").unwrap();
+            let mut state = create_test_state();
+            Arc::get_mut(&mut state).unwrap().backup_manager = Arc::new(
+                locust_core::backup::BackupManager::new(temp.path().join("backups")),
+            );
+            let backup = state.backup_manager.create_backup(&game).unwrap();
+            std::fs::write(game.join("story.txt"), b"modified").unwrap();
+            let (url, server) = start_test_server(state).await;
+            let response = client()
+                .post(format!("{url}/api/backups/{}/restore{suffix}", backup.id))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let report: locust_core::backup::RestorePreview = response.json().await.unwrap();
+            assert_eq!(report.replaced, vec![std::path::PathBuf::from("story.txt")]);
+            assert_eq!(std::fs::read(game.join("story.txt")).unwrap(), b"original");
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn backup_restore_revalidates_after_advisory_preview() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        std::fs::create_dir(&game).unwrap();
+        std::fs::write(game.join("story.txt"), b"original").unwrap();
+        let mut state = create_test_state();
+        Arc::get_mut(&mut state).unwrap().backup_manager = Arc::new(
+            locust_core::backup::BackupManager::new(temp.path().join("backups")),
+        );
+        let backup = state.backup_manager.create_backup(&game).unwrap();
+        std::fs::write(game.join("story.txt"), b"modified").unwrap();
+        let (url, server) = start_test_server(state).await;
+        let endpoint = format!("{url}/api/backups/{}/restore", backup.id);
+        let preview = client()
+            .post(format!("{endpoint}?dry_run=true"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(preview.status(), StatusCode::OK);
+        // A new conflicting destination after the preview must still be refused.
+        std::fs::remove_file(game.join("story.txt")).unwrap();
+        std::fs::create_dir(game.join("story.txt")).unwrap();
+        let before = game_hashes(&game);
+        let response = client().post(endpoint).send().await.unwrap();
+        assert!(!response.status().is_success());
+        assert!(response
+            .text()
+            .await
+            .unwrap()
+            .contains("invalid restore destination"));
+        assert_eq!(game_hashes(&game), before);
+        server.abort();
+    }
 
     #[tokio::test]
     async fn backups_delete_unverified_requires_explicit_confirmation() {
@@ -508,5 +694,20 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "../backup_operation_tests.rs"]
-mod backup_operation_tests;
+mod backup_operation_tests {
+    // These shared tests exercise the legacy writing operation directly.
+    // Keep their two-argument helper while HTTP tests cover query extraction.
+    async fn restore_backup(
+        state: axum::extract::State<std::sync::Arc<crate::AppState>>,
+        id: axum::extract::Path<String>,
+    ) -> Result<axum::Json<locust_core::backup::RestorePreview>, crate::ApiError> {
+        super::restore_backup(
+            state,
+            id,
+            axum::extract::Query(super::BackupRestoreQuery::default()),
+        )
+        .await
+    }
+
+    include!("../backup_operation_tests.rs");
+}

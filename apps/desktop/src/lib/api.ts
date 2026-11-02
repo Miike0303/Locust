@@ -221,7 +221,7 @@ export interface BackupListing {
   unreadable: { id: string; error: string }[];
 }
 
-/** Serialized core RestorePreview returned after a completed restore. */
+/** Serialized core RestorePreview for an advisory preview or a completed restore. */
 export interface BackupRestoreReport {
   destination: string;
   replaced: string[];
@@ -1015,6 +1015,10 @@ export const getBackups = (): Promise<BackupEntry[]> =>
 /** Includes per-backup manifest diagnostics without changing the legacy array API. */
 export const getBackupsReport = (): Promise<BackupListing> =>
   IS_TAURI ? tauriInvoke("get_backups", { report: true }) : request("/backups?report=true");
+
+/** Read-only, locked preview through the same HTTP transport in both runtimes. */
+export const previewBackupRestore = (id: string): Promise<BackupRestoreReport> =>
+  request<BackupRestoreReport>(`/backups/${encodeURIComponent(id)}/restore?dry_run=true`, { method: "POST" });
 
 /** Both browser and desktop restore through the HTTP server. */
 export const restoreBackup = (id: string): Promise<BackupRestoreReport> =>
