@@ -65,6 +65,9 @@ pub(crate) struct PatchPathsRequest {
     confirm_legacy: bool,
     #[serde(default)]
     dry_run: bool,
+    #[cfg(test)]
+    #[serde(skip)]
+    apply_hooks: Option<PatchApplyTestHooks>,
 }
 
 /// Resolve local zip path or download `zip_url` into a TempDir (caller must keep it alive).
@@ -646,6 +649,34 @@ pub(crate) async fn patch_apply(
     ))
 }
 
+// Per-request gates keep blocking-worker interleavings deterministic without
+// changing core apply or sharing hooks between concurrently running tests.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PatchApplyTestPoint {
+    BeforeWrite(usize),
+    AfterWriteCheck(usize),
+    AfterApply,
+}
+
+#[cfg(test)]
+struct PatchApplyTestHooks {
+    point: PatchApplyTestPoint,
+    pause: Option<Box<dyn FnOnce() + Send>>,
+    finished: tokio::sync::oneshot::Sender<()>,
+}
+
+#[cfg(test)]
+impl PatchApplyTestHooks {
+    fn run(hooks: &mut Option<Self>, point: PatchApplyTestPoint) {
+        if let Some(hooks) = hooks.as_mut().filter(|hooks| hooks.point == point) {
+            if let Some(pause) = hooks.pause.take() {
+                pause();
+            }
+        }
+    }
+}
+
 async fn run_patch_apply_job(
     req: PatchPathsRequest,
     broadcast_tx: broadcast::Sender<serde_json::Value>,
@@ -687,27 +718,43 @@ async fn run_patch_apply_job(
         tokio::sync::mpsc::channel::<locust_core::patch::PatchProgress>(1);
     let apply_cancel = cancel.clone();
 
+    #[cfg(test)]
+    let mut hooks = req.apply_hooks;
     let apply_task = tokio::task::spawn_blocking(move || {
-        locust_core::patch::apply_cancellable(&game, &zip, opts, |p| {
+        let result = locust_core::patch::apply_cancellable(&game, &zip, opts, |p| {
+            #[cfg(test)]
+            PatchApplyTestHooks::run(&mut hooks, PatchApplyTestPoint::BeforeWrite(p.current));
+            #[cfg(test)]
+            let current = p.current;
             if apply_cancel.is_cancelled() || progress_tx.blocking_send(p).is_err() {
                 return Err(locust_core::error::LocustError::PatchInterrupted(
                     "cancelled".into(),
                 ));
             }
+            #[cfg(test)]
+            PatchApplyTestHooks::run(&mut hooks, PatchApplyTestPoint::AfterWriteCheck(current));
             Ok(())
-        })
+        });
+        #[cfg(test)]
+        {
+            PatchApplyTestHooks::run(&mut hooks, PatchApplyTestPoint::AfterApply);
+            if let Some(hooks) = hooks {
+                let _ = hooks.finished.send(());
+            }
+        }
+        result
     });
     tokio::pin!(apply_task);
     let mut progress_rx = Some(progress_rx);
 
-    let outcome = loop {
+    let result = loop {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                // Drop the receiver so the next blocking_send fails and apply unwinds.
+                // Unblock a pending send, then drain the non-abortable worker.
+                // It may already have passed its final cancellation checkpoint.
                 progress_rx.take();
-                let _ = apply_task.await;
-                break Err("cancelled".to_string());
+                break apply_task.await;
             }
             ev = async {
                 match progress_rx.as_mut() {
@@ -725,48 +772,33 @@ async fn run_patch_apply_job(
                             "phase": p.phase,
                         }));
                     }
-                    None => {
-                        break match apply_task.await {
-                            Ok(Ok(report)) => Ok(apply_report_json(report)),
-                            Ok(Err(e)) => Err(e.to_string()),
-                            Err(e) if e.is_cancelled() || cancel.is_cancelled() => {
-                                Err("cancelled".into())
-                            }
-                            Err(e) => Err(format!("apply task failed: {e}")),
-                        };
-                    }
+                    None => break apply_task.await,
                 }
             }
-            result = &mut apply_task => {
-                break match result {
-                    Ok(Ok(report)) => {
-                        if let Some(rx) = progress_rx.as_mut() {
-                            while let Ok(p) = rx.try_recv() {
-                                publish(serde_json::json!({
-                                    "type": "progress",
-                                    "current": p.current as u64,
-                                    "total": p.total as u64,
-                                    "path": p.path,
-                                    "phase": p.phase,
-                                }));
-                            }
-                        }
-                        Ok(apply_report_json(report))
-                    }
-                    Ok(Err(e)) => Err(e.to_string()),
-                    Err(e) if e.is_cancelled() || cancel.is_cancelled() => Err("cancelled".into()),
-                    Err(e) => Err(format!("apply task failed: {e}")),
-                };
-            }
+            result = &mut apply_task => break result,
         }
+    };
+    let outcome = match result {
+        Ok(Ok(report)) => {
+            if let Some(rx) = progress_rx.as_mut() {
+                while let Ok(p) = rx.try_recv() {
+                    publish(serde_json::json!({
+                        "type": "progress",
+                        "current": p.current as u64,
+                        "total": p.total as u64,
+                        "path": p.path,
+                        "phase": p.phase,
+                    }));
+                }
+            }
+            Ok(apply_report_json(report))
+        }
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(e) if e.is_cancelled() => Err("cancelled".into()),
+        Err(e) => Err(format!("apply task failed: {e}")),
     };
 
     drop(guard);
-
-    if cancel.is_cancelled() {
-        publish(serde_json::json!({"type": "error", "message": "cancelled"}));
-        return;
-    }
 
     match outcome {
         Ok(report) => publish(serde_json::json!({"type": "done", "report": report})),
@@ -1008,42 +1040,352 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_patch_apply_cancel_stops_job() {
-        use futures_util::StreamExt;
-        let (url, _handle, state) = setup_with_state().await;
-        let job_id = "parked-patch";
-        park_job(&state, job_id, crate::JobKind::Patch, None);
-        let cancel_token = state.active_jobs.get(job_id).unwrap().cancel.clone();
-        let ws_url = format!("{}/api/patch/ws/{job_id}", url.replacen("http", "ws", 1));
-        let (mut ws, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
-        let response = client()
-            .post(format!("{url}/api/patch/cancel/{job_id}"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 200);
-        assert!(cancel_token.is_cancelled());
-        let event = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while let Some(message) = ws.next().await {
-                if let tokio_tungstenite::tungstenite::Message::Text(text) = message.unwrap() {
-                    return serde_json::from_str::<serde_json::Value>(&text).unwrap();
+    struct PausedPatch {
+        _dir: tempfile::TempDir,
+        game: std::path::PathBuf,
+        zip: std::path::PathBuf,
+        state: std::sync::Arc<crate::AppState>,
+        url: String,
+        server: tokio::task::JoinHandle<()>,
+        job_id: String,
+        replay: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        release: Option<std::sync::mpsc::Sender<()>>,
+        finished: Option<tokio::sync::oneshot::Receiver<()>>,
+    }
+
+    impl PausedPatch {
+        async fn start(point: super::PatchApplyTestPoint) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let game = dir.path().join("game");
+            let source = dir.path().join("source");
+            let pristine = dir.path().join("pristine");
+            for root in [&game, &source, &pristine] {
+                std::fs::create_dir(root).unwrap();
+                for name in ["a.txt", "b.txt"] {
+                    std::fs::write(root.join(name), b"original").unwrap();
                 }
             }
-            panic!("cancelled patch must emit a terminal event");
+            let state = crate::create_test_state();
+            let files: Vec<_> = ["a.txt", "b.txt"].map(|name| source.join(name)).into();
+            for file in &files {
+                std::fs::write(file, b"patched").unwrap();
+                state
+                    .db
+                    .save_entries(&[translated(
+                        file.file_name().unwrap().to_str().unwrap(),
+                        "original",
+                        file.to_str().unwrap(),
+                        "patched",
+                    )])
+                    .unwrap();
+            }
+            state
+                .db
+                .record_injection(Some("es"), &source, &files)
+                .unwrap();
+            let zip = dir.path().join("patch.zip");
+            locust_core::patch::pack_injection_recording(
+                &state.db,
+                locust_core::patch::PackOptions {
+                    game_path: source,
+                    lang: Some("es".into()),
+                    output: zip.clone(),
+                    pristine: Some(pristine),
+                    engine: Some("test".into()),
+                    project: dir.path().join("project.db"),
+                    require_pristine: true,
+                    game: None,
+                },
+            )
+            .unwrap();
+
+            let (entered, reached) = tokio::sync::oneshot::channel();
+            let (release, hold) = std::sync::mpsc::channel();
+            let (finished, returned) = tokio::sync::oneshot::channel();
+            let mut req: super::PatchPathsRequest = serde_json::from_value(serde_json::json!({
+                "game_path": game, "zip_path": zip,
+            }))
+            .unwrap();
+            req.apply_hooks = Some(super::PatchApplyTestHooks {
+                point,
+                pause: Some(Box::new(move || {
+                    let _ = entered.send(());
+                    // Disconnect also releases the worker if an assertion fails.
+                    assert!(
+                        !matches!(
+                            hold.recv_timeout(std::time::Duration::from_secs(10)),
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                        ),
+                        "patch gate timed out"
+                    );
+                })),
+                finished,
+            });
+            let (url, server) = crate::start_test_server(state.clone()).await;
+            let (status, axum::Json(body)) =
+                super::patch_apply(axum::extract::State(state.clone()), axum::Json(req))
+                    .await
+                    .unwrap();
+            assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+            let job_id = body["job_id"].as_str().unwrap().to_string();
+            let replay = state.active_jobs.get(&job_id).unwrap().replay.clone();
+            let fixture = Self {
+                _dir: dir,
+                game,
+                zip,
+                state,
+                url,
+                server,
+                job_id,
+                replay,
+                release: Some(release),
+                finished: Some(returned),
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(5), reached)
+                .await
+                .expect("patch did not reach gate")
+                .unwrap();
+            fixture
+        }
+
+        async fn cancel(&self) {
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client()
+                    .post(format!("{}/api/patch/cancel/{}", self.url, self.job_id))
+                    .send(),
+            )
+            .await
+            .expect("cancel must return without waiting for the worker")
+            .unwrap();
+            assert_eq!(response.status(), 200);
+        }
+
+        async fn connect(
+            &self,
+        ) -> tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        > {
+            tokio_tungstenite::connect_async(format!(
+                "{}/api/patch/ws/{}",
+                self.url.replacen("http", "ws", 1),
+                self.job_id,
+            ))
+            .await
+            .unwrap()
+            .0
+        }
+
+        async fn drain(&mut self) {
+            self.release.take().unwrap().send(()).unwrap();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.finished.take().unwrap(),
+            )
+            .await
+            .expect("blocking patch did not drain")
+            .unwrap();
+        }
+
+        fn terminal(&self) -> serde_json::Value {
+            let log = self.replay.lock().unwrap();
+            let terminals: Vec<_> = log
+                .iter()
+                .filter(|e| crate::job_event_is_terminal(e))
+                .collect();
+            assert_eq!(
+                terminals.len(),
+                1,
+                "exactly one authoritative terminal in replay"
+            );
+            let mut terminal = terminals[0].clone();
+            terminal.as_object_mut().unwrap().remove("seq");
+            terminal
+        }
+    }
+
+    impl Drop for PausedPatch {
+        fn drop(&mut self) {
+            self.release.take();
+            if let Some(job) = self.state.active_jobs.get(&self.job_id) {
+                job.abort_handle.abort();
+            }
+            self.server.abort();
+        }
+    }
+
+    async fn patch_frames(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> Vec<serde_json::Value> {
+        use futures_util::{SinkExt, StreamExt};
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut frames = Vec::new();
+            while let Some(message) = ws.next().await {
+                match message.unwrap() {
+                    tokio_tungstenite::tungstenite::Message::Text(text) => {
+                        frames.push(serde_json::from_str(&text).unwrap());
+                    }
+                    tokio_tungstenite::tungstenite::Message::Close(_) => {
+                        ws.flush().await.unwrap();
+                        assert_eq!(
+                            frames
+                                .iter()
+                                .filter(|e| crate::job_event_is_terminal(e))
+                                .count(),
+                            1,
+                            "exactly one terminal per WebSocket"
+                        );
+                        return frames;
+                    }
+                    _ => {}
+                }
+            }
+            panic!("patch WebSocket ended without Close");
         })
         .await
-        .unwrap();
-        assert_eq!(
-            event,
-            serde_json::json!({"type": "error", "message": "cancelled"})
-        );
-        let response = client()
-            .post(format!("{url}/api/patch/cancel/{job_id}"))
+        .expect("patch WebSocket did not terminate")
+    }
+
+    #[tokio::test]
+    async fn patch_cancel_before_commit_drains_to_recoverable_interruption() {
+        let mut f = PausedPatch::start(super::PatchApplyTestPoint::BeforeWrite(2)).await;
+        let mut ws = f.connect().await;
+        assert_eq!(std::fs::read(f.game.join("a.txt")).unwrap(), b"patched");
+        assert_eq!(std::fs::read(f.game.join("b.txt")).unwrap(), b"original");
+        f.cancel().await;
+        let retained = f.state.active_jobs.contains_key(&f.job_id);
+        let premature = f
+            .replay
+            .lock()
+            .unwrap()
+            .iter()
+            .any(crate::job_event_is_terminal);
+        let in_flight = crate::active_patch_job_for_game(&f.state, f.game.to_str().unwrap());
+        let second = client()
+            .post(format!("{}/api/patch/apply", f.url))
+            .json(&serde_json::json!({"game_path": f.game, "zip_path": f.zip}))
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), 404, "cancelled job must be removed");
+        f.drain().await;
+        let frames = patch_frames(&mut ws).await;
+        let terminal = f.terminal();
+        assert_eq!(frames.last(), Some(&terminal));
+        assert!(matches!(
+            locust_core::patch::PatchStore::new(&f.game)
+                .status()
+                .unwrap(),
+            locust_core::patch::PatchStatus::Interrupted(_)
+        ));
+        let rollback = locust_core::patch::rollback(&f.game, Default::default()).unwrap();
+        assert_eq!(rollback.restored, 2);
+        for name in ["a.txt", "b.txt"] {
+            assert_eq!(std::fs::read(f.game.join(name)).unwrap(), b"original");
+        }
+        assert!(!f.game.join(".locust").exists());
+        assert_eq!(terminal["type"], "error");
+        assert!(terminal["message"].as_str().unwrap().contains("cancelled"));
+        assert!(
+            retained,
+            "cancelling must retain the patch job while it drains"
+        );
+        assert!(
+            !premature,
+            "cancelling must not publish before the worker returns"
+        );
+        assert_eq!(in_flight.as_deref(), Some(f.job_id.as_str()));
+        assert_eq!(
+            second.status(),
+            409,
+            "same-folder admission stays blocked while draining"
+        );
+    }
+
+    async fn cancelled_committed_patch(point: super::PatchApplyTestPoint) {
+        let mut f = PausedPatch::start(point).await;
+        let mut ws = f.connect().await;
+        if point == super::PatchApplyTestPoint::AfterApply {
+            assert!(
+                matches!(
+                    locust_core::patch::PatchStore::new(&f.game)
+                        .status()
+                        .unwrap(),
+                    locust_core::patch::PatchStatus::Patched(_)
+                ),
+                "worker committed before cancellation"
+            );
+        }
+        f.cancel().await;
+        f.drain().await;
+        let frames = patch_frames(&mut ws).await;
+        assert!(matches!(
+            locust_core::patch::PatchStore::new(&f.game)
+                .status()
+                .unwrap(),
+            locust_core::patch::PatchStatus::Patched(_)
+        ));
+        for name in ["a.txt", "b.txt"] {
+            assert_eq!(std::fs::read(f.game.join(name)).unwrap(), b"patched");
+        }
+        let terminal = f.terminal();
+        assert_eq!(frames.last(), Some(&terminal));
+        assert_eq!(
+            terminal["type"], "done",
+            "committed work must report its real success"
+        );
+        assert_eq!(terminal["report"]["replaced"], 2);
+        assert_eq!(terminal["report"]["dry_run"], false);
+        assert!(crate::active_patch_job_for_game(&f.state, f.game.to_str().unwrap()).is_none());
+    }
+
+    #[tokio::test]
+    async fn patch_cancel_after_commit_reports_success() {
+        cancelled_committed_patch(super::PatchApplyTestPoint::AfterApply).await;
+    }
+
+    #[tokio::test]
+    async fn patch_cancel_after_last_check_reports_committed_success() {
+        cancelled_committed_patch(super::PatchApplyTestPoint::AfterWriteCheck(2)).await;
+    }
+
+    #[tokio::test]
+    async fn patch_cancel_reconnect_during_drain_and_after_completion_replays_one_terminal() {
+        let mut f = PausedPatch::start(super::PatchApplyTestPoint::BeforeWrite(2)).await;
+        f.cancel().await;
+        f.cancel().await;
+        // Cancellation must not start the completion-window timer while the
+        // blocking worker is still parked. Virtual time does not release it.
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        assert!(f.state.active_jobs.contains_key(&f.job_id));
+        tokio::time::resume();
+        // This handshake finishes before releasing the worker, so lookup must
+        // find the draining registry entry rather than a fabricated terminal.
+        let mut during_drain = f.connect().await;
+        f.drain().await;
+        let first = patch_frames(&mut during_drain).await;
+        assert_eq!(first.last().unwrap()["type"], "error");
+        assert!(first.last().unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .contains("cancelled"));
+        assert_eq!(first.last(), Some(&f.terminal()));
+        f.cancel().await;
+        let mut after_completion = f.connect().await;
+        let replay = patch_frames(&mut after_completion).await;
+        assert_eq!(replay.last(), Some(&f.terminal()));
+        assert!(
+            f.state.active_jobs.contains_key(&f.job_id),
+            "completed jobs retain their replay window"
+        );
+        // After drainage, the normal 30-second replay cleanup applies again.
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        tokio::task::yield_now().await;
+        assert!(!f.state.active_jobs.contains_key(&f.job_id));
+        tokio::time::resume();
     }
 
     #[tokio::test]

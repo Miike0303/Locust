@@ -47,33 +47,16 @@ pub(crate) fn cancel_job(state: &AppState, job_id: &str) -> Result<StatusCode, A
             return Ok(StatusCode::OK);
         }
     }
-    // Preserve the patch endpoint's existing removal contract. Patch workers
-    // have their own game-folder lock and do not use the live project database.
-    let is_patch = state
-        .active_jobs
-        .get(job_id)
-        .is_some_and(|job| matches!(job.kind, JobKind::Patch));
-    if is_patch {
-        if let Some((_, job)) = state.active_jobs.remove(job_id) {
+    if let Some(job) = state.active_jobs.get(job_id) {
+        if matches!(job.kind, JobKind::Translate) {
             publish_job_event(
                 &job.progress_tx,
                 &job.replay,
-                serde_json::json!({"type": "error", "message": "cancelled"}),
+                serde_json::json!({"type": "failed", "entry_id": null, "error": "cancelled"}),
             );
-            job.cancel.cancel();
-            job.abort_handle.abort();
-            return Ok(StatusCode::OK);
         }
-        return Err(err(StatusCode::NOT_FOUND, "job not found"));
-    }
-    if let Some(job) = state.active_jobs.get(job_id) {
-        let terminal = match job.kind {
-            JobKind::Translate => {
-                serde_json::json!({"type": "failed", "entry_id": null, "error": "cancelled"})
-            }
-            JobKind::Patch => serde_json::json!({"type": "error", "message": "cancelled"}),
-        };
-        publish_job_event(&job.progress_tx, &job.replay, terminal);
+        // Patch workers publish their actual result after cooperative cancellation
+        // drains the blocking apply. Retain the supervisor and replay entry.
         job.cancel.cancel();
         // A translation may be awaiting a SQLite spawn_blocking write, which
         // cannot be aborted. Let cooperative cancellation drain those writes
