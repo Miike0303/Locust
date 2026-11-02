@@ -636,6 +636,15 @@ fn parse_archive(
         encoded_spans.push(pos..end);
         pos = end;
     }
+    if uncompressed.len() != expected_uncomp {
+        return Err(err(
+            label,
+            format!(
+                "UnityFS storage produced {} bytes, expected {expected_uncomp}",
+                uncompressed.len()
+            ),
+        ));
+    }
 
     let source = Arc::new(data);
     let storage_cache = blocks
@@ -1005,7 +1014,12 @@ fn decompress_blob_into(
             out.resize(start + uncompressed, 0);
             let written = lz4_flex::decompress_into(src, &mut out[start..])
                 .map_err(|e| err(label, format!("{what}: LZ4 decompress failed: {e}")))?;
-            out.truncate(start + written);
+            if written != uncompressed {
+                return Err(err(
+                    label,
+                    format!("{what}: LZ4 produced {written} bytes, expected {uncompressed}"),
+                ));
+            }
             Ok(())
         }
         COMPRESSION_LZMA => decompress_lzma_into(src, uncompressed, label, what, out),
@@ -1253,6 +1267,173 @@ mod tests {
             archive.node_bytes(&archive.nodes[0]).unwrap(),
             cab.as_slice()
         );
+    }
+
+    // Use the existing builder for the header, then encode explicit block sizes
+    // so malformed inputs do not have to pass the archive writer's validation.
+    fn lz4_size_fixture(
+        blocks: &[(u32, &[u8])],
+        compression: u32,
+        info_size_delta: i32,
+    ) -> Vec<u8> {
+        let mut bytes = build_test_bundle(&[], false, 6, false, false);
+        let mut size_pos = 0;
+        read_cstring(&bytes, &mut size_pos, "fixture").unwrap();
+        read_u32_be(&bytes, &mut size_pos, "fixture").unwrap();
+        read_cstring(&bytes, &mut size_pos, "fixture").unwrap();
+        read_cstring(&bytes, &mut size_pos, "fixture").unwrap();
+        bytes.truncate(size_pos);
+
+        let mut info = vec![0; 16];
+        write_i32_be(&mut info, blocks.len() as i32);
+        let mut storage = Vec::new();
+        let mut payload_size = 0;
+        for &(declared, payload) in blocks {
+            let packed = lz4_flex::compress(payload);
+            write_u32_be(&mut info, declared);
+            write_u32_be(&mut info, packed.len() as u32);
+            write_u16_be(&mut info, compression as u16);
+            storage.extend_from_slice(&packed);
+            payload_size += payload.len();
+        }
+        write_i32_be(&mut info, 1);
+        write_i64_be(&mut info, 0);
+        write_i64_be(&mut info, payload_size as i64);
+        write_u32_be(&mut info, 4);
+        write_cstring(&mut info, "CAB-size");
+        let packed_info = lz4_flex::compress(&info);
+        let size = size_pos + 20 + packed_info.len() + storage.len();
+        write_i64_be(&mut bytes, size as i64);
+        write_u32_be(&mut bytes, packed_info.len() as u32);
+        write_u32_be(&mut bytes, (info.len() as i32 + info_size_delta) as u32);
+        write_u32_be(&mut bytes, FLAG_COMBINED | compression);
+        bytes.extend_from_slice(&packed_info);
+        bytes.extend_from_slice(&storage);
+        bytes
+    }
+
+    fn assert_short_storage_block_rejected(compression: u32, multiblock: bool) {
+        let block_count = if multiblock { 3 } else { 1 };
+        for short_index in 0..block_count {
+            let mut blocks = vec![(4, &b"data"[..]); block_count];
+            blocks[short_index].0 = 8;
+            let bytes = lz4_size_fixture(&blocks, compression, 0);
+            let error = UnityFsArchive::parse(bytes, "short.unity3d").unwrap_err();
+            assert_eq!(error.file, "short.unity3d");
+            assert_eq!(
+                error.message,
+                format!("storage block {short_index}: LZ4 produced 4 bytes, expected 8")
+            );
+        }
+    }
+
+    #[test]
+    fn parse_lz4_storage_block_rejects_short_decode() {
+        assert_short_storage_block_rejected(COMPRESSION_LZ4, false);
+    }
+
+    #[test]
+    fn parse_lz4hc_storage_block_rejects_short_decode() {
+        assert_short_storage_block_rejected(COMPRESSION_LZ4HC, false);
+    }
+
+    #[test]
+    fn parse_lz4_multiblock_rejects_short_decode_at_each_index() {
+        assert_short_storage_block_rejected(COMPRESSION_LZ4, true);
+    }
+
+    #[test]
+    fn parse_lz4hc_multiblock_rejects_short_decode_at_each_index() {
+        assert_short_storage_block_rejected(COMPRESSION_LZ4HC, true);
+    }
+
+    fn assert_short_blocks_info_rejected(compression: u32) {
+        // One block and one CAB-size node occupy 16 + 4 + 10 + 4 + 29 bytes.
+        let bytes = lz4_size_fixture(&[(4, b"data")], compression, 4);
+        let error = UnityFsArchive::parse(bytes, "short-info.unity3d").unwrap_err();
+        assert_eq!(error.file, "short-info.unity3d");
+        assert_eq!(
+            error.message,
+            "blocks-info: LZ4 produced 63 bytes, expected 67"
+        );
+    }
+
+    #[test]
+    fn parse_lz4_blocks_info_rejects_short_decode() {
+        assert_short_blocks_info_rejected(COMPRESSION_LZ4);
+    }
+
+    #[test]
+    fn parse_lz4hc_blocks_info_rejects_short_decode() {
+        assert_short_blocks_info_rejected(COMPRESSION_LZ4HC);
+    }
+
+    #[test]
+    fn parse_lz4_storage_block_surfaces_output_too_small() {
+        let payload = b"too long";
+        let mut output = [0; 4];
+        let api_error =
+            lz4_flex::decompress_into(&lz4_flex::compress(payload), &mut output).unwrap_err();
+        assert!(matches!(
+            api_error,
+            lz4_flex::block::DecompressError::OutputTooSmall { .. }
+        ));
+        for compression in [COMPRESSION_LZ4, COMPRESSION_LZ4HC] {
+            let bytes =
+                lz4_size_fixture(&[(4, b"head"), (4, payload), (4, b"tail")], compression, 0);
+            let error = UnityFsArchive::parse(bytes, "long.unity3d").unwrap_err();
+            assert_eq!(error.file, "long.unity3d");
+            assert_eq!(
+                error.message,
+                format!("storage block 1: LZ4 decompress failed: {api_error}")
+            );
+        }
+    }
+
+    #[test]
+    fn parse_lz4_blocks_info_surfaces_output_too_small() {
+        for compression in [COMPRESSION_LZ4, COMPRESSION_LZ4HC] {
+            let bytes = lz4_size_fixture(&[(4, b"data")], compression, -4);
+            let error = UnityFsArchive::parse(bytes, "long-info.unity3d").unwrap_err();
+            assert_eq!(error.file, "long-info.unity3d");
+            assert_eq!(
+                error.message,
+                "blocks-info: LZ4 decompress failed: provided output is too small for the decompressed data, actual 59, expected 63"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_lz4_multiblock_matches_declared_total_and_node_bytes() {
+        let cab = cab_bytes();
+        let blocks = [
+            (4, &cab[..4]),
+            (7, &cab[4..11]),
+            ((cab.len() - 11) as u32, &cab[11..]),
+        ];
+        for compression in [COMPRESSION_LZ4, COMPRESSION_LZ4HC] {
+            let bytes = lz4_size_fixture(&blocks, compression, 0);
+            let archive = UnityFsArchive::parse(bytes, "exact.unity3d").unwrap();
+            assert_eq!(archive.blocks.len(), blocks.len());
+            let declared_total: usize = archive
+                .blocks
+                .iter()
+                .map(|block| block.uncompressed_size as usize)
+                .sum();
+            assert_eq!(archive.uncompressed.len(), declared_total);
+            assert_eq!(archive.uncompressed, cab);
+            let node = archive.node("CAB-size").unwrap();
+            let got = archive.node_bytes(node).unwrap();
+            assert_eq!(got, cab);
+            let sf = SerializedFile::parse(got.to_vec(), "CAB-size").unwrap();
+            assert_eq!(
+                sf.read_text_asset(1).unwrap().script,
+                "Hello from the bundle."
+            );
+            let again = UnityFsArchive::parse(archive.write_bytes().unwrap(), "exact-out").unwrap();
+            assert_eq!(again.node_bytes(&again.nodes[0]).unwrap(), cab);
+            assert_eq!(again.uncompressed.len(), declared_total);
+        }
     }
 
     #[test]
