@@ -344,6 +344,9 @@ impl UnrealPlugin {
                 "binary_slot".to_string(),
                 serde_json::Value::String("utf16le".to_string()),
             );
+            entry
+                .metadata
+                .insert("byte_offset".to_string(), serde_json::json!(offset));
             entries.push(entry);
         }
 
@@ -1415,6 +1418,19 @@ fn find_utf16le_strings(bytes: &[u8]) -> Vec<(usize, String)> {
     results
 }
 
+fn heuristic_utf16le_offset(entry: &StringEntry) -> Option<usize> {
+    entry
+        .metadata
+        .get("byte_offset")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|offset| usize::try_from(offset).ok())
+        .or_else(|| {
+            let (_, suffix) = entry.id.rsplit_once("#offset_")?;
+            let (offset, _) = suffix.split_once('#')?;
+            offset.parse().ok()
+        })
+}
+
 fn has_natural_language(text: &str) -> bool {
     let char_count = text.chars().count();
     if char_count < 4 {
@@ -1841,6 +1857,7 @@ impl FormatPlugin for UnrealPlugin {
 
             struct Work<'a> {
                 entry: &'a StringEntry,
+                offset: Option<usize>,
                 needle: Vec<u8>,
                 trans: Vec<u8>,
             }
@@ -1891,35 +1908,91 @@ impl FormatPlugin for UnrealPlugin {
 
                 work.push(Work {
                     entry,
+                    offset: heuristic_utf16le_offset(entry),
                     needle: orig_utf16,
                     trans: trans_utf16,
                 });
             }
+            if work.is_empty() {
+                continue;
+            }
 
-            let patterns: Vec<&[u8]> = work.iter().map(|w| w.needle.as_slice()).collect();
+            // Reuse extraction's start/end rules: a full slot stops at NUL, an
+            // invalid UTF-16LE text unit, or EOF. Prefixes/suffixes are not slots.
+            let slots: HashMap<usize, usize> = find_utf16le_strings(&bytes)
+                .into_iter()
+                .map(|(offset, text)| (offset, text.encode_utf16().count() * 2))
+                .collect();
+            let patterns: Vec<&[u8]> = work
+                .iter()
+                .map(|w| {
+                    if w.offset.is_none() {
+                        w.needle.as_slice()
+                    } else {
+                        &[]
+                    }
+                })
+                .collect();
             let mut cursor = crate::binary_search::MatchCursor::from_patterns(&bytes, &patterns);
-
-            for (i, w) in work.iter().enumerate() {
-                if let Some(pos) = cursor.next_valid(i, &bytes, &w.needle) {
-                    bytes[pos..pos + w.trans.len()].copy_from_slice(&w.trans);
-                    for b in &mut bytes[pos + w.trans.len()..pos + w.needle.len()] {
-                        *b = 0;
-                    }
-                    strings_written += 1;
-                    modified = true;
-                    if w.trans.len() < w.needle.len() {
-                        if pad_noted < 5 {
-                            warnings.push(format!(
-                                "padded {} null bytes for '{}'",
-                                w.needle.len() - w.trans.len(),
-                                w.entry.id
-                            ));
+            // Resolve and validate against the same pre-write image, so earlier
+            // writes cannot revive stale sources or make legacy needles unique.
+            let targets: Vec<_> = work
+                .iter()
+                .enumerate()
+                .map(|(i, w)| {
+                    let pos = if let Some(pos) = w.offset {
+                        pos
+                    } else {
+                        let pos = cursor
+                            .next_valid(i, &bytes, &w.needle)
+                            .ok_or("source_changed")?;
+                        if cursor.next_valid(i, &bytes, &w.needle).is_some() {
+                            return Err("ambiguous_target");
                         }
-                        pad_noted += 1;
+                        pos
+                    };
+                    let end = pos.checked_add(w.needle.len()).ok_or("source_changed")?;
+                    if slots.get(&pos) != Some(&w.needle.len())
+                        || bytes.get(pos..end) != Some(w.needle.as_slice())
+                    {
+                        return Err("source_changed");
                     }
-                } else {
-                    strings_skipped += 1;
-                    *skip_reasons.entry("source_changed".into()).or_default() += 1;
+                    Ok(pos)
+                })
+                .collect();
+
+            for (w, target) in work.iter().zip(targets) {
+                // Recheck after prior writes, including duplicate rows for a slot.
+                let target = target.and_then(|pos| {
+                    let end = pos.checked_add(w.needle.len()).ok_or("source_changed")?;
+                    if bytes.get(pos..end) != Some(w.needle.as_slice()) {
+                        return Err("source_changed");
+                    }
+                    Ok(pos)
+                });
+                let pos = match target {
+                    Ok(pos) => pos,
+                    Err(reason) => {
+                        strings_skipped += 1;
+                        *skip_reasons.entry(reason.into()).or_default() += 1;
+                        continue;
+                    }
+                };
+                bytes[pos..pos + w.trans.len()].copy_from_slice(&w.trans);
+                for b in &mut bytes[pos + w.trans.len()..pos + w.needle.len()] {
+                    *b = 0;
+                }
+                strings_written += 1;
+                modified = true;
+                if w.trans.len() < w.needle.len() {
+                    if pad_noted < 5 {
+                        warnings.push(format!(
+                            "padded {} null bytes for '{}'",
+                            w.needle.len() - w.trans.len(),
+                            w.entry.id
+                        ));
+                    }
+                    pad_noted += 1;
                 }
             }
 
@@ -2307,6 +2380,299 @@ mod tests {
         assert!(sources.contains(&"Press Start"), "got: {:?}", sources);
     }
 
+    fn utf16le(text: &str) -> Vec<u8> {
+        text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    }
+
+    fn create_heuristic_slot_fixture(dir: &Path, strings: &[&str]) -> (PathBuf, Vec<usize>) {
+        let path = dir.join("Slots.pak");
+        let mut bytes = vec![0; 32];
+        let mut offsets = Vec::new();
+        for text in strings {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(&utf16le(text));
+            bytes.extend_from_slice(&[0, 0]);
+        }
+        // Same malformed-footer fallback as create_pak_fixture.
+        bytes.extend_from_slice(&[0; 32]);
+        bytes.extend_from_slice(&pak_magic());
+        bytes.extend_from_slice(&[0; 40]);
+        fs::write(&path, bytes).unwrap();
+        (path, offsets)
+    }
+
+    #[test]
+    fn test_inject_heuristic_offset_translates_only_second_substring_slot() {
+        let dir = tempdir();
+        let (path, offsets) =
+            create_heuristic_slot_fixture(dir.path(), &["Prefix Hello world", "Hello world"]);
+        let plugin = UnrealPlugin::new();
+        let mut entries = plugin.extract(&path).unwrap();
+        assert_eq!(entries.len(), 2);
+        let mut entry = entries.pop().unwrap();
+        assert_eq!(entry.source, "Hello world");
+        assert_eq!(entry.id, format!("Slots.pak#offset_{}#1", offsets[1]));
+        assert_eq!(entry.metadata["byte_offset"], serde_json::json!(offsets[1]));
+        // Saved rows predating offset metadata must keep working through their IDs.
+        entry.metadata.remove("byte_offset");
+        entry.translation = Some("Hola mundo".into());
+        let mut expected = fs::read(&path).unwrap();
+        expected[offsets[1]..offsets[1] + 20].copy_from_slice(&utf16le("Hola mundo"));
+        expected[offsets[1] + 20..offsets[1] + 22].fill(0);
+
+        let report = plugin.inject(dir.path(), &[entry]).unwrap();
+        assert_eq!(report.strings_written, 1, "{report:?}");
+        assert_eq!(report.strings_skipped, 0, "{report:?}");
+        assert_eq!(report.files_written, vec![path.clone()]);
+        assert_eq!(fs::read(path).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_inject_heuristic_offset_duplicate_slots_follow_rows_in_reverse_order() {
+        let dir = tempdir();
+        let (path, offsets) =
+            create_heuristic_slot_fixture(dir.path(), &["Hello world", "Hello world"]);
+        let plugin = UnrealPlugin::new();
+        // Extraction deduplicates text; explicit saved rows still address each slot.
+        let mut entries = plugin.extract(&path).unwrap();
+        assert_eq!(entries.len(), 1);
+        let mut first = entries.pop().unwrap();
+        first.metadata.remove("byte_offset");
+        first.translation = Some("Salut monde".into());
+        let mut second = first.clone();
+        second.id = format!("Slots.pak#offset_{}#1", offsets[1]);
+        second.translation = Some("Buenos dias".into());
+        let mut expected = fs::read(&path).unwrap();
+        expected[offsets[0]..offsets[0] + 22].copy_from_slice(&utf16le("Salut monde"));
+        expected[offsets[1]..offsets[1] + 22].copy_from_slice(&utf16le("Buenos dias"));
+
+        let report = plugin.inject(dir.path(), &[second, first]).unwrap();
+        assert_eq!(report.strings_written, 2, "{report:?}");
+        assert_eq!(report.strings_skipped, 0, "{report:?}");
+        assert!(report.skip_reasons.is_empty(), "{report:?}");
+        assert_eq!(fs::read(path).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_inject_heuristic_offset_stale_source_refuses_other_occurrences() {
+        let dir = tempdir();
+        let (path, offsets) =
+            create_heuristic_slot_fixture(dir.path(), &["Hello world", "Hello world"]);
+        let plugin = UnrealPlugin::new();
+        let mut entry = plugin.extract(&path).unwrap().pop().unwrap();
+        entry.id = format!("Slots.pak#offset_{}#1", offsets[1]);
+        entry.metadata.remove("byte_offset");
+        entry.translation = Some("Hola mundo".into());
+        let mut stale = fs::read(&path).unwrap();
+        stale[offsets[1]] = b'J';
+        fs::write(&path, &stale).unwrap();
+
+        let report = plugin
+            .inject(dir.path(), std::slice::from_ref(&entry))
+            .unwrap();
+        assert_eq!(report.strings_written, 0, "{report:?}");
+        assert_eq!(report.strings_skipped, 1, "{report:?}");
+        assert_eq!(report.skip_reasons.get("source_changed"), Some(&1));
+        assert_eq!(report.files_modified, 0, "{report:?}");
+        assert!(report.files_written.is_empty());
+        assert_eq!(fs::read(&path).unwrap(), stale);
+
+        // A preceding row must not revive a source that was stale at resolution.
+        let mut preceding = entry.clone();
+        preceding.source = "Jello world".into();
+        preceding.translation = Some("Hello world".into());
+        let mut expected = stale;
+        expected[offsets[1]] = b'H';
+        let report = plugin.inject(dir.path(), &[preceding, entry]).unwrap();
+        assert_eq!(report.strings_written, 1, "{report:?}");
+        assert_eq!(report.strings_skipped, 1, "{report:?}");
+        assert_eq!(report.skip_reasons.get("source_changed"), Some(&1));
+        assert_eq!(fs::read(path).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_inject_heuristic_offset_metadata_takes_precedence_over_id() {
+        let dir = tempdir();
+        let (path, offsets) =
+            create_heuristic_slot_fixture(dir.path(), &["Hello world", "Hello world"]);
+        let plugin = UnrealPlugin::new();
+        let mut entry = plugin.extract(&path).unwrap().pop().unwrap();
+        entry
+            .metadata
+            .insert("byte_offset".into(), serde_json::json!(offsets[1]));
+        entry.translation = Some("Salut monde".into());
+        let mut expected = fs::read(&path).unwrap();
+        expected[offsets[1]..offsets[1] + 22].copy_from_slice(&utf16le("Salut monde"));
+
+        let report = plugin.inject(dir.path(), &[entry]).unwrap();
+        assert_eq!(report.strings_written, 1, "{report:?}");
+        assert_eq!(report.strings_skipped, 0, "{report:?}");
+        assert_eq!(fs::read(path).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_inject_heuristic_offset_requires_complete_bounded_slot() {
+        let dir = tempdir();
+        let (path, offsets) = create_heuristic_slot_fixture(dir.path(), &["Prefix Hello world"]);
+        let plugin = UnrealPlugin::new();
+        let original = fs::read(&path).unwrap();
+        for (offset, source) in [
+            (offsets[0] + 14, "Hello world"), // Suffix is not a slot start.
+            (offsets[0], "Prefix Hello"),     // Prefix is not a complete slot.
+            (offsets[0] + 1, "Prefix Hello world"), // Misaligned.
+            (original.len(), "Prefix Hello world"),
+            (usize::MAX, "Prefix Hello world"),
+        ] {
+            let mut entry =
+                StringEntry::new(format!("Slots.pak#offset_{offset}#0"), source, path.clone());
+            entry.translation = Some("Hola".into());
+            let report = plugin.inject(dir.path(), &[entry]).unwrap();
+            assert_eq!(report.strings_written, 0, "offset={offset}: {report:?}");
+            assert_eq!(report.strings_skipped, 1, "{report:?}");
+            assert_eq!(report.skip_reasons.get("source_changed"), Some(&1));
+            assert_eq!(report.files_modified, 0, "{report:?}");
+            assert!(report.files_written.is_empty());
+            assert_eq!(fs::read(&path).unwrap(), original);
+        }
+
+        // Extraction also accepts a slot bounded by a non-text code unit.
+        let mut expected = original;
+        expected[offsets[0] + 36..offsets[0] + 38].fill(0xFF);
+        fs::write(&path, &expected).unwrap();
+        let mut entry = plugin.extract(&path).unwrap().pop().unwrap();
+        assert_eq!(entry.source, "Prefix Hello world");
+        entry.translation = Some("Hola".into());
+        expected[offsets[0]..offsets[0] + 8].copy_from_slice(&utf16le("Hola"));
+        expected[offsets[0] + 8..offsets[0] + 36].fill(0);
+        let report = plugin.inject(dir.path(), &[entry]).unwrap();
+        assert_eq!(report.strings_written, 1, "{report:?}");
+        assert_eq!(report.strings_skipped, 0, "{report:?}");
+        assert_eq!(fs::read(path).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_inject_heuristic_offset_changed_terminator_is_refused() {
+        let dir = tempdir();
+        let (path, offsets) = create_heuristic_slot_fixture(dir.path(), &["Hello world"]);
+        let plugin = UnrealPlugin::new();
+        let mut entry = plugin.extract(&path).unwrap().pop().unwrap();
+        entry.translation = Some("Hola".into());
+        let mut changed = fs::read(&path).unwrap();
+        changed[offsets[0] + 22] = b'!'; // The original slot now continues past source.
+        fs::write(&path, &changed).unwrap();
+
+        let report = plugin.inject(dir.path(), &[entry]).unwrap();
+        assert_eq!(report.strings_written, 0, "{report:?}");
+        assert_eq!(report.strings_skipped, 1, "{report:?}");
+        assert_eq!(report.skip_reasons.get("source_changed"), Some(&1));
+        assert_eq!(report.files_modified, 0, "{report:?}");
+        assert!(report.files_written.is_empty());
+        assert_eq!(fs::read(path).unwrap(), changed);
+    }
+
+    #[test]
+    fn test_inject_heuristic_offset_preserves_utf16_byte_length_and_padding() {
+        for translation in ["Salut monde", "Hola", "", "Hello world!", "😀😀😀😀😀😀"] {
+            let dir = tempdir();
+            let (path, offsets) =
+                create_heuristic_slot_fixture(dir.path(), &["Hello world", "Guard string"]);
+            let plugin = UnrealPlugin::new();
+            let mut entry = plugin
+                .extract(&path)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.source == "Hello world")
+                .unwrap();
+            entry.translation = Some(translation.into());
+            let mut expected = fs::read(&path).unwrap();
+            let trans = utf16le(translation);
+            let fits = trans.len() <= 22;
+            if fits {
+                expected[offsets[0]..offsets[0] + trans.len()].copy_from_slice(&trans);
+                expected[offsets[0] + trans.len()..offsets[0] + 22].fill(0);
+            }
+
+            let report = plugin.inject(dir.path(), &[entry]).unwrap();
+            assert_eq!(report.strings_written, usize::from(fits), "{report:?}");
+            assert_eq!(report.strings_skipped, usize::from(!fits), "{report:?}");
+            assert_eq!(report.files_modified, usize::from(fits), "{report:?}");
+            if fits {
+                assert!(report.skip_reasons.is_empty(), "{report:?}");
+            } else {
+                assert_eq!(report.skip_reasons.get("too_long"), Some(&1));
+            }
+            // Includes the original terminator, next slot, footer and file length.
+            assert_eq!(fs::read(path).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_inject_heuristic_offset_legacy_unique_needle_is_allowed() {
+        for id in ["legacy", "Slots.pak#offset_invalid#0"] {
+            let dir = tempdir();
+            let (path, offsets) = create_heuristic_slot_fixture(dir.path(), &["Hello world"]);
+            let mut entry = StringEntry::new(id, "Hello world", path.clone());
+            entry.translation = Some("Salut monde".into());
+            let mut expected = fs::read(&path).unwrap();
+            expected[offsets[0]..offsets[0] + 22].copy_from_slice(&utf16le("Salut monde"));
+
+            let report = UnrealPlugin::new().inject(dir.path(), &[entry]).unwrap();
+            assert_eq!(report.strings_written, 1, "{report:?}");
+            assert_eq!(report.strings_skipped, 0, "{report:?}");
+            assert_eq!(fs::read(path).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_inject_heuristic_offset_legacy_repeated_needle_is_ambiguous() {
+        let dir = tempdir();
+        let (path, _) = create_heuristic_slot_fixture(dir.path(), &["Hello world", "Hello world"]);
+        let original = fs::read(&path).unwrap();
+        let entries: Vec<_> = ["Hola mundo", "Salut monde"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, translation)| {
+                let mut entry =
+                    StringEntry::new(format!("legacy_{i}"), "Hello world", path.clone());
+                entry.translation = Some(translation.into());
+                entry
+            })
+            .collect();
+
+        let report = UnrealPlugin::new().inject(dir.path(), &entries).unwrap();
+        assert_eq!(report.strings_written, 0, "{report:?}");
+        assert_eq!(report.strings_skipped, 2, "{report:?}");
+        assert_eq!(report.skip_reasons.get("ambiguous_target"), Some(&2));
+        assert_eq!(report.files_modified, 0, "{report:?}");
+        assert!(report.files_written.is_empty());
+        assert_eq!(fs::read(path).unwrap(), original);
+    }
+
+    #[test]
+    fn test_inject_heuristic_offset_legacy_ambiguity_uses_prewrite_image() {
+        let dir = tempdir();
+        let (path, offsets) =
+            create_heuristic_slot_fixture(dir.path(), &["Prefix Hello world", "Hello world"]);
+        let mut pinned = StringEntry::new(
+            format!("Slots.pak#offset_{}#1", offsets[1]),
+            "Hello world",
+            path.clone(),
+        );
+        pinned.translation = Some("Salut monde".into());
+        let mut legacy = StringEntry::new("legacy", "Hello world", path.clone());
+        legacy.translation = Some("Hola mundo".into());
+        let mut expected = fs::read(&path).unwrap();
+        expected[offsets[1]..offsets[1] + 22].copy_from_slice(&utf16le("Salut monde"));
+
+        let report = UnrealPlugin::new()
+            .inject(dir.path(), &[pinned, legacy])
+            .unwrap();
+        assert_eq!(report.strings_written, 1, "{report:?}");
+        assert_eq!(report.strings_skipped, 1, "{report:?}");
+        assert_eq!(report.skip_reasons.get("ambiguous_target"), Some(&1));
+        assert_eq!(fs::read(path).unwrap(), expected);
+    }
+
     fn write_heuristic_inject_target(dir: &Path, name: &str, len: u64) -> StringEntry {
         let path = dir.join(name);
         let source: Vec<u8> = "Hello World"
@@ -2543,7 +2909,7 @@ mod tests {
         assert!(report.strings_skipped >= 1);
     }
 
-    /// Multi-pattern Unreal inject: duplicate UTF-16LE needle, identity, oversize.
+    /// Offset-based Unreal inject: duplicate UTF-16LE needle, identity, oversize.
     /// Entries planted manually (no extract filter dependency).
     #[test]
     fn test_inject_multi_pattern_semantics() {
@@ -2572,8 +2938,8 @@ mod tests {
         };
         // AlphaStr = 8 chars; AlfaStr! = 8 chars (equal UTF-16LE byte length).
         let inject = vec![
-            mk("a1", "AlphaStr", Some("AlfaStr!")),
-            mk("a2", "AlphaStr", Some("AlfaStr!")),
+            mk("Multi.pak#offset_32#0", "AlphaStr", Some("AlfaStr!")),
+            mk("Multi.pak#offset_58#1", "AlphaStr", Some("AlfaStr!")),
             mk("id", "BetaStr!", Some("BetaStr!")), // identity
             mk("over", "BetaStr!", Some("This translation is far too long")), // oversize
         ];
