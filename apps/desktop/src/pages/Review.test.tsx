@@ -7,7 +7,7 @@ import type { FileStats, StringEntry } from "../lib/api.ts";
 import * as contextLibrary from "../lib/reviewContext.ts";
 import { draftProjectKey, projectScopedQueryFn } from "../lib/projectScope.ts";
 import { useProjectStore } from "../stores/projectStore.ts";
-import { draftEntryKey, editDraft, saveDraft, useDraftStore } from "../stores/draftStore.ts";
+import { draftEntryKey, editDraft, refreshDurableDrafts, useDraftStore } from "../stores/draftStore.ts";
 import { setLocale, t } from "../lib/i18n/index.ts";
 
 const project = { path: "/game", database_path: "/game.db", format_id: "renpy", name: "Game" };
@@ -133,7 +133,7 @@ const hooks = registerHooks({
         "../stores/projectStore": `const store=globalThis.__reviewTest.projectStore;export const useProjectStore=Object.assign(select=>select(store.getState()),{getState:store.getState});`,
         "../lib/reviewContext": `const h=globalThis.__reviewTest;export const buildReviewContextIndex=rows=>h.buildContextIndex(rows);export const reviewContext=(...args)=>h.reviewContext(...args);`,
         "../lib/i18n": `export const useT=()=>globalThis.__reviewTest.t;`,
-        "../lib/api": `const h=globalThis.__reviewTest;export const getFileStats=()=>h.getFileStats();export const getStrings=filter=>h.getStrings(filter);export const patchString=(id,patch)=>h.patchString(id,patch);export const getSpeakers=async()=>({groups:h.speakers,unassigned_entry_ids:[]});`,
+        "../lib/api": `const h=globalThis.__reviewTest;export const getString=async id=>h.rows[id];export const getFileStats=()=>h.getFileStats();export const getStrings=filter=>h.getStrings(filter);export const patchString=(id,patch)=>h.patchString(id,patch);export const getSpeakers=async()=>({groups:h.speakers,unassigned_entry_ids:[]});`,
       };
       if (stubs[specifier]) return { url: `data:text/javascript,${encodeURIComponent(stubs[specifier])}`, shortCircuit: true };
     }
@@ -142,6 +142,8 @@ const hooks = registerHooks({
 });
 const previousStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
 Object.defineProperty(globalThis, "localStorage", { configurable: true, value: {
+  get length() { return h.storage.size; },
+  key(index: number) { return [...h.storage.keys()][index] ?? null; },
   getItem(key: string) { if (h.storageFailure) throw new Error("Storage denied"); return h.storage.get(key) ?? null; },
   setItem(key: string, value: string) { if (h.storageFailure) throw new Error("Storage denied"); h.storage.set(key, value); },
   removeItem(key: string) { if (h.storageFailure) throw new Error("Storage denied"); h.storage.delete(key); },
@@ -150,6 +152,7 @@ const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
 const previousDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
 Object.defineProperty(globalThis, "window", {
   configurable: true, value: {
+    localStorage: globalThis.localStorage,
     addEventListener(_type: string, handler: typeof h.keydown) { h.keydown = handler; },
     removeEventListener() { h.keydown = null; },
   },
@@ -167,6 +170,7 @@ client.invalidateQueries = (...args: Parameters<typeof client.invalidateQueries>
   return invalidateQueries(...args);
 };
 after(() => {
+  unmountReview();
   client.clear();
   useProjectStore.getState().clearProject();
   hooks.deregister();
@@ -221,6 +225,7 @@ async function approve() {
   await settle();
 }
 beforeEach(async () => {
+  unmountReview();
   client.clear();
   useDraftStore.setState({ drafts: {}, records: [], persistenceIssue: null, persistenceIssues: {} });
   useProjectStore.getState().setProject(project);
@@ -293,24 +298,26 @@ test("approval invalidates only this database's caches and leaves newer Editor d
   const unrelated = [["config"], ["memory-suggestions", projectKey, "A"]];
   for (const key of [...own, ...others, ...unrelated]) client.setQueryData(key, "cached");
   const draftKey = draftEntryKey(projectKey, "A");
-  editDraft(draftKey, "Submitted Editor draft", "Translation A");
+  edit("Submitted Review draft");
   let finish!: () => void;
-  const saving = saveDraft(draftKey, "Translation A", () => new Promise<void>(resolve => { finish = resolve; }));
+  h.waitForSave = new Promise<void>(resolve => { finish = resolve; });
+  button(t("review.approve")).props.onClick();
   await Promise.resolve();
   editDraft(draftKey, "Newer Editor draft");
-  const drafts = useDraftStore.getState().drafts;
-  assert.equal(drafts[draftKey].saving, true);
   const reads = h.reads.length;
   try {
-    await approve();
+    finish();
+    await settle();
     for (const key of own) assert.equal(client.getQueryState(key)?.isInvalidated, true, JSON.stringify(key));
     for (const key of [...others, ...unrelated]) {
       assert.equal(client.getQueryState(key)?.isInvalidated, false, JSON.stringify(key));
       assert.equal(client.getQueryData(key), "cached");
     }
     assert.equal(h.reads.length, reads, "invalidation defers API reads until Editor navigation");
-    assert.equal(useDraftStore.getState().drafts, drafts, "approval cannot acknowledge a newer pending Editor draft");
-  } finally { finish(); await saving; }
+    assert.equal(useDraftStore.getState().drafts[draftKey].text, "Newer Editor draft",
+      "approval cannot acknowledge an edit made after submission");
+    assert.equal(useDraftStore.getState().drafts[draftKey].baseline, "Submitted Review draft");
+  } finally { finish(); await settle(); }
   assert.equal(useDraftStore.getState().drafts[draftKey].text, "Newer Editor draft");
 });
 
@@ -565,6 +572,7 @@ test("Review header uses the shared status badge and success progress color", as
 });
 
 async function startWith(entries: StringEntry[]) {
+  unmountReview();
   h.contextBuilds = [];
   h.values = []; h.effects = []; h.pending = [];
   h.rows = Object.fromEntries(entries.map(entry => [entry.id, entry]));
@@ -873,7 +881,7 @@ for (const rejected of [false, true]) {
   });
 }
 
-test("switching during a delayed page cannot merge the previous file or retain its cursor and draft", async () => {
+test("switching during a delayed page cannot merge the previous file or show its cursor and draft", async () => {
   await startWith(fileRows());
   selectScope("A.json");
   await settle();
@@ -885,7 +893,7 @@ test("switching during a delayed page cannot merge the previous file or retain i
   button(t("review.skip")).props.onClick();
   render();
   assert.ok(h.reads.some(filter => filter.status === "translated" && filter.file_path === "A.json" && filter.offset === 9));
-  edit("Discard this scope's draft");
+  edit("Keep this scope's draft");
   button(t("review.showDiff")).props.onClick();
   selectScope("B.json");
   await flushScope();
@@ -1056,3 +1064,161 @@ test("navigation while context pages are pending builds only the completed file 
   assert.deepEqual(contextRows().map(node => node.props["data-entry-id"]),
     [2, 3, 4, 5, 6, 7, 8].map(n => `delayed.rpy#s${n}`));
 });
+
+function unmountReview() {
+  for (const value of h.values) value?.cleanup?.();
+  h.values = []; h.effects = [];
+}
+async function remountReview() {
+  unmountReview();
+  render();
+  await settle();
+}
+
+test("Skip then Previous recovers the durable V-review draft and its V1 baseline", async () => {
+  await startWith([{ ...row("A"), translation: "V1" }, row("B")]);
+  edit("V-review");
+  button(t("review.skip")).props.onClick();
+  assert.equal(textarea().props.value, "Translation B");
+  button(t("review.previous")).props.onClick();
+  assert.equal(textarea().props.value, "V-review");
+  const key = draftEntryKey(projectKey, "A");
+  assert.equal(useDraftStore.getState().drafts[key].baseline, "V1");
+  assert.ok(useDraftStore.getState().records.some(record => record.entryKey === key && record.text === "V-review"));
+  assert.deepEqual(h.writes, []);
+});
+
+test("scope change and return recover V-review without writing it", async () => {
+  await startWith([{ ...row("A"), translation: "V1", file_path: "A.json" }, { ...row("B"), file_path: "B.json" }]);
+  selectScope("A.json");
+  await settle();
+  edit("V-review");
+  selectScope("B.json");
+  await settle();
+  assert.equal(textarea().props.value, "Translation B");
+  selectScope("A.json");
+  await settle();
+  assert.equal(textarea().props.value, "V-review");
+  assert.deepEqual(h.writes, []);
+});
+
+test("route exit and remount recover V-review from the shared durable store", async () => {
+  edit("V-review");
+  button(t("common.exit")).props.onClick();
+  assert.deepEqual(h.navigations, ["/editor"]);
+  unmountReview();
+  // Simulate a fresh in-memory store using the actual persisted records.
+  useDraftStore.setState({ drafts: {}, records: [] });
+  refreshDurableDrafts();
+  render();
+  await settle();
+  assert.equal(textarea().props.value, "V-review");
+  assert.equal(useDraftStore.getState().drafts[draftEntryKey(projectKey, "A")].baseline, "Translation A");
+});
+
+test("approval retires only the acknowledged draft and its durable records", async () => {
+  const a = draftEntryKey(projectKey, "A");
+  const b = draftEntryKey(projectKey, "B");
+  const other = draftEntryKey(draftProjectKey({ ...project, database_path: "/other.db" }), "A");
+  edit("V-review");
+  editDraft(b, "Draft B", "Translation B");
+  editDraft(other, "Other project draft", "Other baseline");
+  await approve();
+  assert.deepEqual(h.writes, [{ id: "A", patch: {
+    translation: "V-review", status: "approved", expected_translation: "Translation A",
+  } }]);
+  assert.equal(useDraftStore.getState().drafts[a], undefined);
+  assert.equal(useDraftStore.getState().drafts[b].text, "Draft B");
+  assert.equal(useDraftStore.getState().drafts[other].text, "Other project draft");
+  assert.ok(!useDraftStore.getState().records.some(record => record.entryKey === a));
+  assert.ok(useDraftStore.getState().records.some(record => record.entryKey === b));
+  assert.ok(useDraftStore.getState().records.some(record => record.entryKey === other));
+  assert.equal(textarea().props.value, "Draft B");
+});
+
+for (const locale of ["en", "es"] as const) {
+  test(`${locale}: changed server baseline after remount keeps the draft and reports a durable conflict`, async () => {
+    setLocale(locale);
+    edit("V-review");
+    h.rows.A = { ...h.rows.A, translation: "V2" };
+    await remountReview();
+    await approve();
+    assert.deepEqual(h.writes, [{ id: "A", patch: {
+      translation: "V-review", status: "approved", expected_translation: "Translation A",
+    } }]);
+    assert.equal(h.rows.A.translation, "V2");
+    assert.equal(textarea().props.value, "V-review");
+    const draft = useDraftStore.getState().drafts[draftEntryKey(projectKey, "A")];
+    assert.equal(draft.baseline, "Translation A");
+    assert.equal(draft.conflict, true);
+    assert.ok(nodes(render()).some(node => node.props?.role === "alert" && text(node) === t("api.error.translationConflict")));
+    assert.ok(button(t("detail.loadLatest")));
+    assert.ok(button(t("detail.overwrite")));
+    assert.equal(textarea().props["aria-invalid"], true);
+    assert.equal(h.invalidations, 0);
+    await remountReview();
+    assert.equal(textarea().props.value, "V-review");
+    assert.ok(text(render()).includes(t("api.error.translationConflict")));
+    await approve();
+    assert.equal(h.writes.length, 1, "ordinary approval cannot retry a conflicted draft");
+  });
+}
+
+for (const baseline of [null, "", "Translation A"] as const) {
+  test(`unchanged text creates no draft: ${JSON.stringify(baseline)}`, async () => {
+    await startWith([{ ...row("A"), translation: baseline }, row("B")]);
+    edit(baseline ?? "");
+    assert.deepEqual(useDraftStore.getState().drafts, {});
+    assert.deepEqual(useDraftStore.getState().records, []);
+    await approve();
+    assert.deepEqual(useDraftStore.getState().drafts, {});
+    assert.deepEqual(useDraftStore.getState().records, []);
+  });
+}
+
+test("returning an edit to the saved translation retires the unchanged draft", () => {
+  edit("V-review");
+  edit("Translation A");
+  assert.deepEqual(useDraftStore.getState().drafts, {});
+  assert.deepEqual(useDraftStore.getState().records, []);
+});
+
+test("Review shares Editor drafts but never shows another project's row draft", async () => {
+  const key = draftEntryKey(projectKey, "A");
+  const otherProject = { ...project, database_path: "/other.db" };
+  const otherKey = draftEntryKey(draftProjectKey(otherProject), "A");
+  editDraft(otherKey, "Other project draft", "Other baseline");
+  assert.equal(textarea().props.value, "Translation A");
+  editDraft(key, "Editor correction", "Translation A");
+  assert.equal(textarea().props.value, "Editor correction");
+  useProjectStore.getState().setProject(otherProject);
+  render();
+  await settle();
+  assert.equal(textarea().props.value, "Other project draft");
+  useProjectStore.getState().setProject(project);
+  render();
+  await settle();
+  assert.equal(textarea().props.value, "Editor correction");
+});
+
+for (const action of ["loadLatest", "overwrite"] as const) {
+  test(`conflicted draft reuses DetailPanel's ${action} action`, async () => {
+    edit("V-review");
+    h.rows.A = { ...h.rows.A, translation: "V2" };
+    await approve();
+    button(t(`detail.${action}`)).props.onClick();
+    await settle();
+    const key = draftEntryKey(projectKey, "A");
+    assert.equal(useDraftStore.getState().drafts[key], undefined);
+    if (action === "loadLatest") {
+      assert.equal(textarea().props.value, "V2");
+      assert.equal(h.writes.length, 1);
+      await approve();
+      assert.deepEqual(h.writes[1].patch, { status: "approved", expected_translation: "V2" });
+    } else {
+      assert.deepEqual(h.writes[1].patch, { translation: "V-review", status: "approved" });
+      assert.equal(h.rows.A.translation, "V-review");
+    }
+    assert.ok(!text(render()).includes(t("api.error.translationConflict")));
+  });
+}

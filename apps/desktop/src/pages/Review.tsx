@@ -3,7 +3,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, Check, SkipForward, X } from "lucide-react";
-import { getFileStats, getSpeakers, getStrings, patchString, type FileStats, type StringEntry } from "../lib/api";
+import { getFileStats, getSpeakers, getString, getStrings, patchString, type FileStats, type StringEntry } from "../lib/api";
 import { speakerOwner } from "../lib/speakers";
 import { pathBasename } from "../lib/path";
 import { placeholderParts, placeholderCheck } from "../lib/placeholders";
@@ -12,6 +12,7 @@ import DiffView from "../components/DiffView";
 import EmptyState from "../components/EmptyState";
 import { shouldHandleEscape, shouldRunActionHotkey } from "../lib/hotkeyPolicy";
 import { useProjectStore } from "../stores/projectStore";
+import { acknowledgeDraft, draftEntryKey, editDraft, loadLatestDraft, saveDraft, useDraftStore } from "../stores/draftStore";
 import { draftProjectKey, isProjectScopedQueryEnabled } from "../lib/projectScope";
 import { invalidateProjectData } from "../lib/queryClient";
 import { useT } from "../lib/i18n";
@@ -75,7 +76,13 @@ export default function Review() {
   const [queue, setQueue] = useState<ReviewQueueState>(createReviewQueue);
   const [byId, setById] = useState<Record<string, StringEntry>>({});
   const [showDiff, setShowDiff] = useState(false);
-  const [translation, setTranslation] = useState("");
+  const [drafts, setDrafts] = useState(() => useDraftStore.getState().drafts);
+  useEffect(() => {
+    const sync = () => setDrafts(useDraftStore.getState().drafts);
+    const unsubscribe = useDraftStore.subscribe(sync);
+    sync();
+    return unsubscribe;
+  }, []);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [initialLoading, setInitialLoading] = useState(true);
   const [approving, setApproving] = useState(false);
@@ -133,7 +140,6 @@ export default function Review() {
     setQueue(queueRef.current);
     setById({});
     setShowDiff(false);
-    setTranslation("");
     setLoadError(null);
     setInitialLoading(true);
     fetchingRef.current = false;
@@ -242,6 +248,9 @@ export default function Review() {
 
   const entryId = queue.items[queue.index]?.id;
   const entry = entryId ? byId[entryId] : undefined;
+  const draftKey = entry ? draftEntryKey(projectKey, entry.id) : "";
+  const draft = drafts[draftKey];
+  const translation = draft?.text ?? entry?.translation ?? "";
   const progress = reviewProgress(queue);
 
   useEffect(() => {
@@ -292,31 +301,43 @@ export default function Review() {
     return () => { active = false; };
   }, [entry?.id, entry?.file_path, projectPath, databasePath, format]);
 
-  useEffect(() => {
-    if (entry) setTranslation(entry.translation || "");
-  }, [entry?.id]);
-
   const renderedGen = loadGenRef.current;
-  const handleApprove = useCallback(async () => {
+  const handleApprove = useCallback(async (overwrite = false) => {
     if (renderedGen !== loadGenRef.current) return;
     if (approvingRef.current || !projectKey || !isProjectScopedQueryEnabled(projectKey)) return;
     const state = queueRef.current;
     const id = state.items[state.index]?.id;
     const current = id ? byId[id] : undefined;
     if (!current || state.complete) return;
+    const key = draftEntryKey(projectKey, current.id);
+    const currentDraft = useDraftStore.getState().drafts[key];
+    if (currentDraft?.saving || (currentDraft?.conflict && !overwrite)) return;
     approvingRef.current = true;
     setApproving(true);
     const gen = loadGenRef.current;
     try {
-      const patch = reviewApprovalPatch(current, translation);
-      if (patch) {
-        const saved = await patchString(current.id, patch);
+      let saved: StringEntry | undefined;
+      const write = async (text: string, baseline: string | null = current.translation) => {
+        if (!isProjectScopedQueryEnabled(projectKey)) throw new Error(t("detail.projectChanged"));
+        const patch = reviewApprovalPatch(current, text);
+        if (patch) {
+          const { expected_translation: _expected, ...unguarded } = patch;
+          saved = await patchString(current.id, overwrite ? unguarded : { ...patch, expected_translation: baseline });
+        }
         // Defer reads until Editor remounts; never refetch a different open database.
         void invalidateProjectData(qc, projectKey, "none");
-        if (gen !== loadGenRef.current || !isProjectScopedQueryEnabled(projectKey)) return;
-        setById((prev) => ({ ...prev, [current.id]: saved }));
+      };
+      if (currentDraft) {
+        if (!(await saveDraft(key, current.translation ?? "", write, overwrite, true))) return;
+        acknowledgeDraft(key, (saved ?? current).translation ?? "");
       } else {
-        void invalidateProjectData(qc, projectKey, "none");
+        // A status-only approval must not manufacture an unchanged text draft.
+        await write(current.translation ?? "");
+      }
+      if (gen !== loadGenRef.current || !isProjectScopedQueryEnabled(projectKey)) return;
+      if (saved) {
+        const approved = saved;
+        setById((prev) => ({ ...prev, [current.id]: approved }));
       }
       setLoadError(null);
       const next = approveCurrent(queueRef.current, current.id);
@@ -330,7 +351,26 @@ export default function Review() {
       approvingRef.current = false;
       setApproving(false);
     }
-  }, [byId, translation, qc, projectKey, renderedGen]);
+  }, [byId, qc, projectKey, renderedGen, t]);
+
+  const handleLoadLatest = useCallback(async () => {
+    if (!entry || approvingRef.current || !isProjectScopedQueryEnabled(projectKey)) return;
+    const gen = loadGenRef.current;
+    await loadLatestDraft(draftKey, async () => {
+      if (!isProjectScopedQueryEnabled(projectKey)) throw new Error(t("detail.projectChanged"));
+      const latest = await getString(entry.id);
+      if (!isProjectScopedQueryEnabled(projectKey)) throw new Error(t("detail.projectChanged"));
+      if (gen === loadGenRef.current) {
+        setById(previous => ({ ...previous, [latest.id]: latest }));
+        setLoadError(null);
+      }
+      return latest.translation;
+    });
+    if (gen === loadGenRef.current && isProjectScopedQueryEnabled(projectKey)) {
+      const latest = useDraftStore.getState().drafts[draftKey];
+      if (latest && !latest.conflict && !latest.error) acknowledgeDraft(draftKey, latest.baseline ?? "");
+    }
+  }, [draftKey, entry, projectKey, t]);
 
   const handleSkip = useCallback(() => {
     if (approvingRef.current) return;
@@ -542,12 +582,27 @@ export default function Review() {
                 <textarea
                   id="review-textarea"
                   value={translation}
-                  disabled={approving}
-                  onChange={(e) => setTranslation(e.target.value)}
+                  disabled={approving || draft?.saving}
+                  onChange={(e) => {
+                    const text = e.target.value;
+                    if (!draft && text === (entry.translation ?? "")) return;
+                    editDraft(draftKey, text, entry.translation);
+                    if (text === (entry.translation ?? "")) acknowledgeDraft(draftKey, text);
+                  }}
                   aria-label={t("review.translation")}
+                  aria-invalid={!!draft?.error || !!draft?.conflict}
+                  aria-describedby={draft?.conflict ? "review-draft-conflict" : draft?.error ? "review-draft-error" : undefined}
                   className="w-full p-3 border border-border rounded bg-surface text-body leading-relaxed focus:outline-none focus:ring-2 focus:ring-accent-fg resize-y min-h-[100px]"
                   rows={4}
                 />
+                {draft?.error && <p id="review-draft-error" role="alert" className="text-caption text-danger break-words">{draft.error}</p>}
+                {draft?.conflict && <div className="text-caption">
+                  <p id="review-draft-conflict" role="alert" className="text-danger">{t("api.error.translationConflict")}</p>
+                  <div className="flex gap-3">
+                    <button type="button" disabled={approving || draft.saving} onClick={() => { void handleLoadLatest(); }} className="underline">{t("detail.loadLatest")}</button>
+                    <button type="button" disabled={approving || draft.saving} onClick={() => { void handleApprove(true); }} className="underline">{t("detail.overwrite")}</button>
+                  </div>
+                </div>}
                 <p role="status" className={`mt-2 text-caption break-words ${placeholdersValid ? "text-success" : "text-warning"}`}>
                   {placeholdersValid
                     ? t("review.placeholdersPresent", { present: check.present, total: sourceTokens.length })
@@ -598,7 +653,7 @@ export default function Review() {
           className="flex items-center gap-1.5 px-4 py-2 bg-surface-muted hover:bg-surface rounded text-body font-medium disabled:opacity-50">
           <SkipForward size={16} /> {t("review.skip")} <kbd className="text-caption text-text-muted ml-1">S</kbd>
         </button>
-        <button onClick={() => { void handleApprove(); }} disabled={approving}
+        <button onClick={() => { void handleApprove(); }} disabled={approving || !!draft?.saving || !!draft?.conflict}
           className="flex items-center gap-1.5 px-6 py-2 bg-accent hover:bg-accent-hover text-white rounded text-body font-medium disabled:opacity-50">
           <Check size={16} /> {t("review.approve")} <kbd className="text-caption text-white/70 ml-1">A</kbd>
         </button>
