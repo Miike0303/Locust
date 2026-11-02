@@ -63,7 +63,7 @@ fn game_fixture(kind: &str) -> tempfile::TempDir {
 fn select_ui_translations(entries: &mut [StringEntry]) {
     for entry in entries {
         entry.translation = match entry.source.as_str() {
-            "Back" => Some("Retour \"principal\" \\ menu\nSuite".to_string()),
+            "Back" => Some("Retour \"principal\" \\\\ menu\nSuite".to_string()),
             "Options" => Some("选项".to_string()),
             _ => None,
         };
@@ -130,7 +130,7 @@ fn rpa_ui_injection_matches_loose_and_replaces_only_the_selected_literal() {
 fn assert_replace_preserves_script_bytes(endings: &[&str], archived: bool) {
     let selected = "\ttextbutton \"Back\" action Return(\"Back\")  # keep \"Back\"  ";
     let translated = r#"	textbutton "Retour \"principal\" \\ menu\nSuite\r\t选项" action Return("Back")  # keep "Back"  "#;
-    let translation = "Retour \"principal\" \\ menu\nSuite\r\t选项";
+    let translation = "Retour \"principal\" \\\\ menu\nSuite\r\t选项";
 
     // Start with the real audit's shape: a terminating newline plus a blank
     // line. Also cover an unterminated final line and whitespace-only tails.
@@ -299,4 +299,160 @@ fn rpa_ui_injection_rejects_a_stale_physical_source() {
         !root.join("game/screens.rpy").exists(),
         "a stale source must not produce an override file"
     );
+}
+
+// Expected spellings are independent raw literals. The source and row IDs stay
+// in the extractor's representation, including when an archive creates a loose
+// override and the next injection reads that override.
+fn assert_replace_literal_round_trip(
+    archived: bool,
+    triple_quoted: bool,
+    cases: &[(&str, &str, &str)],
+) {
+    for &(source, translation, encoded) in cases {
+        let script_with = |text: &str| {
+            if triple_quoted {
+                format!("define greeting = _p(\"\"\"{text}\"\"\") # keep\n")
+            } else {
+                format!("label start:\n    e \"{text}\" # keep\n")
+            }
+        };
+        let script = script_with(source);
+        let expected = script_with(encoded);
+        let root = game_fixture("raw_escapes");
+        let loose_path = root.path().join("game/script.rpy");
+        let archive_path = root.path().join("game/scripts.rpa");
+        let archive = build_rpa("script.rpy", script.as_bytes());
+        if archived {
+            fs::write(&archive_path, &archive).unwrap();
+        } else {
+            fs::write(&loose_path, &script).unwrap();
+        }
+
+        let plugin = RenPyPlugin::new();
+        let mut entries = plugin.extract(root.path()).unwrap();
+        assert_eq!(entries.len(), 1, "{script:?}");
+        assert_eq!(entries[0].source, source);
+        let row_id = format!("script.rpy#{}", if triple_quoted { 1 } else { 2 });
+        assert_eq!(entries[0].id, row_id);
+        entries[0].translation = Some(translation.to_string());
+        let report = plugin.inject(root.path(), &entries).unwrap();
+        assert_eq!(report.strings_written, 1, "{translation:?}");
+        assert_eq!(report.files_modified, 1);
+        assert_eq!(fs::read(&loose_path).unwrap(), expected.as_bytes());
+        assert_eq!(entries[0].source, source, "stored source must not mutate");
+        assert_eq!(entries[0].id, row_id, "stored row ID must not mutate");
+
+        let mut fresh = plugin.extract(&loose_path).unwrap();
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].source, encoded);
+        if translation == encoded {
+            assert_eq!(fresh[0].source, translation, "raw spelling round trip");
+        }
+        // Retrying the original rows must be harmless. Then actually replace
+        // the freshly extracted literal again, even for normalized UI input.
+        let retry = plugin.inject(root.path(), &entries).unwrap();
+        assert_eq!(retry.strings_written, usize::from(archived));
+        assert_eq!(fs::read(&loose_path).unwrap(), expected.as_bytes());
+        fresh[0].translation = Some(translation.to_string());
+        let repeat = plugin.inject(root.path(), &fresh).unwrap();
+        assert_eq!(repeat.strings_written, usize::from(translation != encoded));
+        assert_eq!(fs::read(&loose_path).unwrap(), expected.as_bytes());
+        assert_eq!(plugin.extract(&loose_path).unwrap()[0].source, encoded);
+        if archived {
+            assert_eq!(fs::read(&archive_path).unwrap(), archive);
+        }
+    }
+}
+
+fn raw_escape_cases() -> &'static [(&'static str, &'static str, &'static str)] {
+    &[
+        (r"Hello\nworld", r"Hola\nmundo", r"Hola\nmundo"),
+        (r#"Say \"hello\""#, r#"Dijo \"hola\""#, r#"Dijo \"hola\""#),
+        (r"Path \\ files", r"Ruta \\ archivos", r"Ruta \\ archivos"),
+        (
+            r"Tabs\treturns\r",
+            r"Tab\tretorno\rfin",
+            r"Tab\tretorno\rfin",
+        ),
+        (
+            "Tags and interpolation",
+            r"\{ \[ \% {b}Hola{/b} [name] 50% \u0041 \q \ ",
+            r"\{ \[ \% {b}Hola{/b} [name] 50% \u0041 \q \ ",
+        ),
+        ("Trailing pair", r"Final\\", r"Final\\"),
+        (
+            "Escaped quote",
+            r#"Dijo \\\"hola\\\""#,
+            r#"Dijo \\\"hola\\\""#,
+        ),
+    ]
+}
+
+#[test]
+fn loose_replace_preserves_raw_escape_spelling() {
+    assert_replace_literal_round_trip(false, false, raw_escape_cases());
+}
+
+#[test]
+fn rpa_replace_preserves_raw_escape_spelling() {
+    assert_replace_literal_round_trip(true, false, raw_escape_cases());
+}
+
+fn unsafe_literal_cases() -> &'static [(&'static str, &'static str, &'static str)] {
+    &[
+        (
+            "Hello",
+            "Dijo \"hola\"\nContinúa\r\tfin",
+            r#"Dijo \"hola\"\nContinúa\r\tfin"#,
+        ),
+        ("Even slashes", r#"Par \\"hola""#, r#"Par \\\"hola\""#),
+        ("Odd trailing slash", "Final\\", r"Final\\"),
+        ("Three trailing slashes", r"Final\\\", r"Final\\\\"),
+        (
+            "Slash before controls",
+            "Barra\\\n\\\r\\\tfin",
+            r"Barra\\\n\\\r\\\tfin",
+        ),
+    ]
+}
+
+#[test]
+fn loose_replace_encodes_unsafe_literal_characters() {
+    assert_replace_literal_round_trip(false, false, unsafe_literal_cases());
+}
+
+#[test]
+fn rpa_replace_encodes_unsafe_literal_characters() {
+    assert_replace_literal_round_trip(true, false, unsafe_literal_cases());
+}
+
+fn triple_quoted_cases() -> &'static [(&'static str, &'static str, &'static str)] {
+    &[
+        (r"Hello\nworld", r"Hola\nmundo", r"Hola\nmundo"),
+        (
+            "Triple quoted greeting",
+            r#"Hola "mundo" y \"amiga\" \\ \n {b}[name]{/b} 50%"#,
+            r#"Hola "mundo" y \"amiga\" \\ \n {b}[name]{/b} 50%"#,
+        ),
+        (
+            "Triple delimiter",
+            r#"Antes """ después"#,
+            r#"Antes ""\" después"#,
+        ),
+        ("One trailing quote", r#"Final ""#, r#"Final \""#),
+        ("Two trailing quotes", r#"Final """#, r#"Final "\""#),
+        ("Trailing slash", "Final\\", r"Final\\"),
+        ("Real controls", "Hola\nmundo\r\tfin", r"Hola\nmundo\r\tfin"),
+    ]
+}
+
+#[test]
+fn loose_replace_preserves_triple_quoted_escape_spelling() {
+    assert_replace_literal_round_trip(false, true, triple_quoted_cases());
+}
+
+#[test]
+fn rpa_replace_preserves_triple_quoted_escape_spelling() {
+    assert_replace_literal_round_trip(true, true, triple_quoted_cases());
 }

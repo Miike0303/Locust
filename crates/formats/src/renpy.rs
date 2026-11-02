@@ -1896,12 +1896,38 @@ fn extracted_literal_on_line<'a>(line: &'a str, expected: &str) -> Option<&'a st
         .or_else(|| matches_expected(extract_say_statement(trimmed).map(|(_, text)| text)))
 }
 
-fn escape_renpy_double_quoted(s: &str) -> String {
+/// Translations use the same raw escape spelling as extracted source literals.
+/// Preserve escape pairs; only encode controls and protect the actual delimiter.
+fn escape_renpy_literal(s: &str, triple_quoted: bool) -> String {
     let mut escaped = String::with_capacity(s.len() + 8);
-    for ch in s.chars() {
+    let mut chars = s.chars().peekable();
+    let mut quote_run = 0;
+    while let Some(ch) = chars.next() {
+        if ch != '"' {
+            quote_run = 0;
+        }
         match ch {
-            '\\' => escaped.push_str("\\\\"),
-            '"' => escaped.push_str("\\\""),
+            '\\' => {
+                escaped.push('\\');
+                if let Some(next) = chars.next_if(|next| !matches!(*next, '\n' | '\r' | '\t')) {
+                    escaped.push(next);
+                } else {
+                    // An odd final slash must not escape the closing quote.
+                    // Before a real control, pair it before encoding the control.
+                    escaped.push('\\');
+                }
+            }
+            '"' => {
+                // _p("""...""") admits isolated quotes, but a run of three or
+                // a final quote could terminate or overlap the closing delimiter.
+                if !triple_quoted || quote_run == 2 || chars.peek().is_none() {
+                    escaped.push('\\');
+                    quote_run = 0;
+                } else {
+                    quote_run += 1;
+                }
+                escaped.push('"');
+            }
             '\n' => escaped.push_str("\\n"),
             '\r' => escaped.push_str("\\r"),
             '\t' => escaped.push_str("\\t"),
@@ -1917,7 +1943,11 @@ fn replace_extracted_literal(line: &str, source: &str, translation: &str) -> Opt
     let start = literal.as_ptr() as usize - line.as_ptr() as usize;
     let end = start.checked_add(literal.len())?;
     let mut replaced = line.to_string();
-    replaced.replace_range(start..end, &escape_renpy_double_quoted(translation));
+    let triple_quoted = line[..start].ends_with("\"\"\"");
+    replaced.replace_range(
+        start..end,
+        &escape_renpy_literal(translation, triple_quoted),
+    );
     Some(replaced)
 }
 
