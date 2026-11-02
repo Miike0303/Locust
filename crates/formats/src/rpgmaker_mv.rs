@@ -141,21 +141,30 @@ fn has_plugin_display_text(text: &str) -> bool {
     true
 }
 
-/// Extract the body of D_TEXT, or the full command for other known display
-/// plugins with literal text. Technical/audio/system commands are skipped.
+/// Split the non-D_TEXT display commands into dispatcher, original prefix
+/// (including separator whitespace), and body. D_TEXT has its own size grammar.
+fn parse_mv_display_command(command: &str) -> Option<(&str, &str, &str)> {
+    let (dispatcher, rest) = command.trim_start().split_once(char::is_whitespace)?;
+    if dispatcher == "D_TEXT" || !TEXT_DISPLAY_PLUGINS.contains(&dispatcher) {
+        return None;
+    }
+    let body = rest.trim_start();
+    let prefix = &command[..command.len() - body.len()];
+    Some((dispatcher, prefix, body.trim_end()))
+}
+
+/// Extract only the body of known display plugins with literal text.
+/// Technical/audio/system commands are skipped.
 fn extract_plugin_command_text(command: &str) -> Option<String> {
     if command.split_whitespace().next() == Some("D_TEXT") {
         return parse_d_text_command(command)
             .filter(|(body, _)| has_plugin_display_text(body))
             .map(|(body, _)| body.to_string());
     }
-    let trimmed = command.trim();
-    let (dispatcher, body) = trimmed.split_once(char::is_whitespace)?;
     // Check the body alone: a dispatcher is alphabetic even with no visible text.
-    if TEXT_DISPLAY_PLUGINS.contains(&dispatcher) && has_plugin_display_text(body) {
-        return Some(trimmed.to_string());
-    }
-    None
+    parse_mv_display_command(command)
+        .filter(|(_, _, body)| has_plugin_display_text(body))
+        .map(|(_, _, body)| body.to_string())
 }
 
 /// Extract translatable strings from an MZ plugin command (code 357).
@@ -1139,6 +1148,16 @@ impl RpgMakerMvPlugin {
                 Some(size) => format!("D_TEXT {translation} {size}"),
                 None => format!("D_TEXT {translation}"),
             }
+        } else if let Some((dispatcher, prefix, _)) =
+            first.as_str().and_then(parse_mv_display_command)
+        {
+            // Older projects may retain translations containing the dispatcher.
+            let body = translation
+                .strip_prefix(dispatcher)
+                .filter(|rest| rest.starts_with(char::is_whitespace))
+                .map(str::trim_start)
+                .unwrap_or(translation);
+            format!("{prefix}{body}")
         } else {
             translation.to_string()
         };
@@ -3199,25 +3218,186 @@ mod tests {
     }
 
     #[test]
-    fn test_mv_plugin_non_d_text_behavior_is_unchanged() {
+    fn test_mv_plugin_display_body_preserves_numeric_text() {
         for filename in ["Map001.json", "CommonEvents.json", "Troops.json"] {
-            for command in ["SHOW_TEXT テスト 32", "T_TEXT テスト", "GN_TEXT テスト"] {
+            for dispatcher in ["SHOW_TEXT", "T_TEXT", "GN_TEXT"] {
                 assert_mv_plugin_roundtrip(
                     filename,
-                    command,
-                    command,
-                    "SHOW_TEXT Prueba 32",
-                    "SHOW_TEXT Prueba 32",
+                    &format!("{dispatcher} テスト 32"),
+                    "テスト 32",
+                    "Prueba 32",
+                    &format!("{dispatcher} Prueba 32"),
                     &["plugin_cmd"],
                 );
             }
         }
-        assert_eq!(
-            extract_plugin_command_text("SHOW_TEXT Hello"),
-            Some("SHOW_TEXT Hello".into())
-        );
-        assert_eq!(extract_plugin_command_text("D_TEXT_OTHER テスト 32"), None);
-        assert_eq!(extract_plugin_command_text("PLAY_SOUND テスト"), None);
+    }
+
+    fn assert_mv_display_dispatcher_roundtrips(filename: &str) {
+        for dispatcher in ["SHOW_TEXT", "T_TEXT", "GN_TEXT"] {
+            for separator in [" ", "  ", "\t", " \t ", "\u{3000}"] {
+                assert_mv_plugin_roundtrip(
+                    filename,
+                    &format!("{dispatcher}{separator}Hello traveler"),
+                    "Hello traveler",
+                    "Hola viajero",
+                    &format!("{dispatcher}{separator}Hola viajero"),
+                    &["plugin_cmd"],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_mv_display_dispatchers_map_roundtrip() {
+        assert_mv_display_dispatcher_roundtrips("Map001.json");
+    }
+
+    #[test]
+    fn test_mv_display_dispatchers_common_event_roundtrip() {
+        assert_mv_display_dispatcher_roundtrips("CommonEvents.json");
+    }
+
+    #[test]
+    fn test_mv_display_dispatchers_troop_roundtrip() {
+        assert_mv_display_dispatcher_roundtrips("Troops.json");
+    }
+
+    #[test]
+    fn test_mv_display_dispatchers_writers_keep_prefix() {
+        for filename in ["Map001.json", "CommonEvents.json", "Troops.json"] {
+            for dispatcher in ["SHOW_TEXT", "T_TEXT", "GN_TEXT"] {
+                for prefix in [format!("{dispatcher} "), format!("  {dispatcher} \t ")] {
+                    let (mut json, id) =
+                        mv_plugin_fixture(filename, &format!("{prefix}Hello traveler"));
+                    let mut expected = json.clone();
+                    mv_plugin_command_mut(filename, &mut expected)["parameters"][0] =
+                        serde_json::json!(format!("{prefix}Hola viajero"));
+                    RpgMakerMvPlugin::apply_translation(&mut json, filename, &id, "Hola viajero");
+                    assert_eq!(json, expected, "{filename}: {prefix:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_mv_display_dispatchers_legacy_translation_roundtrip() {
+        for filename in ["Map001.json", "CommonEvents.json", "Troops.json"] {
+            for dispatcher in ["SHOW_TEXT", "T_TEXT", "GN_TEXT"] {
+                for separator in [" ", " \t "] {
+                    for legacy_separator in [" ", "\t", " \t "] {
+                        let game = tempfile::tempdir().unwrap();
+                        let file = game.path().join(filename);
+                        let (original, id) = mv_plugin_fixture(
+                            filename,
+                            &format!("{dispatcher}{separator}Hello traveler"),
+                        );
+                        fs::write(&file, serde_json::to_vec(&original).unwrap()).unwrap();
+                        let plugin = RpgMakerMvPlugin::new();
+                        // A project merge refreshes the source but retains this old translation.
+                        let mut entries: Vec<_> = plugin
+                            .extract(&file)
+                            .unwrap()
+                            .into_iter()
+                            .filter(|e| e.id == id)
+                            .collect();
+                        let row = entries.iter_mut().find(|e| e.id == id).unwrap();
+                        row.translation =
+                            Some(format!("{dispatcher}{legacy_separator}Hola viajero"));
+                        let report = plugin.inject(&file, &entries).unwrap();
+                        assert_eq!(report.strings_written, 1);
+                        assert_eq!(report.strings_skipped, 0);
+                        let written: serde_json::Value =
+                            serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+                        let mut expected = original;
+                        mv_plugin_command_mut(filename, &mut expected)["parameters"][0] =
+                            serde_json::json!(format!("{dispatcher}{separator}Hola viajero"));
+                        assert_eq!(written, expected);
+                        let again = plugin.extract(&file).unwrap();
+                        assert_eq!(
+                            again.iter().find(|e| e.id == id).unwrap().source,
+                            "Hola viajero"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_mv_display_dispatchers_unrefreshed_legacy_source_is_skipped() {
+        for filename in ["Map001.json", "CommonEvents.json", "Troops.json"] {
+            for dispatcher in ["SHOW_TEXT", "T_TEXT", "GN_TEXT"] {
+                let game = tempfile::tempdir().unwrap();
+                let file = game.path().join(filename);
+                let command = format!("{dispatcher} Hello traveler");
+                let (original, id) = mv_plugin_fixture(filename, &command);
+                let bytes = serde_json::to_vec(&original).unwrap();
+                fs::write(&file, &bytes).unwrap();
+                let mut legacy = StringEntry::new(&id, &command, file.clone());
+                legacy.tags = vec!["plugin_cmd".into()];
+                legacy.translation = Some(format!("{dispatcher} Hola viajero"));
+                let report = RpgMakerMvPlugin::new().inject(&file, &[legacy]).unwrap();
+                assert_eq!(report.strings_written, 0);
+                assert_eq!(report.skip_reasons.get("source_changed"), Some(&1));
+                assert_eq!(fs::read(&file).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn test_mv_display_dispatchers_only_strip_own_legacy_token() {
+        for filename in ["Map001.json", "CommonEvents.json", "Troops.json"] {
+            for dispatcher in ["SHOW_TEXT", "T_TEXT", "GN_TEXT"] {
+                let other = if dispatcher == "SHOW_TEXT" {
+                    "T_TEXT"
+                } else {
+                    "SHOW_TEXT"
+                };
+                for translation in [
+                    dispatcher.to_string(),
+                    format!("{dispatcher}_EXTRA Hola viajero"),
+                    format!("{other} Hola viajero"),
+                    format!("{} Hola viajero", dispatcher.to_ascii_lowercase()),
+                    "D_TEXT Hola viajero".to_string(),
+                ] {
+                    let (mut json, id) =
+                        mv_plugin_fixture(filename, &format!("{dispatcher}\tHello traveler"));
+                    let mut expected = json.clone();
+                    mv_plugin_command_mut(filename, &mut expected)["parameters"][0] =
+                        serde_json::json!(format!("{dispatcher}\t{translation}"));
+                    RpgMakerMvPlugin::apply_translation(&mut json, filename, &id, &translation);
+                    assert_eq!(json, expected, "{filename}: {translation:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_mv_display_dispatchers_unknown_commands_are_excluded() {
+        for filename in ["Map001.json", "CommonEvents.json", "Troops.json"] {
+            for dispatcher in [
+                "SHOW_TEXT_SETTINGS",
+                "D_TEXT_OTHER",
+                "PLAY_SOUND",
+                "show_text",
+            ] {
+                let game = tempfile::tempdir().unwrap();
+                let file = game.path().join(filename);
+                let (original, id) =
+                    mv_plugin_fixture(filename, &format!("{dispatcher} Hello traveler"));
+                let bytes = serde_json::to_vec(&original).unwrap();
+                fs::write(&file, &bytes).unwrap();
+                let plugin = RpgMakerMvPlugin::new();
+                let entries = plugin.extract(&file).unwrap();
+                assert!(
+                    !entries.iter().any(|e| e.id == id),
+                    "{filename}: {dispatcher}"
+                );
+                assert_eq!(plugin.inject(&file, &entries).unwrap().files_modified, 0);
+                assert_eq!(fs::read(&file).unwrap(), bytes);
+            }
+        }
     }
 
     #[test]
@@ -3298,14 +3478,14 @@ mod tests {
     fn test_cycle104_mv_latin_display_roundtrip() {
         for filename in ["Map001.json", "CommonEvents.json", "Troops.json"] {
             for dispatcher in ["SHOW_TEXT", "T_TEXT", "GN_TEXT"] {
-                let source = format!("{dispatcher} Meet Jade at the market.");
-                let translation = format!("{dispatcher} Encuentra a Jade en el mercado.");
+                let command = format!("{dispatcher} Meet Jade at the market.");
+                let translation = "Encuentra a Jade en el mercado.";
                 assert_mv_plugin_roundtrip(
                     filename,
-                    &source,
-                    &source,
-                    &translation,
-                    &translation,
+                    &command,
+                    "Meet Jade at the market.",
+                    translation,
+                    &format!("{dispatcher} {translation}"),
                     &["plugin_cmd"],
                 );
             }
@@ -3414,7 +3594,7 @@ mod tests {
             );
             for dispatcher in ["SHOW_TEXT", "T_TEXT", "GN_TEXT"] {
                 let command = format!("{dispatcher} {text}");
-                assert_eq!(extract_plugin_command_text(&command), Some(command.clone()));
+                assert_eq!(extract_plugin_command_text(&command), Some(text.into()));
             }
             assert_eq!(
                 extract_plugin_command_text(&format!("D_TEXT {text} 32")),
