@@ -76,6 +76,7 @@ export function FastWorkflowView({ receipt, isRunning, cancelRequested = false, 
 						<span className="text-caption text-text-muted">{t(`fastWorkflow.stageStatus.${stage.status}` as MessageKey)}</span>
 					</div>
 					{stage.error && <p className="mt-1 text-caption text-danger break-words">{displayError(stage.error, t)}</p>}
+					{stage.reason && stage.status !== "done" && <p data-reason={stage.reason} className="mt-1 text-caption text-text-muted">{displayError(stage.reason, t)}</p>}
 					{stage.id === "validate" && stage.status === "done" && (stage.result?.validationIssues ?? 0) > 0 && <p className="mt-1 text-caption text-warning">{t("fastWorkflow.validationAdvisory", { count: stage.result!.validationIssues! })}</p>}
 				</div>
 			</li>)}

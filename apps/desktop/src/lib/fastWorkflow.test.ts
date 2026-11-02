@@ -4,7 +4,7 @@ import { after, test } from "node:test";
 import { createElement, useEffect, useRef, useState } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import type { ProjectInfo } from "./api";
+import type { ProjectInfo, StringsResponse } from "./api";
 import type { StringStorage } from "./storage";
 import {
   FAST_WORKFLOW_STAGES,
@@ -484,7 +484,7 @@ const hooks = registerHooks({
       };
     }
     if (context.parentURL?.replace(/\\/g, "/").endsWith("/stores/fastWorkflowStore.ts")) {
-      const apiNames = ["cancelTranslation", "getInjectionStatus", "getPatchRecordings", "getStats", "inject", "openProjectDb", "patchPack", "patchStatus", "patchVerify", "runPivot", "startTranslation", "validate"];
+      const apiNames = ["cancelTranslation", "getCurrentProject", "getStrings", "getTranslationRuns", "getInjectionStatus", "getPatchRecordings", "getStats", "inject", "openProjectDb", "patchPack", "patchStatus", "patchVerify", "runPivot", "startTranslation", "validate"];
       const stubs: Record<string, string> = {
         "../lib/api": apiNames.map(name => `export const ${name}=(...args)=>h.rpc('${name}',args);`).join("\n") + "\nexport const validationKindLabel=kind=>typeof kind==='string'?kind:Object.keys(kind)[0];",
         "../lib/ws": "export function subscribeToJob(jobId,handlers){h.subscriptions.push({jobId,handlers});return()=>{h.unsubscribed++;};}",
@@ -661,6 +661,16 @@ function resetTransport() {
   transport.projectState.setProject(project);
   transport.responses = {
     startTranslation: { job_id: "transport-job" }, cancelTranslation: undefined,
+    getCurrentProject: () => clone(transport.projectState.project),
+    getStrings: ({ offset = 0 }: { offset?: number }) => ({
+      entries: Array.from({ length: 4 }, (_, i) => ({
+        id: `row-${i}`, source: `Source ${i}`, translation: `Translation ${i}`,
+        status: "translated", file_path: "script.rpy", context: null, tags: [], metadata: {},
+        char_limit: null, provider_used: "google", created_at: "2026-01-01T00:00:00Z",
+        translated_at: "2026-01-02T00:00:00Z", reviewed_at: null,
+      })).slice(offset, offset + 2), total: 4, offset, limit: 2,
+    }),
+    getTranslationRuns: [],
     getStats: { total: 4, pending: 0, error: 0, translated: 4, reviewed: 0, approved: 0, total_cost_usd: 0 },
     runPivot: { database_path: options.pivotOutputPath, entries: 4 },
     openProjectDb: {
@@ -722,6 +732,179 @@ async function waitForSubscription() {
   assert.equal(transport.subscriptions.length, 1, "translation subscribes after starting its job");
   return transport.subscriptions[0];
 }
+
+async function pauseAfterValidation(englishPivot = false) {
+  const receipt = englishPivot ? completedPrefix("translateTarget") : fresh({ englishPivot: false });
+  const translation = englishPivot ? "translateTarget" : "translate";
+  stage(receipt, translation).result = { jobId: "finished-job", providerCompleted: true };
+  const controller = new AbortController();
+  const { result } = await run(receipt, fastWorkflowAdapter, {
+    controller,
+    onChange(value) { if (stage(value, "validate").status === "done") controller.abort(); },
+  });
+  assert.equal(result.status, "cancelled");
+  assert.equal(stage(result, "validate").status, "done");
+  assert.equal(stage(result, "inject").startedAt, undefined);
+  return parseFastWorkflowReceipt(JSON.stringify(result))!;
+}
+
+for (const englishPivot of [false, true]) {
+  test(`resume invalidates old validation after a same-count DB row edit (${englishPivot ? "pivot" : "direct"})`, async () => {
+    resetTransport();
+    const receipt = await pauseAfterValidation(englishPivot);
+    const rows = transport.responses.getStrings as Rpc;
+    transport.responses.getStrings = (filter: unknown) => {
+      const page = rows(filter) as StringsResponse;
+      // Edit the last row, retaining status, timestamps and aggregate stats.
+      for (const row of page.entries) if (row.id === "row-3") row.translation = "Edited {missing}";
+      return page;
+    };
+    transport.responses.validate = { validation: { issues_found: 1, by_kind: { MissingPlaceholder: 1 }, issues: [] }, fonts: [] };
+    transport.calls = [];
+    const { result, snapshots } = await run(receipt, fastWorkflowAdapter);
+    assert.equal(result.error, "fastWorkflow.validationFailed");
+    assert.ok(snapshots.some(r => stage(r, "validate").status === "pending" && stage(r, "validate").reason === "fastWorkflow.contentChanged"));
+    assert.equal(stage(result, "inject").status, "pending");
+    assert.equal(stage(result, "pack").status, "pending");
+    assert.ok(!transport.calls.some(([name]) => ["inject", "patchPack", "startTranslation"].includes(name)));
+  });
+}
+
+test("resume invalidates validation and blocks a replaced database even when the UI still has its old identity", async () => {
+  resetTransport();
+  const receipt = await pauseAfterValidation();
+  transport.responses.getCurrentProject = { ...project, database_path: "C:/projects/re-extracted.db" };
+  transport.calls = [];
+  const { result } = await run(receipt, fastWorkflowAdapter);
+  assert.equal(result.error, "fastWorkflow.projectChanged");
+  assert.equal(stage(result, "validate").status, "pending");
+  assert.equal(stage(result, "validate").reason, "fastWorkflow.contentChanged");
+  assert.ok(!transport.calls.some(([name]) => ["validate", "inject", "patchPack", "startTranslation"].includes(name)));
+});
+
+test("resume invalidates validation after an outside translate job even with identical rows and stats", async () => {
+  resetTransport();
+  const receipt = await pauseAfterValidation();
+  transport.responses.getTranslationRuns = [{ id: 42, started_at: "2026-11-01T00:00:00Z", provider: "deepl", source_lang: "ja", target_lang: "es", strings_translated: 4 }];
+  transport.responses.validate = { validation: { issues_found: 1, by_kind: { MissingPlaceholder: 1 }, issues: [] }, fonts: [] };
+  transport.calls = [];
+  const { result, snapshots } = await run(receipt, fastWorkflowAdapter);
+  assert.equal(result.error, "fastWorkflow.validationFailed");
+  assert.ok(snapshots.some(r => stage(r, "validate").status === "pending" && stage(r, "validate").reason === "fastWorkflow.contentChanged"));
+  assert.ok(!transport.calls.some(([name]) => ["inject", "patchPack", "startTranslation"].includes(name)));
+});
+
+for (const englishPivot of [false, true]) {
+  test(`unchanged resume retains completed translation and validation receipts (${englishPivot ? "pivot" : "direct"})`, async () => {
+    resetTransport();
+    const receipt = await pauseAfterValidation(englishPivot);
+    const translation = englishPivot ? "translateTarget" : "translate";
+    assert.ok(stage(receipt, translation).result?.contentRevision);
+    assert.ok(stage(receipt, "validate").result?.contentRevision);
+    transport.calls = [];
+    const { result } = await run(receipt, fastWorkflowAdapter);
+    assert.equal(result.status, "completed");
+    for (const id of [translation, "validate"] as const) assert.deepEqual(stage(result, id), stage(receipt, id));
+    assert.ok(!transport.calls.some(([name]) => ["validate", "startTranslation"].includes(name)));
+  });
+}
+
+test("legacy validation without a content revision must run again before injecting", async () => {
+  resetTransport();
+  const receipt = directReceipt("inject");
+  const { result } = await run(receipt, fastWorkflowAdapter);
+  assert.equal(result.status, "completed");
+  const validation = transport.calls.findIndex(([name]) => name === "validate");
+  assert.ok(validation >= 0 && validation < transport.calls.findIndex(([name]) => name === "inject"));
+  assert.equal(stage(result, "validate").reason, "fastWorkflow.contentChanged");
+});
+
+test("revision read failure blocks resumed writes while retaining prior evidence", async () => {
+  resetTransport();
+  const receipt = await pauseAfterValidation();
+  transport.responses.getStrings = () => { throw new Error("revision unavailable"); };
+  transport.calls = [];
+  const { result } = await run(receipt, fastWorkflowAdapter);
+  assert.equal(result.status, "failed");
+  assert.equal(result.error, "revision unavailable");
+  assert.deepEqual(stage(result, "validate"), stage(receipt, "validate"));
+  assert.ok(!transport.calls.some(([name]) => ["inject", "patchPack"].includes(name)));
+});
+
+test("an undispatched inject preflight revalidates changed content and retains its reconciliation evidence", async () => {
+  resetTransport();
+  const receipt = await pauseAfterValidation();
+  Object.assign(stage(receipt, "inject"), { status: "failed", startedAt: 200, result: { writeStarted: false, injectionIds: ["baseline"] } });
+  const stats = transport.responses.getStats as any;
+  transport.responses.getStats = { ...stats, approved: 1, translated: 3 };
+  transport.responses.validate = { validation: { issues_found: 1, by_kind: { MissingPlaceholder: 1 }, issues: [] }, fonts: [] };
+  transport.calls = [];
+  const { result } = await run(receipt, fastWorkflowAdapter);
+  assert.equal(result.error, "fastWorkflow.validationFailed");
+  assert.equal(stage(result, "inject").status, "pending");
+  assert.equal(stage(result, "inject").startedAt, 200);
+  assert.deepEqual(stage(result, "inject").result, stage(receipt, "inject").result);
+  assert.ok(hasUncertainWorkflowWrite(result));
+  assert.ok(parseFastWorkflowReceipt(JSON.stringify(result)));
+  assert.ok(!transport.calls.some(([name]) => ["inject", "patchPack"].includes(name)));
+});
+
+for (const id of ["inject", "pack"] as const) {
+  test(`revision invalidation leaves dispatched ${id} recovery and completed writes to reconciliation`, async () => {
+    resetTransport();
+    const receipt = uncertain(id);
+    const previous = clone(receipt);
+    transport.responses.getStrings = () => { throw new Error("must reconcile dispatched writes first"); };
+    transport.responses.getInjectionStatus = { game_root: project.path, pending: null, applied: [appliedInjection()] };
+    const { result } = await run(receipt, fastWorkflowAdapter);
+    assert.equal(result.status, "completed");
+    for (const prior of previous.stages.filter(s => s.status === "done")) assert.deepEqual(stage(result, prior.id), prior);
+    assert.ok(!transport.calls.some(([name]) => ["getStrings", "validate", "inject", ...(id === "pack" ? ["patchPack"] : [])].includes(name)));
+  });
+}
+
+test("content changing during validation cannot produce a reusable validation receipt", async () => {
+  resetTransport();
+  transport.responses.validate = () => {
+    transport.responses.getTranslationRuns = [{ id: 99 }];
+    return { validation: { issues_found: 0, by_kind: {}, issues: [] }, fonts: [] };
+  };
+  const { result } = await run(directReceipt("validate"), fastWorkflowAdapter);
+  assert.equal(result.error, "fastWorkflow.contentChanged");
+  assert.equal(stage(result, "validate").status, "failed");
+  assert.ok(!transport.calls.some(([name]) => ["inject", "patchPack"].includes(name)));
+});
+
+for (const locale of ["en", "es"] as const) {
+  test(`${locale}: invalidated stage view displays its persisted reason`, () => {
+    setLocale(locale);
+    const receipt = directReceipt("validate");
+    stage(receipt, "validate").reason = "fastWorkflow.contentChanged";
+    const html = renderToStaticMarkup(createElement(FastWorkflowView, { receipt, isRunning: false }));
+    assert.match(html, /data-reason="fastWorkflow.contentChanged"/);
+    assert.ok(html.includes(t(stage(receipt, "validate").reason as Parameters<typeof t>[0])));
+  });
+}
+
+test("expired translation subscription cannot complete a stage or replay progress without DB proof", async () => {
+  resetTransport();
+  transport.responses.getStats = { total: 4, pending: 1, error: 0 };
+  const snapshots: FastWorkflowReceipt[] = [];
+  const executing = run(fresh({ englishPivot: false }), fastWorkflowAdapter, { onChange: r => snapshots.push(clone(r)) });
+  const subscription = await waitForSubscription();
+  subscription.handlers.onClosed();
+  const { result } = await executing;
+  assert.equal(stage(result, "translate").status, "failed");
+  const before = clone(result);
+  const published = snapshots.length;
+  subscription.handlers.onCompleted({ total_translated: 4, remaining: 0 });
+  subscription.handlers.onStarted({ total: 100 });
+  subscription.handlers.onBatchCompleted({ completed: 100, total: 100 });
+  await Promise.resolve();
+  assert.deepEqual(result, before);
+  assert.equal(snapshots.length, published, "expired handlers cannot publish into a completed runner");
+  assert.ok(!transport.calls.some(([name]) => ["validate", "inject", "patchPack"].includes(name)));
+});
 
 test("actual adapter saves inject baseline before its write and packs with fast compression plus the exact pristine backup", async () => {
   resetTransport();
@@ -972,7 +1155,8 @@ test("actual validation stage preserves advisory counts and displays them after 
   };
   const receipt = directReceipt("validate");
   const result = await fastWorkflowAdapter.execute("validate", receipt, contextFor(receipt, "validate"));
-  assert.deepEqual(result, { validationIssues: 2 });
+  assert.equal(result?.validationIssues, 2);
+  assert.ok(result?.contentRevision);
   Object.assign(stage(receipt, "validate"), { status: "done", result });
   for (const locale of ["en", "es"] as const) {
     setLocale(locale);

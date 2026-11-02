@@ -1,13 +1,13 @@
 import { create } from "zustand";
 import {
-  cancelTranslation, getInjectionStatus, getPatchRecordings, getStats, inject,
+  cancelTranslation, getCurrentProject, getStrings, getTranslationRuns, getInjectionStatus, getPatchRecordings, getStats, inject,
   openProjectDb, patchPack, patchStatus, patchVerify, runPivot, startTranslation, validate, validationKindLabel,
   type ProjectInfo, type ProgressEventCompleted,
 } from "../lib/api";
 import {
   canResumeFastWorkflow, createFastWorkflowReceipt, readFastWorkflowReceipt,
   hasUncertainWorkflowWrite, runFastWorkflow, writeFastWorkflowReceipt,
-  type FastWorkflowAdapter, type FastWorkflowContext, type FastWorkflowOptions,
+  type FastWorkflowAdapter, type FastWorkflowContentRevision, type FastWorkflowContext, type FastWorkflowOptions,
   type FastWorkflowReceipt, type FastWorkflowStageId, type FastWorkflowStageResult,
 } from "../lib/fastWorkflow";
 import { availableInjectModes } from "../lib/injectModes";
@@ -85,6 +85,59 @@ async function proveTranslationComplete(receipt: FastWorkflowReceipt): Promise<v
   if (stats.pending !== 0 || stats.error !== 0 || stats.total < 1) throw failure("failedTranslation");
 }
 
+// Stats alone miss same-status edits. Hash the existing bounded row pages and
+// run ledger, retaining only a small fingerprint per row, never translated text
+// in localStorage. Two independent 32-bit accumulators detect accidental changes.
+function fingerprint(value: string): string {
+  let a = 2166136261;
+  let b = 5381;
+  for (let i = 0; i < value.length; i++) {
+    a = Math.imul(a ^ value.charCodeAt(i), 16777619);
+    b = Math.imul(b, 33) ^ value.charCodeAt(i);
+  }
+  return [a, b].map(n => (n >>> 0).toString(16).padStart(8, "0")).join("");
+}
+
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(value, (_key, item) => item && typeof item === "object" && !Array.isArray(item)
+    ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item);
+}
+
+async function readContentRevision(receipt: FastWorkflowReceipt): Promise<FastWorkflowContentRevision> {
+  const projectKey = draftProjectKey(assertScope(receipt));
+  const current = await getCurrentProject();
+  assertScope(receipt);
+  const actualKey = current ? draftProjectKey(current) : "";
+  // Return the changed identity so the runner can invalidate before blocking.
+  if (actualKey !== projectKey) return { projectKey: actualKey, fingerprint: "database-changed" };
+  const stats = await getStats();
+  assertScope(receipt);
+  if (!Number.isSafeInteger(stats.total) || stats.total < 0) throw failure("contentChanged");
+  const rows = new Map<string, string>();
+  let offset = 0;
+  do {
+    const page = await getStrings({ offset, limit: 500 });
+    assertScope(receipt);
+    if (page.total !== stats.total || page.offset !== offset || !page.entries.length && offset < stats.total) throw failure("contentChanged");
+    for (const entry of page.entries) {
+      if (rows.has(entry.id)) throw failure("contentChanged");
+      rows.set(entry.id, fingerprint(canonicalJson(entry)));
+    }
+    offset += page.entries.length;
+    if (offset > stats.total) throw failure("contentChanged");
+  } while (offset < stats.total);
+  const runs = await getTranslationRuns();
+  assertScope(receipt);
+  const after = await getStats();
+  assertScope(receipt);
+  const finalProject = await getCurrentProject();
+  assertScope(receipt);
+  if (!finalProject || draftProjectKey(finalProject) !== projectKey || canonicalJson(stats) !== canonicalJson(after)) throw failure("contentChanged");
+  return { projectKey, fingerprint: `rows-v1:${fingerprint(canonicalJson([
+    stats, [...rows].sort(([a], [b]) => a.localeCompare(b)), [...runs].sort((a, b) => a.id - b.id),
+  ]))}` };
+}
+
 async function translateStage(
   id: "translate" | "translateTarget", receipt: FastWorkflowReceipt, context: FastWorkflowContext,
 ): Promise<FastWorkflowStageResult> {
@@ -139,8 +192,9 @@ async function translateStage(
         });
       };
       close = subscribeToJob(ownedJobId, {
-        onStarted: event => context.onProgress({ completed: 0, total: event.total }),
+        onStarted: event => { if (!settled) context.onProgress({ completed: 0, total: event.total }); },
         onBatchCompleted: event => {
+          if (settled) return;
           const elapsed = Math.max(0, Date.now() - startedAt) / 1000;
           context.onProgress({
             completed: event.completed, total: event.total,
@@ -192,6 +246,11 @@ async function recordingRoot(receipt: FastWorkflowReceipt): Promise<string> {
 
 /** Adapts the pure stage runner to the existing desktop HTTP/Tauri endpoints. */
 export const fastWorkflowAdapter: FastWorkflowAdapter = {
+  async getRevision(stage, receipt, context) {
+    await prepareProject(stage, receipt, context);
+    assertNotCancelled(context);
+    return readContentRevision(receipt);
+  },
   async execute(stage, receipt, context) {
     await prepareProject(stage, receipt, context);
     assertNotCancelled(context);
@@ -219,6 +278,9 @@ export const fastWorkflowAdapter: FastWorkflowAdapter = {
       return { pivotDatabasePath: databasePath, project };
     }
     if (stage === "validate") {
+      const contentRevision = await readContentRevision(receipt);
+      if (contentRevision.projectKey !== draftProjectKey(assertScope(receipt))) throw failure("projectChanged");
+      await proveTranslationComplete(receipt);
       const report = await validate();
       assertScope(receipt);
       const textIssues = report.validation.issues_found;
@@ -236,7 +298,9 @@ export const fastWorkflowAdapter: FastWorkflowAdapter = {
         report.validation.issues.some(issue => !qaIsAdvisoryKind(validationKindLabel(issue.kind)))) {
         throw failure("validationFailed");
       }
-      return { validationIssues: issues };
+      const after = await readContentRevision(receipt);
+      if (after.projectKey !== contentRevision.projectKey || after.fingerprint !== contentRevision.fingerprint) throw failure("contentChanged");
+      return { validationIssues: issues, contentRevision };
     }
     if (stage === "inject") {
       context.checkpoint({ writeStarted: false });

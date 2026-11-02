@@ -18,7 +18,9 @@ export const FAST_WORKFLOW_STAGES = ["translate", "pivot", "translateTarget", "v
 export type FastWorkflowStageId = typeof FAST_WORKFLOW_STAGES[number];
 export type FastWorkflowStageStatus = "pending" | "running" | "done" | "failed" | "skipped";
 export interface FastWorkflowProgress { completed: number; total: number; etaSeconds?: number }
+export interface FastWorkflowContentRevision { projectKey: string; fingerprint: string }
 export interface FastWorkflowStageResult {
+  contentRevision?: FastWorkflowContentRevision;
   jobId?: string;
   pivotDatabasePath?: string;
   project?: ProjectInfo;
@@ -38,6 +40,7 @@ export interface FastWorkflowStageReceipt {
   durationMs?: number;
   progress?: FastWorkflowProgress;
   error?: string;
+  reason?: "fastWorkflow.contentChanged";
   result?: FastWorkflowStageResult;
 }
 export interface FastWorkflowReceipt {
@@ -59,6 +62,8 @@ export interface FastWorkflowContext {
   checkpoint: (result: Partial<FastWorkflowStageResult>) => void;
 }
 export interface FastWorkflowAdapter {
+  /** Fresh database evidence, independent of provider terminal events. */
+  getRevision?: (stage: FastWorkflowStageId, receipt: FastWorkflowReceipt, context: FastWorkflowContext) => Promise<FastWorkflowContentRevision>;
   execute: (stage: FastWorkflowStageId, receipt: FastWorkflowReceipt, context: FastWorkflowContext) => Promise<FastWorkflowStageResult | void>;
   reconcile: (stage: FastWorkflowStageId, receipt: FastWorkflowReceipt, context: FastWorkflowContext) => Promise<{
     outcome: "done" | "retry" | "blocked";
@@ -154,6 +159,7 @@ export function parseFastWorkflowReceipt(raw: string): FastWorkflowReceipt | nul
       const stage = r.stages[i];
       const skip = !r.options.englishPivot && (stage.id === "pivot" || stage.id === "translateTarget");
       if (stage.id !== FAST_WORKFLOW_STAGES[i] || !["pending", "running", "done", "failed", "skipped"].includes(stage.status) ||
+        (stage.reason !== undefined && stage.reason !== "fastWorkflow.contentChanged") ||
         (stage.status === "skipped") !== skip ||
         (stage.startedAt !== undefined && (!Number.isFinite(stage.startedAt) || stage.startedAt < 0)) ||
         (stage.durationMs !== undefined && (!Number.isFinite(stage.durationMs) || stage.durationMs < 0))) return null;
@@ -171,6 +177,9 @@ export function parseFastWorkflowReceipt(raw: string): FastWorkflowReceipt | nul
       if (stage.result !== undefined) {
         const result = stage.result;
         if (!result || typeof result !== "object" ||
+          (result.contentRevision !== undefined && (!result.contentRevision ||
+            typeof result.contentRevision.projectKey !== "string" ||
+            typeof result.contentRevision.fingerprint !== "string" || !result.contentRevision.fingerprint)) ||
           [result.jobId, result.pivotDatabasePath, result.injectedRoot, result.backupId, result.outputPath, result.patchId].some(v => v !== undefined && typeof v !== "string") ||
           (result.project !== undefined && !validProject(result.project)) ||
           (result.validationIssues !== undefined && (!Number.isInteger(result.validationIssues) || result.validationIssues < 0)) ||
@@ -239,7 +248,44 @@ export async function runFastWorkflow(
     receipt = { ...receipt, stages: receipt.stages.map(s => s.id === id ? { ...s, ...patch } : s) };
     publish();
   };
+  const expectedProject = (id: FastWorkflowStageId) => id === "translate" || !receipt.options.englishPivot ? receipt.project :
+    receipt.stages.find(s => s.id === "pivot")?.result?.project ?? receipt.project;
+  const invalidateValidation = () => {
+    receipt = { ...receipt, stages: receipt.stages.map(s =>
+      s.id === "validate" || (["inject", "pack"].includes(s.id) && s.status !== "done") ? {
+        id: s.id, status: "pending", reason: "fastWorkflow.contentChanged",
+        ...(s.id !== "validate" && s.startedAt !== undefined ? { startedAt: s.startedAt, result: s.result } : {}),
+      } : s) };
+    publish();
+  };
   publish({ status: "running", error: undefined });
+  // Status/ZIP reconciliation owns dispatched writes. A durable preflight that
+  // never dispatched is safe to revalidate, while retaining its recovery evidence.
+  if (adapter.getRevision && !receipt.stages.some(s =>
+    (s.id === "inject" || s.id === "pack") &&
+      (s.status === "done" || s.startedAt !== undefined && s.result?.writeStarted !== false))) {
+    const completed = [...receipt.stages].reverse().find(s => s.status === "done" &&
+      (s.id === "validate" || s.id === "translateTarget" ||
+        (s.id === "translate" && receipt.stages.find(p => p.id === "pivot")?.status !== "done")));
+    if (completed) {
+      try {
+        if (signal.aborted) { publish({ status: "cancelled" }); return receipt; }
+        const revision = await adapter.getRevision(completed.id, receipt, {
+          signal, onProgress() {}, checkpoint() {},
+        });
+        const saved = completed.result?.contentRevision;
+        if (!saved || saved.projectKey !== revision.projectKey || saved.fingerprint !== revision.fingerprint) {
+          invalidateValidation();
+        }
+        if (revision.projectKey !== fastWorkflowProjectKey(expectedProject(completed.id))) throw new Error("fastWorkflow.projectChanged");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (message === "fastWorkflow.contentChanged") invalidateValidation();
+        publish({ status: signal.aborted ? "cancelled" : "failed", error: signal.aborted ? undefined : message });
+        return receipt;
+      }
+    }
+  }
   for (const initialStage of receipt.stages) {
     const id = initialStage.id;
     let stage = receipt.stages.find(s => s.id === id)!;
@@ -268,6 +314,10 @@ export async function runFastWorkflow(
           result = await adapter.execute(id, receipt, context);
         }
       } else result = await adapter.execute(id, receipt, context);
+      if (adapter.getRevision && (id === "translate" || id === "translateTarget" || id === "validate") && !result?.contentRevision) {
+        result = { ...result, contentRevision: await adapter.getRevision(id, receipt, context) };
+      }
+      if (result?.contentRevision && result.contentRevision.projectKey !== fastWorkflowProjectKey(expectedProject(id))) throw new Error("fastWorkflow.projectChanged");
       stage = receipt.stages.find(s => s.id === id)!;
       updateStage(id, { status: "done", durationMs: Math.max(0, now() - startedAt), result: { ...stage.result, ...result }, error: undefined });
     } catch (error) {
