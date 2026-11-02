@@ -44,6 +44,19 @@ async fn connect_handler_with_write_limit(
     oneshot::Receiver<()>,
     test_server::TestServer,
 ) {
+    connect_handler_with_limits(found, write_limit, None).await
+}
+
+async fn connect_handler_with_limits(
+    found: Option<JobStream>,
+    write_limit: Option<usize>,
+    receive_limit: Option<u32>,
+) -> (
+    ClientSocket,
+    oneshot::Sender<()>,
+    oneshot::Receiver<()>,
+    test_server::TestServer,
+) {
     let (start, ready) = oneshot::channel();
     let (finished, done) = oneshot::channel();
     let input = Arc::new(std::sync::Mutex::new(Some((found, ready, finished))));
@@ -69,10 +82,20 @@ async fn connect_handler_with_write_limit(
         }),
     );
     let (url, server) = test_server::start_test_server(app).await;
-    let (client, _) =
-        tokio_tungstenite::connect_async(format!("{}/ws", url.replacen("http", "ws", 1)))
+    let ws_url = format!("{}/ws", url.replacen("http", "ws", 1));
+    let (client, _) = if let Some(limit) = receive_limit {
+        let tcp = tokio::net::TcpSocket::new_v4().unwrap();
+        tcp.set_recv_buffer_size(limit).unwrap();
+        let tcp = tcp
+            .connect(url.trim_start_matches("http://").parse().unwrap())
             .await
             .unwrap();
+        tokio_tungstenite::client_async(ws_url, tokio_tungstenite::MaybeTlsStream::Plain(tcp))
+            .await
+            .unwrap()
+    } else {
+        tokio_tungstenite::connect_async(ws_url).await.unwrap()
+    };
     (client, start, done, server)
 }
 
@@ -117,6 +140,197 @@ async fn slow_reader_delay(delay: Duration) {
         .await
         .unwrap();
     tokio::time::advance(delay).await;
+}
+
+// The worker publishes once, then cannot make progress until the test releases
+// it. Receiving the first frame proves the handler is live without a timing sleep.
+struct ParkedJob {
+    tx: broadcast::Sender<serde_json::Value>,
+    replay: Replay,
+    resume: oneshot::Sender<()>,
+    worker: tokio::task::JoinHandle<()>,
+}
+
+impl ParkedJob {
+    async fn new() -> Self {
+        let (tx, _) = broadcast::channel(8);
+        let replay = Replay::default();
+        let (resume, resumed) = oneshot::channel();
+        let (parked, ready) = oneshot::channel();
+        let worker_tx = tx.clone();
+        let worker_replay = replay.clone();
+        let worker = tokio::spawn(async move {
+            emit(
+                &worker_tx,
+                &worker_replay,
+                serde_json::json!({"type":"started", "total":1, "job_id":"idle"}),
+            );
+            parked.send(()).unwrap();
+            resumed.await.unwrap();
+            emit(
+                &worker_tx,
+                &worker_replay,
+                serde_json::json!({"type":"completed", "total_translated":1}),
+            );
+        });
+        ready.await.unwrap();
+        Self {
+            tx,
+            replay,
+            resume,
+            worker,
+        }
+    }
+
+    fn subscribe(&self) -> JobStream {
+        JobSubscription::subscribe(&self.tx, &self.replay, JobKind::Translate)
+    }
+
+    async fn finish_and_reconnect(self) {
+        assert!(
+            !self.worker.is_finished(),
+            "socket loss stopped the parked worker"
+        );
+        self.resume.send(()).unwrap();
+        self.worker.await.unwrap();
+        let expected = self.replay.lock().unwrap().clone();
+        assert_eq!(expected.last().unwrap()["type"], "completed");
+        let (mut client, start, done, server) = connect_handler(Some(JobSubscription::subscribe(
+            &self.tx,
+            &self.replay,
+            JobKind::Translate,
+        )))
+        .await;
+        start.send(()).unwrap();
+        assert_eq!(read_to_close(&mut client).await, expected);
+        done.await.unwrap();
+        server.shutdown().await;
+    }
+}
+
+async fn read_started(client: &mut ClientSocket) {
+    let frame = tokio::time::timeout(Duration::from_secs(1), client.next())
+        .await
+        .expect("initial event timed out")
+        .unwrap()
+        .unwrap();
+    let ClientMessage::Text(text) = frame else {
+        panic!("expected initial event")
+    };
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&text).unwrap()["type"],
+        "started"
+    );
+}
+
+#[tokio::test]
+async fn job_ws_idle_ping_gets_pong_without_worker_progress() {
+    let job = ParkedJob::new().await;
+    let (mut client, start, mut done, server) = connect_handler(Some(job.subscribe())).await;
+    start.send(()).unwrap();
+    read_started(&mut client).await;
+    // Unexpected application frames and unsolicited Pong must not end the job
+    // subscription or prevent the next Ping from being answered.
+    for message in [
+        ClientMessage::Text("ignored".into()),
+        ClientMessage::Binary(vec![4, 5]),
+        ClientMessage::Pong(vec![6]),
+        ClientMessage::Ping(vec![1, 2, 3]),
+    ] {
+        client.send(message).await.unwrap();
+    }
+    let pong = tokio::time::timeout(Duration::from_secs(1), client.next())
+        .await
+        .expect("idle job did not answer Ping")
+        .unwrap()
+        .unwrap();
+    assert_eq!(pong, ClientMessage::Pong(vec![1, 2, 3]));
+    assert!(matches!(
+        done.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    job.resume.send(()).unwrap();
+    job.worker.await.unwrap();
+    assert_eq!(
+        read_to_close(&mut client).await.last().unwrap()["type"],
+        "completed"
+    );
+    done.await.unwrap();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn job_ws_idle_peer_close_finishes_handler_and_preserves_final_replay() {
+    let job = ParkedJob::new().await;
+    let (mut client, start, done, server) = connect_handler(Some(job.subscribe())).await;
+    start.send(()).unwrap();
+    read_started(&mut client).await;
+    let close = Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
+        code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal,
+        reason: "leaving".into(),
+    });
+    client
+        .send(ClientMessage::Close(close.clone()))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), done)
+        .await
+        .expect("peer Close waited for another job event")
+        .unwrap();
+    assert_eq!(
+        client.next().await.unwrap().unwrap(),
+        ClientMessage::Close(close)
+    );
+    server.shutdown().await;
+    job.finish_and_reconnect().await;
+}
+
+#[tokio::test]
+async fn job_ws_idle_tcp_disconnect_finishes_handler_and_preserves_final_replay() {
+    let job = ParkedJob::new().await;
+    let (mut client, start, done, server) = connect_handler(Some(job.subscribe())).await;
+    start.send(()).unwrap();
+    read_started(&mut client).await;
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(1), done)
+        .await
+        .expect("TCP disconnect waited for another job event")
+        .unwrap();
+    server.shutdown().await;
+    job.finish_and_reconnect().await;
+}
+
+#[tokio::test]
+async fn job_ws_stalled_reader_send_is_bounded_and_preserves_final_replay() {
+    let job = ParkedJob::new().await;
+    let (mut client, start, done, server) =
+        connect_handler_with_limits(Some(job.subscribe()), None, Some(1024)).await;
+    start.send(()).unwrap();
+    read_started(&mut client).await;
+    // Keep TCP connected but stop reading. Feed progress until an actual send
+    // blocks, instead of assuming a particular OS socket-buffer capacity.
+    // Only queue another event once the handler has taken the previous one.
+    let event = serde_json::json!({"type":"progress", "data":"x".repeat(1024 * 1024)});
+    tokio::time::timeout(Duration::from_secs(8), async {
+        tokio::select! {
+            result = done => result.unwrap(),
+            () = async {
+                loop {
+                    emit(&job.tx, &job.replay, event.clone());
+                    while !job.tx.is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            } => unreachable!(),
+        }
+    })
+    .await
+    .expect("stalled reader kept an outgoing send alive");
+    assert!(!job.worker.is_finished());
+    drop(client);
+    server.shutdown().await;
+    job.finish_and_reconnect().await;
 }
 
 #[tokio::test]

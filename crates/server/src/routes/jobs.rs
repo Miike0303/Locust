@@ -102,7 +102,7 @@ async fn handle_job_ws(
         include_sequence,
     }) = found
     else {
-        let _ = socket.send(Message::Text(not_found.to_string())).await;
+        send_job_ws(&mut socket, Message::Text(not_found.to_string())).await;
         close_job_ws(&mut socket).await;
         return;
     };
@@ -125,30 +125,65 @@ async fn handle_job_ws(
                     fields.remove("seq");
                 }
             }
-            let sent = socket.send(Message::Text(event.to_string())).await;
-            if let Err(error) = &sent {
-                tracing::warn!(%error, "Job WebSocket send failed");
-            }
-            if sent.is_err() || job_event_is_terminal(&event) {
+            let sent = send_job_ws(&mut socket, Message::Text(event.to_string())).await;
+            if !sent || job_event_is_terminal(&event) {
                 close_job_ws(&mut socket).await;
                 return;
             }
         }
-        match rx.recv().await {
-            Ok(event) => pending.push(event),
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                tracing::warn!("WS client lagged by {} messages", n);
-                // A live ring can lose informational frames or a terminal.
-                // Retain the replay Arc even after active_jobs cleanup, and
-                // resume from compact state without redelivering the prefix.
-                pending = replay.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        tokio::select! {
+            message = socket.recv() => match message {
+                Some(Ok(Message::Close(_))) => {
+                    // Receiving Close queues Axum's reply. Drive that reply to
+                    // completion before dropping TCP, without waiting on the job.
+                    close_job_ws(&mut socket).await;
+                    return;
+                }
+                Some(Ok(Message::Ping(data))) => {
+                    // Replace Axum's queued automatic Pong with the same payload
+                    // and flush it under our send deadline (no duplicate Pong).
+                    if !send_job_ws(&mut socket, Message::Pong(data)).await {
+                        close_job_ws(&mut socket).await;
+                        return;
+                    }
+                }
+                Some(Ok(_)) => {} // Client text/binary/Pong carries no job commands.
+                Some(Err(error)) => {
+                    tracing::debug!(%error, "Job WebSocket receive failed");
+                    return;
+                }
+                None => return,
+            },
+            event = rx.recv() => match event {
+                Ok(event) => pending.push(event),
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!("WS client lagged by {} messages", n);
+                    // A live ring can lose informational frames or a terminal.
+                    // Retain the replay Arc even after active_jobs cleanup, and
+                    // resume from compact state without redelivering the prefix.
+                    pending = replay.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
             }
-            Err(broadcast::error::RecvError::Closed) => {
-                break;
-            }
-        }
+        };
     }
     close_job_ws(&mut socket).await;
+}
+
+async fn send_job_ws(socket: &mut WebSocket, message: Message) -> bool {
+    // Disconnect only this subscriber when its peer stops reading. The worker
+    // and retained replay continue independently of the socket's lifetime.
+    match tokio::time::timeout(Duration::from_secs(2), socket.send(message)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "Job WebSocket send failed");
+            false
+        }
+        Err(_) => {
+            tracing::warn!("Job WebSocket send timed out");
+            false
+        }
+    }
 }
 
 async fn close_job_ws(socket: &mut WebSocket) {
