@@ -147,10 +147,22 @@ function ProjectTranslationMemory({ projectScope }: { projectScope: string | nul
           </button>
         </div>
 
+        {stats?.degraded && (
+          <div role="alert" className="mb-4 rounded border border-warning bg-warning-muted p-3 text-body text-warning">
+            <p className="font-medium">{t("memory.globalDegraded")}</p>
+            <p>{t("memory.globalDegradedHint")}</p>
+            <details className="mt-1">
+              <summary className="cursor-pointer">{t("recovery.details")}</summary>
+              <p className="break-words">{stats.degraded.path}</p>
+              <p className="break-words">{stats.degraded.reason}</p>
+            </details>
+          </div>
+        )}
+
         {/* Stats */}
         {!isError && stats && langPairs && (
           <div className="flex gap-6 text-body text-text-muted mb-4">
-            <span className="text-text">{t("memory.globalEntries", { count: stats.global_entries })}</span>
+            {!stats.degraded && <span className="text-text">{t("memory.globalEntries", { count: stats.global_entries })}</span>}
             <span className="text-text">{t("memory.projectEntries", { count: stats.project_entries })}</span>
             <span className="text-text">{t("memory.languagePairs", { count: langPairs.length })}</span>
           </div>

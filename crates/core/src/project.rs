@@ -493,6 +493,31 @@ fn owned_saved_dbs_with(
     Ok(owned)
 }
 
+/// Open-time discovery diagnostics share the existing warnings channel, but
+/// are not saved as extraction failures: the skipped file may later be moved.
+fn append_skipped_legacy_db_warning(
+    warnings: &mut Vec<String>,
+    game_root: &Path,
+    selected_database: &Path,
+) -> Result<()> {
+    if let Some(parent) = game_root.parent() {
+        let legacy = parent.join(format!(
+            "{}{DB_SUFFIX}",
+            sanitize_project_stem(&raw_project_name(game_root))
+        ));
+        if legacy.is_file()
+            && !same_saved_db(&legacy, selected_database)
+            && !project_stem_unambiguous(game_root)?
+        {
+            warnings.push(format!(
+                "Skipped ambiguous legacy project database '{}'; open this .locust.db file explicitly to inspect older saved work.",
+                legacy.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn foreign_project_db_error(path: &Path) -> LocustError {
     LocustError::IoError(std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
@@ -637,13 +662,15 @@ fn open_project_with(
     // Reuse saved work regardless of current writability, and reject ambiguity
     // before extraction or opening either candidate database for writing.
     let database_path = folder_open_db_path_with(&path, config_dir, writable)?;
+    let mut open_warnings = Vec::new();
+    append_skipped_legacy_db_warning(&mut open_warnings, &path, &database_path)?;
     let _source_lock = lock_game_source(&path)?;
 
     let format_id = plugin.id().to_string();
     let format_name = plugin.name().to_string();
     let supported_modes = plugin.supported_modes();
     let extraction = plugin.extract_with_diagnostics(&path)?;
-    let extraction_warnings = extraction.bounded_warnings();
+    let mut extraction_warnings = extraction.bounded_warnings();
 
     let existing = database_path.try_exists()?;
     let candidate = Database::open(&database_path)?;
@@ -670,6 +697,7 @@ fn open_project_with(
         &serde_json::json!(path_identity_key(&path)),
     )?;
     let total_strings = candidate.get_stats()?.total;
+    extraction_warnings.extend(open_warnings);
 
     let project_name = path
         .file_name()
@@ -797,7 +825,7 @@ fn open_project_db_under_lock(
     let automatic = !matches!(&saved, SavedProjectOpen::Explicit);
     // Initialize legacy schemas before reading metadata, but finish warning
     // validation before claiming ownership or publishing the live connection.
-    let extraction_warnings = match saved {
+    let mut extraction_warnings = match saved {
         SavedProjectOpen::Verified(warnings) => warnings,
         _ => saved_extraction_warnings(&candidate)?,
     };
@@ -809,6 +837,7 @@ fn open_project_db_under_lock(
         )? {
             return Err(foreign_project_db_error(database_path));
         }
+        append_skipped_legacy_db_warning(&mut extraction_warnings, game_path, database_path)?;
         candidate.set_project_metadata(
             GAME_ROOT_IDENTITY,
             &serde_json::json!(path_identity_key(game_path)),
@@ -1119,6 +1148,30 @@ mod tests {
                 );
                 assert_eq!(std::fs::read(&legacy).unwrap(), before);
                 assert_eq!(out.preserved_translations, 0);
+                let expected = format!("Skipped ambiguous legacy project database '{}'; open this .locust.db file explicitly to inspect older saved work.", legacy.display());
+                assert_eq!(
+                    out.extraction_warnings.as_slice(),
+                    std::slice::from_ref(&expected)
+                );
+                let reopened =
+                    open_project_with(&live, &registry(), game, None, &config, |_| true).unwrap();
+                assert_eq!(
+                    reopened.extraction_warnings.as_slice(),
+                    std::slice::from_ref(&expected)
+                );
+                assert!(
+                    saved_extraction_warnings(&live).unwrap().is_empty(),
+                    "open warnings must not become stale extraction metadata"
+                );
+                let recent =
+                    open_recent_project_with(&live, &registry(), game, None, &config).unwrap();
+                assert_eq!(recent.extraction_warnings, [expected]);
+                let explicit =
+                    open_project_db(&live, &registry(), &legacy, game, "tsv-test").unwrap();
+                assert!(
+                    explicit.extraction_warnings.is_empty(),
+                    "explicit selection does not skip the legacy DB"
+                );
             }
         }
     }
@@ -1207,6 +1260,10 @@ mod tests {
                 let out = open_project_with(&live, &reg, &game, None, &config, |_| true).unwrap();
                 assert_eq!(out.database_path, legacy);
                 assert_eq!(out.preserved_translations, 1);
+                assert!(
+                    out.extraction_warnings.is_empty(),
+                    "unambiguous legacy DBs need no warning"
+                );
                 let identity = live.get_project_metadata("game_root_identity").unwrap();
                 assert!(
                     identity.is_some(),

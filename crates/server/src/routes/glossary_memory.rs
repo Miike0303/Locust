@@ -128,10 +128,14 @@ pub(crate) async fn memory_stats(
         .global_memory
         .memory_count()
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    Ok(Json(serde_json::json!({
+    let mut stats = serde_json::json!({
         "project_entries": project,
         "global_entries": global,
-    })))
+    });
+    if let Some(degraded) = &state.global_memory_degraded {
+        stats["degraded"] = serde_json::json!(degraded);
+    }
+    Ok(Json(stats))
 }
 
 fn parse_memory_limit(value: &str) -> Option<usize> {

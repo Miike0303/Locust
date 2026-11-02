@@ -161,6 +161,33 @@ function seedMemory() {
 }
 
 for (const locale of ["en", "es"] as const) {
+  test(`${locale}: degraded global memory warns with its path and reason while project memory stays usable`, () => {
+    setLocale(locale);
+    h.project = project("/projects/degraded.locust.db");
+    render();
+    seedMemory();
+    const query = memoryQueries().find(query => query.queryKey[0] === "tm-stats")!;
+    client.setQueryData(query.queryKey, {
+      project_entries: 1, global_entries: 0,
+      degraded: { path: "C:/profile/global_memory.db", reason: "file is not a database" },
+    });
+    const html = render();
+    assert.ok(html.includes(locale === "en" ? "Global translation memory is unavailable" : "La memoria de traducción global no está disponible"));
+    assert.match(html, /role="alert"/);
+    assert.ok(html.includes("C:/profile/global_memory.db"));
+    assert.ok(html.includes("file is not a database"));
+    assert.ok(html.includes(t("memory.globalDegradedHint")));
+    assert.ok(html.includes("Saved source"));
+    assert.ok(html.includes(t("memory.projectEntries", { count: 1 })));
+    assert.ok(!html.includes(t("memory.globalEntries", { count: 0 })), "unavailable global memory must not appear honestly empty");
+    assert.ok(!html.includes(t("memory.loadError")));
+    assert.ok(!html.includes(t("memory.empty.title")));
+    seedMemory();
+    assert.ok(!render().includes(t("memory.globalDegraded")), "healthy stats clear the warning");
+  });
+}
+
+for (const locale of ["en", "es"] as const) {
   for (const key of ["tm-entries", "tm-stats", "tm-lang-pairs"]) {
     for (const status of [409, 500]) {
       test(`${locale}: ${key} HTTP ${status} shows Retry without empty state or fabricated counts`, () => {

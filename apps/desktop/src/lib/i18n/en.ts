@@ -531,6 +531,8 @@ export const en = {
   "fontPatch.create": "Create ZIP",
   "detail.sharedBudget": "This line shares its file's space. Use Validate to check the complete text.",
   "detail.expandableBudget": "This TextAsset can grow up to 1 MiB; no shortening to the original length is needed.",
+  "editor.openWarnings": "Project opened with warnings",
+  "editor.openWarningsDetail": "Review these warnings before continuing.",
   "editor.partialExtraction": "Some game files could not be read",
   "editor.partialExtractionDetail": "This project contains a partial extraction. Previously saved lines are kept; more text may remain in these files.",
   "editor.stats": "{pending} pending · {translated} translated · {approved} approved",
@@ -613,6 +615,8 @@ export const en = {
   // ── memory ──────────────────────────────────────────────────────────────
   "memory.title": "Translation Memory",
   "memory.clearAll": "Clear All",
+  "memory.globalDegraded": "Global translation memory is unavailable",
+  "memory.globalDegradedHint": "Project memory remains usable. Locust is using temporary empty global memory. Check the saved file and its permissions, then restart Locust to try again.",
   "memory.globalEntries": "{count} global entries",
   "memory.projectEntries": "{count} project entries",
   "memory.languagePairs": "{count} language pairs",

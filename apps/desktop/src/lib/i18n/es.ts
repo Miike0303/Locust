@@ -529,6 +529,8 @@ export const es: Record<keyof typeof en, string> = {
   "fontPatch.create": "Crear ZIP",
   "detail.sharedBudget": "Esta frase comparte el espacio del archivo. Usa Validar para comprobar el texto completo.",
   "detail.expandableBudget": "Este TextAsset puede crecer hasta 1 MiB; no necesita acortarse al tamaño original.",
+  "editor.openWarnings": "El proyecto se abrió con advertencias",
+  "editor.openWarningsDetail": "Revise estas advertencias antes de continuar.",
   "editor.partialExtraction": "No se pudieron leer todos los archivos del juego",
   "editor.partialExtractionDetail": "La extracción está incompleta. Las frases guardadas se conservan; puede quedar más texto en estos archivos.",
   "editor.stats": "{pending} pendientes · {translated} traducidas · {approved} aprobadas",
@@ -608,6 +610,8 @@ export const es: Record<keyof typeof en, string> = {
 
   "memory.title": "Memoria de traducción",
   "memory.clearAll": "Borrar todo",
+  "memory.globalDegraded": "La memoria de traducción global no está disponible",
+  "memory.globalDegradedHint": "La memoria del proyecto sigue disponible. Locust está utilizando una memoria global temporal vacía. Revise el archivo guardado y sus permisos; después, reinicie Locust para volver a intentarlo.",
   "memory.globalEntries": "{count} entradas globales",
   "memory.projectEntries": "{count} entradas del proyecto",
   "memory.languagePairs": "{count} pares de idiomas",

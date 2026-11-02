@@ -398,8 +398,8 @@ export default function Editor() {
 			</div>}
 			{!!project?.extraction_warnings?.length && (
 				<details className="border-b border-warning bg-warning-muted px-4 py-2 text-body text-warning">
-					<summary className="cursor-pointer font-medium">{t("editor.partialExtraction")}</summary>
-					<p className="mt-1">{t("editor.partialExtractionDetail")}</p>
+					<summary className="cursor-pointer font-medium">{t("editor.openWarnings")}</summary>
+					<p className="mt-1">{t("editor.openWarningsDetail")}</p>
 					<ul className="mt-1 max-h-32 overflow-y-auto list-disc pl-5 break-words">
 						{project.extraction_warnings.map((warning, index) => <li key={index}>{warning}</li>)}
 					</ul>

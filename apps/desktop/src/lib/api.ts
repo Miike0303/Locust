@@ -1258,7 +1258,7 @@ export interface MemoryFilter {
   offset?: number;
 }
 
-export const getTranslationMemoryStats = (signal?: AbortSignal): Promise<{ project_entries: number; global_entries: number }> =>
+export const getTranslationMemoryStats = (signal?: AbortSignal): Promise<{ project_entries: number; global_entries: number; degraded?: { path: string; reason: string } | null }> =>
   request("/memory/stats", { signal });
 
 export const getTranslationMemoryLangPairs = (signal?: AbortSignal): Promise<string[]> =>

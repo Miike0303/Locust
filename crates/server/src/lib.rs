@@ -333,6 +333,13 @@ pub struct ProjectInfo {
     pub persistence_warning: Option<String>,
 }
 
+/// Saved global memory could not be opened; the temporary fallback is empty.
+#[derive(Debug, Serialize)]
+pub struct MemoryDegradation {
+    pub path: PathBuf,
+    pub reason: String,
+}
+
 pub struct AppState {
     /// Bounded metric cache shared by HTTP and direct desktop estimates.
     pub text_fit_cache: Arc<std::sync::Mutex<locust_core::text_fit::TextFitCache>>,
@@ -347,6 +354,7 @@ pub struct AppState {
     pub config_load_failed: bool,
     pub backup_manager: Arc<BackupManager>,
     pub global_memory: Arc<GlobalMemoryDb>,
+    pub global_memory_degraded: Option<MemoryDegradation>,
     pub active_jobs: Arc<DashMap<String, JobState>>,
     /// In-flight xAI device-code grants, keyed by an opaque uuid handle.
     pub xai_pending: Arc<DashMap<String, XaiPendingAuth>>,
@@ -452,12 +460,27 @@ fn create_app_state_in(data_dir: &Path) -> Result<Arc<AppState>, StartupError> {
     let provider_registry = locust_providers::default_registry(&config);
 
     let memory_path = data_dir.join("global_memory.db");
-    let global_memory = GlobalMemoryDb::open(&memory_path)
-        .or_else(|_| GlobalMemoryDb::open_in_memory())
-        .map_err(|source| StartupError::GlobalMemory {
-            path: memory_path,
-            source,
-        })?;
+    let (global_memory, global_memory_degraded) = match GlobalMemoryDb::open(&memory_path) {
+        Ok(memory) => (memory, None),
+        Err(source) => {
+            let reason = source.to_string().chars().take(512).collect::<String>();
+            tracing::warn!(path = %memory_path.display(), %reason,
+                "Saved global memory is unavailable; using empty temporary memory");
+            // Preserve the failed file for recovery; never remove or replace it.
+            let memory =
+                GlobalMemoryDb::open_in_memory().map_err(|source| StartupError::GlobalMemory {
+                    path: memory_path.clone(),
+                    source,
+                })?;
+            (
+                memory,
+                Some(MemoryDegradation {
+                    path: memory_path,
+                    reason,
+                }),
+            )
+        }
+    };
 
     Ok(Arc::new(AppState {
         text_fit_cache: Arc::new(std::sync::Mutex::new(Default::default())),
@@ -470,6 +493,7 @@ fn create_app_state_in(data_dir: &Path) -> Result<Arc<AppState>, StartupError> {
         config_load_failed,
         backup_manager: Arc::new(BackupManager::new(backup_root)),
         global_memory: Arc::new(global_memory),
+        global_memory_degraded,
         active_jobs: Arc::new(DashMap::new()),
         xai_pending: Arc::new(DashMap::new()),
         xai_device_code_url: Arc::new(RwLock::new(None)),
@@ -514,6 +538,7 @@ fn create_test_state_inner(db: Arc<Database>) -> Arc<AppState> {
         config_load_failed: false,
         backup_manager: Arc::new(BackupManager::new(backup_root.clone())),
         global_memory: Arc::new(GlobalMemoryDb::open_in_memory().unwrap()),
+        global_memory_degraded: None,
         active_jobs: Arc::new(DashMap::new()),
         xai_pending: Arc::new(DashMap::new()),
         xai_device_code_url: Arc::new(RwLock::new(None)),
@@ -825,6 +850,106 @@ mod tests {
         assert_eq!(std::fs::read(&db_path).unwrap(), original);
         assert_eq!(std::fs::read(&config_path).unwrap(), config);
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
+    }
+
+    async fn startup_memory_stats(state: Arc<AppState>) -> serde_json::Value {
+        mark_project_open(&state).await;
+        state
+            .db
+            .save_memory("project", "Hello", "Hola", "en-es")
+            .await
+            .unwrap();
+        let (url, handle) = start_test_server(state).await;
+        let response = client()
+            .get(format!("{url}/api/memory/stats"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let stats: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(stats["project_entries"], 1);
+        let response = client()
+            .get(format!("{url}/api/memory"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let memory: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(memory["total"], 1);
+        assert_eq!(memory["entries"][0]["translation"], "Hola");
+        handle.abort();
+        stats
+    }
+
+    #[tokio::test]
+    async fn startup_memory_malformed_file_reports_degradation_without_changing_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let memory_path = root.path().join("global_memory.db");
+        let original = b"this is not a SQLite database";
+        std::fs::write(&memory_path, original).unwrap();
+        let state = create_app_state_in(root.path()).unwrap();
+        let stats = startup_memory_stats(state).await;
+        assert_eq!(std::fs::read(&memory_path).unwrap(), original);
+        assert_eq!(stats["global_entries"], 0);
+        assert_eq!(
+            stats["degraded"]["path"],
+            memory_path.to_string_lossy().as_ref()
+        );
+        let reason = stats["degraded"]["reason"]
+            .as_str()
+            .expect("opening failure must be reported");
+        assert!(reason.contains("not a database"), "{reason}");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn startup_memory_unreadable_file_reports_degradation_without_changing_bytes() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let memory_path = root.path().join("global_memory.db");
+        let memory = GlobalMemoryDb::open(&memory_path).unwrap();
+        memory
+            .save_memory("saved", "Saved", "Guardado", "en-es")
+            .await
+            .unwrap();
+        drop(memory);
+        let original = std::fs::read(&memory_path).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&memory_path)
+            .unwrap();
+        let state = create_app_state_in(root.path()).unwrap();
+        let stats = startup_memory_stats(state).await;
+        drop(lock);
+        assert_eq!(std::fs::read(&memory_path).unwrap(), original);
+        assert_eq!(stats["global_entries"], 0);
+        assert_eq!(
+            stats["degraded"]["path"],
+            memory_path.to_string_lossy().as_ref()
+        );
+        assert!(!stats["degraded"]["reason"].as_str().unwrap().is_empty());
+        let recovered = startup_memory_stats(create_app_state_in(root.path()).unwrap()).await;
+        assert!(recovered.get("degraded").is_none());
+        assert_eq!(recovered["global_entries"], 1);
+    }
+
+    #[tokio::test]
+    async fn startup_memory_healthy_existing_and_new_files_report_no_degradation() {
+        for existing in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            if existing {
+                let memory = GlobalMemoryDb::open(&root.path().join("global_memory.db")).unwrap();
+                memory
+                    .save_memory("saved", "Saved", "Guardado", "en-es")
+                    .await
+                    .unwrap();
+            }
+            let stats = startup_memory_stats(create_app_state_in(root.path()).unwrap()).await;
+            assert!(stats.get("degraded").is_none());
+            assert_eq!(stats["global_entries"], usize::from(existing));
+        }
     }
 
     static DATA_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
