@@ -383,15 +383,15 @@ impl TranslationManager {
         Ok(())
     }
 
-    /// Additional logical calls share the run's prepaid budget, including all
+    /// All logical calls share the run's prepaid budget, including all
     /// source/context/glossary bytes and costs from previously rejected answers.
-    async fn additional_request_budget_error(
+    async fn request_budget_error(
         &self,
-        request: &TranslationRequest,
+        requests: &[TranslationRequest],
         opts: &TranslationOptions,
         observed_cost: ObservedCost,
     ) -> Option<LocustError> {
-        if let Err(error) = self.context_request_error(std::slice::from_ref(request), opts) {
+        if let Err(error) = self.context_request_error(requests, opts) {
             return Some(error);
         }
         let limit = opts.cost_limit_usd?;
@@ -400,11 +400,12 @@ impl TranslationManager {
                 "cannot enforce a cost limit: preceding calls have unknown cost".into(),
             ));
         }
-        let chars = request
-            .source
-            .len()
-            .saturating_add(request.context.as_ref().map_or(0, String::len))
-            .saturating_add(request.glossary_hint.as_ref().map_or(0, String::len));
+        let chars = requests.iter().fold(0usize, |chars, request| {
+            chars
+                .saturating_add(request.source.len())
+                .saturating_add(request.context.as_ref().map_or(0, String::len))
+                .saturating_add(request.glossary_hint.as_ref().map_or(0, String::len))
+        });
         match self.provider.estimate_cost(chars, &opts.target_lang).await {
             Some(estimate) if estimate.is_finite() && estimate >= 0.0 => (observed_cost.amount
                 + estimate
@@ -624,55 +625,18 @@ impl TranslationManager {
                             .await;
                                 continue 'groups;
                             }
-                            if let Some(limit) = opts.cost_limit_usd {
-                                if !observed_cost.complete {
-                                    *budget_error = Some(LocustError::ProviderError(
-                                    "cannot enforce a cost limit: preceding calls have unknown cost"
-                                        .into(),
-                                ));
-                                    refuse_group(
+                            *budget_error = self
+                                .request_budget_error(retry_reqs, opts, *observed_cost)
+                                .await;
+                            if budget_error.is_some() {
+                                refuse_group(
                                     tx,
                                     &selected_ids,
                                     oversize_after_retry,
                                     "translation exceeds the shared TextAsset capacity; entries remain pending (no automatic truncation)",
                                 )
                                 .await;
-                                    continue 'groups;
-                                }
-                                let chars: usize = retry_reqs
-                                    .iter()
-                                    .map(|r| {
-                                        r.source.len()
-                                            + r.context.as_ref().map_or(0, String::len)
-                                            + r.glossary_hint.as_ref().map_or(0, String::len)
-                                    })
-                                    .sum();
-                                match self.provider.estimate_cost(chars, &opts.target_lang).await {
-                                    Some(estimate) if estimate.is_finite() && estimate >= 0.0 => {
-                                        if observed_cost.amount + estimate > limit {
-                                            *budget_error = Some(LocustError::CostLimitExceeded {
-                                                estimated: observed_cost.amount + estimate,
-                                                limit,
-                                            });
-                                        }
-                                    }
-                                    None if self.provider.is_free() => {}
-                                    _ => {
-                                        *budget_error = Some(LocustError::ProviderError(
-                                        "cannot enforce a cost limit: this provider has no valid cost estimate".into(),
-                                    ));
-                                    }
-                                }
-                                if budget_error.is_some() {
-                                    refuse_group(
-                                    tx,
-                                    &selected_ids,
-                                    oversize_after_retry,
-                                    "translation exceeds the shared TextAsset capacity; entries remain pending (no automatic truncation)",
-                                )
-                                .await;
-                                    continue 'groups;
-                                }
+                                continue 'groups;
                             }
                             match call_provider(
                                 self.provider.clone(),
@@ -1201,7 +1165,7 @@ impl TranslationManager {
                     break;
                 }
 
-                let Some(mut chunk) = chunk_iter.pop_front() else {
+                let Some(chunk) = chunk_iter.pop_front() else {
                     break;
                 };
 
@@ -1340,46 +1304,17 @@ impl TranslationManager {
                         chunk_iter.push_front(&chunk[start..offset]);
                         offset = start;
                     }
-                    chunk = &chunk[..first_len];
                     requests.truncate(first_len);
                     placeholders_by_id.retain(|id, _| requests.iter().any(|r| &r.entry_id == id));
                     budgets_by_id.retain(|id, _| requests.iter().any(|r| &r.entry_id == id));
                 }
 
                 // 5b. Check the cost of the actual dispatch slice, not unsent splits.
-                if let Some(limit) = opts.cost_limit_usd {
-                    if !observed_cost.complete {
-                        budget_error = Some(LocustError::ProviderError(
-                            "cannot enforce a cost limit: preceding calls have unknown cost".into(),
-                        ));
-                        break;
-                    }
-                    let char_count: usize = chunk.iter().map(|e| e.source.len()).sum();
-                    if let Some(estimated) = self
-                        .provider
-                        .estimate_cost(char_count, &opts.target_lang)
-                        .await
-                    {
-                        if !estimated.is_finite() || estimated < 0.0 {
-                            budget_error = Some(LocustError::ProviderError(
-                                "cannot enforce a cost limit: this provider has no valid cost estimate".into(),
-                            ));
-                            break;
-                        }
-                        if observed_cost.amount + estimated > limit {
-                            budget_error = Some(LocustError::CostLimitExceeded {
-                                estimated: observed_cost.amount + estimated,
-                                limit,
-                            });
-                            break;
-                        }
-                    } else if !self.provider.is_free() {
-                        budget_error = Some(LocustError::ProviderError(
-                            "cannot enforce a cost limit: this provider has no cost estimate"
-                                .into(),
-                        ));
-                        break;
-                    }
+                budget_error = self
+                    .request_budget_error(&requests, &opts, observed_cost)
+                    .await;
+                if budget_error.is_some() {
+                    break;
                 }
 
                 // 5d. Dispatch provider call to the in-flight window
@@ -1538,7 +1473,11 @@ impl TranslationManager {
                                 break;
                             }
                             budget_error = self
-                                .additional_request_budget_error(&retry_req, &opts, observed_cost)
+                                .request_budget_error(
+                                    std::slice::from_ref(&retry_req),
+                                    &opts,
+                                    observed_cost,
+                                )
                                 .await;
                             if cancel.is_cancelled() || budget_error.is_some() {
                                 break;
@@ -1687,7 +1626,11 @@ impl TranslationManager {
                                 break;
                             }
                             budget_error = self
-                                .additional_request_budget_error(&retry_req, &opts, observed_cost)
+                                .request_budget_error(
+                                    std::slice::from_ref(&retry_req),
+                                    &opts,
+                                    observed_cost,
+                                )
                                 .await;
                             if cancel.is_cancelled() || budget_error.is_some() {
                                 break;
