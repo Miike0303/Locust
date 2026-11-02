@@ -54,6 +54,7 @@ export const es: Record<keyof typeof en, string> = {
   "fastWorkflow.invalidOptions": "Selecciona idiomas de origen y destino diferentes e indica todas las rutas de salida necesarias.",
   "fastWorkflow.reconcileBlocked": "No se pudo confirmar la escritura interrumpida. Revisa el estado de la inyección o del parche antes de reintentar; el flujo no repetirá una escritura incierta.",
   "fastWorkflow.optionsChanged": "Estas opciones son diferentes de las del flujo guardado. No se pueden reanudar sus etapas completadas con otras opciones. Restáuralas o inicia un flujo nuevo.",
+  "fastWorkflow.contentChanged": "El contenido del proyecto cambió. Hay que repetir la validación antes de inyectar.",
   "fastWorkflow.projectChanged": "El proyecto abierto es diferente del flujo guardado. Abre el proyecto original para reanudarlo.",
   "fastWorkflow.failedTranslation": "El proveedor no terminó todas las traducciones necesarias. Reintenta esta etapa antes de continuar.",
   "fastWorkflow.validationFailed": "La validación encontró problemas que impiden continuar. Corrígelos antes de reanudar la inyección.",

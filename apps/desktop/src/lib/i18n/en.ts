@@ -52,6 +52,7 @@ export const en = {
   "fastWorkflow.invalidOptions": "Choose different source and target languages and enter all required output paths.",
   "fastWorkflow.reconcileBlocked": "The interrupted write could not be confirmed. Inspect injection or patch status before retrying; the workflow will not repeat an uncertain write.",
   "fastWorkflow.optionsChanged": "These options differ from the saved workflow. Its completed stages cannot be resumed with changed options. Restore them or start a new workflow.",
+  "fastWorkflow.contentChanged": "Project content changed. Validation must run again before injection.",
   "fastWorkflow.projectChanged": "The open project differs from the saved workflow. Reopen the original project to resume it.",
   "fastWorkflow.failedTranslation": "The provider did not finish all required translations. Retry this stage before continuing.",
   "fastWorkflow.validationFailed": "Validation found blocking issues. Fix them before resuming injection.",
