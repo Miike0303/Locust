@@ -26,6 +26,7 @@ const TOKEN_URL: &str = "https://auth.x.ai/oauth2/token";
 const CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 const SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
 const API_BASE_URL: &str = "https://api.x.ai";
+const DEVICE_LOGIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Refresh when less than this many seconds of validity remain.
 const REFRESH_SKEW_SECS: u64 = 3600;
 
@@ -215,49 +216,86 @@ pub async fn request_device_code() -> Result<DeviceCode> {
 
 /// Fetch a device code from an explicit URL (tests / injected endpoints).
 pub async fn request_device_code_at(url: &str) -> Result<DeviceCode> {
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(url)
-        .form(&[("client_id", CLIENT_ID), ("scope", SCOPE)])
-        .send()
-        .await
-        .map_err(|e| {
-            LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
-                &format!("device code request failed: {}", e),
+    request_device_code_with_timeout(url, DEVICE_LOGIN_TIMEOUT).await
+}
+
+fn device_login_timeout(operation: &str) -> LocustError {
+    LocustError::ProviderError(format!("xAI {operation} timed out; retry login"))
+}
+
+fn device_login_error(
+    error: reqwest::Error,
+    operation: &str,
+    context: &str,
+    secrets: &[&str],
+) -> LocustError {
+    if error.is_timeout() {
+        device_login_timeout(operation)
+    } else {
+        LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
+            &format!("{context}: {error}"),
+            secrets,
+        ))
+    }
+}
+
+async fn request_device_code_with_timeout(url: &str, timeout: Duration) -> Result<DeviceCode> {
+    let request = async {
+        let client = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .map_err(|e| {
+                device_login_error(e, "device code request", "device login client failed", &[])
+            })?;
+        let resp = client
+            .post(url)
+            .form(&[("client_id", CLIENT_ID), ("scope", SCOPE)])
+            .send()
+            .await
+            .map_err(|e| {
+                device_login_error(e, "device code request", "device code request failed", &[])
+            })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = match resp.text().await {
+                Ok(body) => crate::error_sanitizer::sanitize_provider_error(&body, &[]),
+                Err(e) if e.is_timeout() => {
+                    return Err(device_login_timeout("device code request"))
+                }
+                Err(_) => String::new(),
+            };
+            return Err(LocustError::ProviderError(
+                crate::error_sanitizer::sanitize_provider_error(
+                    &format!("device code request returned {}: {}", status, body),
+                    &[],
+                ),
+            ));
+        }
+
+        let dc: DeviceCodeResponse = resp.json().await.map_err(|e| {
+            device_login_error(
+                e,
+                "device code request",
+                "malformed device code response",
                 &[],
-            ))
+            )
         })?;
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = crate::error_sanitizer::sanitize_provider_error(
-            &resp.text().await.unwrap_or_default(),
-            &[],
-        );
-        return Err(LocustError::ProviderError(
-            crate::error_sanitizer::sanitize_provider_error(
-                &format!("device code request returned {}: {}", status, body),
-                &[],
-            ),
-        ));
-    }
-
-    let dc: DeviceCodeResponse = resp.json().await.map_err(|e| {
-        LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
-            &format!("malformed device code response: {}", e),
-            &[],
+        let verification_uri = dc.verification_uri_complete.unwrap_or(dc.verification_uri);
+        Ok(DeviceCode::from_parts(
+            dc.device_code,
+            dc.user_code,
+            verification_uri,
+            dc.interval,
+            dc.expires_in,
+            now_secs().saturating_add(dc.expires_in),
         ))
-    })?;
-
-    let verification_uri = dc.verification_uri_complete.unwrap_or(dc.verification_uri);
-    Ok(DeviceCode::from_parts(
-        dc.device_code,
-        dc.user_code,
-        verification_uri,
-        dc.interval,
-        dc.expires_in,
-        now_secs().saturating_add(dc.expires_in),
-    ))
+    };
+    // One budget covers connection setup, headers and all response decoding.
+    tokio::time::timeout(timeout, request)
+        .await
+        .map_err(|_| device_login_timeout("device code request"))?
 }
 
 /// One poll of the production token endpoint.
@@ -267,59 +305,85 @@ pub async fn poll_for_token(device: &DeviceCode) -> Result<PollOutcome> {
 
 /// One poll of an explicit token URL. Persists tokens on `Complete`.
 pub async fn poll_for_token_at(url: &str, device: &DeviceCode) -> Result<PollOutcome> {
+    poll_for_token_with_timeout(url, device, DEVICE_LOGIN_TIMEOUT).await
+}
+
+async fn poll_for_token_with_timeout(
+    url: &str,
+    device: &DeviceCode,
+    timeout: Duration,
+) -> Result<PollOutcome> {
     if now_secs() > device.expires_at {
         return Ok(PollOutcome::Expired);
     }
 
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(url)
-        .form(&[
-            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-            ("device_code", device.device_code.as_str()),
-            ("client_id", CLIENT_ID),
-        ])
-        .send()
-        .await
-        .map_err(|e| {
-            LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
-                &format!("token poll failed: {}", e),
-                &[&device.device_code],
-            ))
-        })?;
+    let request = async {
+        let client = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .map_err(|e| {
+                device_login_error(
+                    e,
+                    "token poll",
+                    "device login client failed",
+                    &[&device.device_code],
+                )
+            })?;
+        let resp = client
+            .post(url)
+            .form(&[
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ("device_code", device.device_code.as_str()),
+                ("client_id", CLIENT_ID),
+            ])
+            .send()
+            .await
+            .map_err(|e| {
+                device_login_error(e, "token poll", "token poll failed", &[&device.device_code])
+            })?;
 
-    if resp.status().is_success() {
-        let tr: TokenResponse = resp.json().await.map_err(|e| {
-            LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
-                &format!("malformed token response: {}", e),
-                &[&device.device_code],
-            ))
-        })?;
-        let store = TokenStore {
-            access_token: tr.access_token,
-            refresh_token: tr.refresh_token.unwrap_or_default(),
-            expires_at: now_secs() + tr.expires_in,
-        };
-        save_tokens(&store)?;
-        return Ok(PollOutcome::Complete(store));
-    }
-
-    let err: TokenErrorResponse = resp.json().await.unwrap_or(TokenErrorResponse {
-        error: "unknown".to_string(),
-    });
-    match err.error.as_str() {
-        "authorization_pending" => Ok(PollOutcome::Pending),
-        "slow_down" => {
-            device.bump_interval();
-            Ok(PollOutcome::Pending)
+        if resp.status().is_success() {
+            let tr: TokenResponse = resp.json().await.map_err(|e| {
+                device_login_error(
+                    e,
+                    "token poll",
+                    "malformed token response",
+                    &[&device.device_code],
+                )
+            })?;
+            let store = TokenStore {
+                access_token: tr.access_token,
+                refresh_token: tr.refresh_token.unwrap_or_default(),
+                expires_at: now_secs() + tr.expires_in,
+            };
+            save_tokens(&store)?;
+            return Ok(PollOutcome::Complete(store));
         }
-        "access_denied" => Ok(PollOutcome::Denied),
-        "expired_token" => Ok(PollOutcome::Expired),
-        other => Err(LocustError::ProviderError(format!(
-            "login failed: {}",
-            crate::error_sanitizer::sanitize_provider_error(other, &[&device.device_code])
-        ))),
-    }
+
+        let err: TokenErrorResponse = match resp.json().await {
+            Ok(error) => error,
+            Err(e) if e.is_timeout() => return Err(device_login_timeout("token poll")),
+            Err(_) => TokenErrorResponse {
+                error: "unknown".to_string(),
+            },
+        };
+        match err.error.as_str() {
+            "authorization_pending" => Ok(PollOutcome::Pending),
+            "slow_down" => {
+                device.bump_interval();
+                Ok(PollOutcome::Pending)
+            }
+            "access_denied" => Ok(PollOutcome::Denied),
+            "expired_token" => Ok(PollOutcome::Expired),
+            other => Err(LocustError::ProviderError(format!(
+                "login failed: {}",
+                crate::error_sanitizer::sanitize_provider_error(other, &[&device.device_code])
+            ))),
+        }
+    };
+    tokio::time::timeout(timeout, request)
+        .await
+        .map_err(|_| device_login_timeout("token poll"))?
 }
 
 /// Run the browser device-code login and persist tokens.
@@ -739,6 +803,123 @@ mod tests {
     impl Drop for RefreshFixture {
         fn drop(&mut self) {
             set_token_path_override(None);
+        }
+    }
+
+    async fn assert_device_login_deadline(poll: bool, status: Option<u16>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let fixture = RefreshFixture::new();
+        let original = std::fs::read(&fixture.path).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/oauth2/stalled", listener.local_addr().unwrap());
+        let (stalled_tx, stalled_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 4096];
+            let mut request = Vec::new();
+            loop {
+                let count = stream.read(&mut buffer).await.unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&buffer[..count]);
+                if request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            if let Some(status) = status {
+                let headers = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: 4096\r\n\r\n{{"
+                );
+                stream.write_all(headers.as_bytes()).await.unwrap();
+            }
+            stalled_tx.send(()).unwrap();
+            // Keep the connection open without completing headers or the body.
+            while stream.read(&mut buffer).await.unwrap_or(0) != 0 {}
+        });
+        let device = DeviceCode::from_parts(
+            "dev-abc",
+            "CODE",
+            "https://example",
+            5,
+            900,
+            now_secs() + 900,
+        );
+        let result = tokio::time::timeout(Duration::from_secs(1), async {
+            if poll {
+                poll_for_token_with_timeout(&url, &device, Duration::from_millis(100))
+                    .await
+                    .map(|_| ())
+            } else {
+                request_device_code_with_timeout(&url, Duration::from_millis(100))
+                    .await
+                    .map(|_| ())
+            }
+        })
+        .await;
+        server.abort();
+        stalled_rx
+            .await
+            .expect("server reached the requested stall");
+        let error = result
+            .expect("device-login operation exceeded its deadline")
+            .unwrap_err();
+        let expected = if poll {
+            "xAI token poll timed out; retry login"
+        } else {
+            "xAI device code request timed out; retry login"
+        };
+        assert!(matches!(&error, LocustError::ProviderError(message) if message == expected));
+        assert!(locust_core::translation::is_retryable(&error), "{error}");
+        assert_eq!(std::fs::read(&fixture.path).unwrap(), original);
+
+        // A timed-out attempt releases all state needed by a fresh login.
+        let server = MockServer::start();
+        let start = server.mock(|when, then| {
+            when.method(POST).path("/oauth2/device/code");
+            then.status(200).json_body(mock_device_payload());
+        });
+        let complete = server.mock(|when, then| {
+            when.method(POST).path("/oauth2/token");
+            then.status(200).json_body(serde_json::json!({
+                "access_token": "replacement-access", "refresh_token": "replacement-refresh"
+            }));
+        });
+        let device = request_device_code_at(&server.url("/oauth2/device/code"))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&fixture.path).unwrap(), original);
+        assert!(matches!(
+            poll_for_token_at(&server.url("/oauth2/token"), &device)
+                .await
+                .unwrap(),
+            PollOutcome::Complete(_)
+        ));
+        assert_eq!(load_tokens().unwrap().access_token, "replacement-access");
+        start.assert();
+        complete.assert();
+    }
+
+    #[tokio::test]
+    async fn device_login_deadline_request_stalled_headers() {
+        assert_device_login_deadline(false, None).await;
+    }
+
+    #[tokio::test]
+    async fn device_login_deadline_request_stalled_body() {
+        for status in [200, 400, 503] {
+            assert_device_login_deadline(false, Some(status)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn device_login_deadline_poll_stalled_headers() {
+        assert_device_login_deadline(true, None).await;
+    }
+
+    #[tokio::test]
+    async fn device_login_deadline_poll_stalled_body() {
+        for status in [200, 400, 503] {
+            assert_device_login_deadline(true, Some(status)).await;
         }
     }
 

@@ -390,6 +390,28 @@ impl TranslationProvider for OpenAiProvider {
             ));
         }
 
+        if self.id == "lmstudio" {
+            #[derive(Deserialize)]
+            struct ModelsResponse {
+                data: Vec<Model>,
+            }
+            #[derive(Deserialize)]
+            struct Model {
+                id: String,
+            }
+
+            let model_guidance = || {
+                LocustError::ProviderError(format!(
+                    "LM Studio could not verify configured model '{}'. Load the model in LM Studio or update the configured model ID, then test the connection again.",
+                    self.model
+                ))
+            };
+            let models: ModelsResponse = resp.json().await.map_err(|_| model_guidance())?;
+            if !models.data.iter().any(|model| model.id == self.model) {
+                return Err(model_guidance());
+            }
+        }
+
         Ok(())
     }
 }
@@ -714,6 +736,95 @@ mod tests {
 
         let provider = make_provider(&server);
         assert!(provider.health_check().await.is_err());
+    }
+
+    async fn assert_lm_studio_model_guidance(body: &str) {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/v1/models");
+            then.status(200).body(body);
+        });
+        let provider = OpenAiProvider::lm_studio(Some(server.base_url()), None);
+        let error = provider.health_check().await.unwrap_err().to_string();
+        assert!(error.contains("qwen/qwen3-14b"), "{error}");
+        assert!(error.contains("Load the model in LM Studio"), "{error}");
+        assert!(error.contains("configured model ID"), "{error}");
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn lm_studio_health_empty_models_gives_guidance() {
+        assert_lm_studio_model_guidance(r#"{"data":[]}"#).await;
+    }
+
+    #[tokio::test]
+    async fn lm_studio_health_malformed_models_gives_guidance() {
+        for body in ["not JSON", "{}", r#"{"data":[{}]}"#, r#"{"data":null}"#] {
+            assert_lm_studio_model_guidance(body).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn lm_studio_health_different_model_gives_guidance() {
+        assert_lm_studio_model_guidance(r#"{"data":[{"id":"qwen/qwen3-14b-other"}]}"#).await;
+    }
+
+    #[tokio::test]
+    async fn lm_studio_health_configured_model_passes() {
+        for model in ["qwen/qwen3-14b", "custom-loaded-model"] {
+            let server = MockServer::start();
+            let mock = server.mock(|when, then| {
+                when.method(GET).path("/v1/models");
+                then.status(200).json_body(serde_json::json!({
+                    "data": [{"id": "other-model"}, {"id": model}]
+                }));
+            });
+            let provider = OpenAiProvider::lm_studio(
+                Some(format!("{}/v1/", server.base_url())),
+                (model != "qwen/qwen3-14b").then(|| model.to_string()),
+            );
+            provider.health_check().await.unwrap();
+            mock.assert();
+        }
+    }
+
+    #[tokio::test]
+    async fn cloud_health_checks_remain_status_only() {
+        for (id, name) in [
+            ("openai", "OpenAI"),
+            ("deepseek", "DeepSeek"),
+            ("grok", "Grok"),
+        ] {
+            for body in [r#"{"data":[]}"#, "not JSON", r#"{"data":[{"id":"other"}]}"#] {
+                let server = MockServer::start();
+                let mut mock = server.mock(|when, then| {
+                    when.method(GET).path("/v1/models");
+                    then.status(200).body(body);
+                });
+                let provider = if id == "openai" {
+                    make_provider(&server)
+                } else {
+                    OpenAiProvider::compatible(
+                        id.into(),
+                        name.into(),
+                        "test-key".into(),
+                        server.base_url(),
+                        "selected-model".into(),
+                    )
+                };
+                provider.health_check().await.unwrap();
+                mock.assert();
+                mock.delete();
+                let unauthorized = server.mock(|when, then| {
+                    when.method(GET).path("/v1/models");
+                    then.status(401).body(body);
+                });
+                let error = provider.health_check().await.unwrap_err();
+                assert!(!locust_core::translation::is_retryable(&error), "{error}");
+                assert!(error.to_string().contains("returned status 401"), "{error}");
+                unauthorized.assert();
+            }
+        }
     }
     #[tokio::test]
     async fn w8_rejected_answers_carry_usage() {
