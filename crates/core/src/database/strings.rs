@@ -851,22 +851,48 @@ impl Database {
 
     pub fn get_stats(&self) -> Result<ProjectStats> {
         let conn = lock_connection(&self.conn);
-        // One table scan: the editor polls this after every page of work.
-        let mut stmt =
-            conn.prepare_cached("SELECT status, COUNT(*) FROM strings GROUP BY status")?;
+        // Keep the existing covering-index count and read the revision in the
+        // same SQLite snapshot, even when another connection is writing.
+        // LEFT JOIN also returns the token for a project with no strings.
+        let stmt = conn.prepare_cached(
+            "WITH counts AS (SELECT status, COUNT(*) AS n FROM strings GROUP BY status)
+             SELECT counts.status, COALESCE(counts.n, 0), r.content_epoch, r.content_revision
+             FROM project_content_revision r LEFT JOIN counts ON TRUE
+             WHERE r.singleton = 1",
+        );
+        let mut stmt = match stmt {
+            // Saved-project preflight opens legacy DBs read-only, before the
+            // additive migration. Preserve their stats without inventing a token.
+            Err(rusqlite::Error::SqliteFailure(code, Some(message)))
+                if code.extended_code == rusqlite::ffi::SQLITE_ERROR
+                    && message == "no such table: project_content_revision" =>
+            {
+                conn.prepare_cached(
+                    "SELECT status, COUNT(*), NULL, NULL FROM strings GROUP BY status",
+                )?
+            }
+            result => result?,
+        };
         let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?))
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, usize>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<u64>>(3)?,
+            ))
         })?;
         let mut stats = ProjectStats::default();
         for row in rows {
-            let (status, n) = row?;
+            let (status, n, epoch, revision) = row?;
+            stats.content_epoch = epoch;
+            stats.content_revision = revision;
             stats.total += n;
-            match status.as_str() {
-                "pending" => stats.pending = n,
-                "translated" => stats.translated = n,
-                "reviewed" => stats.reviewed = n,
-                "approved" => stats.approved = n,
-                "error" => stats.error = n,
+            match status.as_deref() {
+                Some("pending") => stats.pending = n,
+                Some("translated") => stats.translated = n,
+                Some("reviewed") => stats.reviewed = n,
+                Some("approved") => stats.approved = n,
+                Some("error") => stats.error = n,
                 _ => {}
             }
         }

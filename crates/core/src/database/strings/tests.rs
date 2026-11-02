@@ -1091,7 +1091,9 @@ fn merge_entries_writes_only_changed_rows() {
         .query_row("SELECT total_changes()", [], |row| row.get(0))
         .unwrap();
     assert_eq!(stats.updated, 1);
-    assert_eq!(after - before, 1, "only the changed row should be written");
+    // total_changes() includes trigger writes: one string row plus one
+    // project_content_revision bump.
+    assert_eq!(after - before, 2, "only the changed row should be written");
 
     let stats = db.merge_entries(&[unchanged, changed]).unwrap();
     let final_changes: i64 = lock_connection(&db.conn)

@@ -85,9 +85,9 @@ async function proveTranslationComplete(receipt: FastWorkflowReceipt): Promise<v
   if (stats.pending !== 0 || stats.error !== 0 || stats.total < 1) throw failure("failedTranslation");
 }
 
-// Stats alone miss same-status edits. Hash the existing bounded row pages and
-// run ledger, retaining only a small fingerprint per row, never translated text
-// in localStorage. Two independent 32-bit accumulators detect accidental changes.
+// Compatibility fallback for backends without a content revision. Retain only
+// row fingerprints, never translated text in localStorage. Two independent
+// 32-bit accumulators detect accidental changes.
 function fingerprint(value: string): string {
   let a = 2166136261;
   let b = 5381;
@@ -113,29 +113,38 @@ async function readContentRevision(receipt: FastWorkflowReceipt): Promise<FastWo
   const stats = await getStats();
   assertScope(receipt);
   if (!Number.isSafeInteger(stats.total) || stats.total < 0) throw failure("contentChanged");
-  const rows = new Map<string, string>();
-  let offset = 0;
-  do {
-    const page = await getStrings({ offset, limit: 500 });
+  let contentFingerprint: string;
+  if (typeof stats.content_epoch === "string" && stats.content_epoch.length > 0 &&
+    typeof stats.content_revision === "number" && Number.isSafeInteger(stats.content_revision) && stats.content_revision >= 0) {
+    contentFingerprint = `db-v1:${canonicalJson([stats.content_epoch, stats.content_revision])}`;
+  } else {
+    // Older servers (or revisions outside JS's exact integer range) still use
+    // the complete row/run fingerprint rather than risk reusing stale work.
+    const rows = new Map<string, string>();
+    let offset = 0;
+    do {
+      const page = await getStrings({ offset, limit: 500 });
+      assertScope(receipt);
+      if (page.total !== stats.total || page.offset !== offset || !page.entries.length && offset < stats.total) throw failure("contentChanged");
+      for (const entry of page.entries) {
+        if (rows.has(entry.id)) throw failure("contentChanged");
+        rows.set(entry.id, fingerprint(canonicalJson(entry)));
+      }
+      offset += page.entries.length;
+      if (offset > stats.total) throw failure("contentChanged");
+    } while (offset < stats.total);
+    const runs = await getTranslationRuns();
     assertScope(receipt);
-    if (page.total !== stats.total || page.offset !== offset || !page.entries.length && offset < stats.total) throw failure("contentChanged");
-    for (const entry of page.entries) {
-      if (rows.has(entry.id)) throw failure("contentChanged");
-      rows.set(entry.id, fingerprint(canonicalJson(entry)));
-    }
-    offset += page.entries.length;
-    if (offset > stats.total) throw failure("contentChanged");
-  } while (offset < stats.total);
-  const runs = await getTranslationRuns();
-  assertScope(receipt);
+    contentFingerprint = `rows-v1:${fingerprint(canonicalJson([
+      stats, [...rows].sort(([a], [b]) => a.localeCompare(b)), [...runs].sort((a, b) => a.id - b.id),
+    ]))}`;
+  }
   const after = await getStats();
   assertScope(receipt);
   const finalProject = await getCurrentProject();
   assertScope(receipt);
   if (!finalProject || draftProjectKey(finalProject) !== projectKey || canonicalJson(stats) !== canonicalJson(after)) throw failure("contentChanged");
-  return { projectKey, fingerprint: `rows-v1:${fingerprint(canonicalJson([
-    stats, [...rows].sort(([a], [b]) => a.localeCompare(b)), [...runs].sort((a, b) => a.id - b.id),
-  ]))}` };
+  return { projectKey, fingerprint: contentFingerprint };
 }
 
 async function translateStage(

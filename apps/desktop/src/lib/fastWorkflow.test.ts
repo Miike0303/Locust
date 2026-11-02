@@ -748,6 +748,113 @@ async function pauseAfterValidation(englishPivot = false) {
   return parseFastWorkflowReceipt(JSON.stringify(result))!;
 }
 
+function useBackendContentRevision(revision = 0, epoch = "database-epoch") {
+  transport.responses.getStats = { ...(transport.responses.getStats as object), content_epoch: epoch, content_revision: revision };
+  transport.responses.getStrings = () => { throw new Error("fast revision must not scan rows"); };
+  transport.responses.getTranslationRuns = () => { throw new Error("fast revision must not scan run history"); };
+}
+
+for (const englishPivot of [false, true]) {
+  test(`backend revision preserves unchanged work without row or run scans (${englishPivot ? "pivot" : "direct"})`, async () => {
+    resetTransport();
+    useBackendContentRevision(); // Zero is a valid revision.
+    const receipt = await pauseAfterValidation(englishPivot);
+    const translation = englishPivot ? "translateTarget" : "translate";
+    assert.match(stage(receipt, "validate").result!.contentRevision!.fingerprint, /^db-v1:/);
+    transport.calls = [];
+    const { result } = await run(receipt, fastWorkflowAdapter);
+    assert.equal(result.status, "completed");
+    for (const id of [translation, "validate"] as const) assert.deepEqual(stage(result, id), stage(receipt, id));
+    assert.ok(!transport.calls.some(([name]) => ["getStrings", "getTranslationRuns", "validate", "startTranslation"].includes(name)));
+  });
+
+  test(`backend revision bump invalidates validation with unchanged counts (${englishPivot ? "pivot" : "direct"})`, async () => {
+    resetTransport();
+    useBackendContentRevision();
+    const receipt = await pauseAfterValidation(englishPivot);
+    useBackendContentRevision(1);
+    transport.responses.validate = { validation: { issues_found: 1, by_kind: { MissingPlaceholder: 1 }, issues: [] }, fonts: [] };
+    transport.calls = [];
+    const { result, snapshots } = await run(receipt, fastWorkflowAdapter);
+    assert.equal(result.error, "fastWorkflow.validationFailed");
+    assert.ok(snapshots.some(r => stage(r, "validate").status === "pending" && stage(r, "validate").reason === "fastWorkflow.contentChanged"));
+    assert.ok(transport.calls.some(([name]) => name === "validate"));
+    assert.ok(!transport.calls.some(([name]) => ["getStrings", "getTranslationRuns", "inject", "patchPack", "startTranslation"].includes(name)));
+  });
+}
+
+test("a recreated database at the same path invalidates validation even at the same revision", async () => {
+  resetTransport();
+  useBackendContentRevision(7, "original-epoch");
+  const receipt = await pauseAfterValidation();
+  useBackendContentRevision(7, "replacement-epoch");
+  transport.calls = [];
+  const { result, snapshots } = await run(receipt, fastWorkflowAdapter);
+  assert.equal(result.status, "completed");
+  assert.ok(snapshots.some(r => stage(r, "validate").status === "pending" && stage(r, "validate").reason === "fastWorkflow.contentChanged"));
+  assert.ok(transport.calls.some(([name]) => name === "validate"));
+  assert.ok(!transport.calls.some(([name]) => ["getStrings", "getTranslationRuns", "startTranslation"].includes(name)));
+});
+
+test("backend revision uses exactly two stats reads and retains project identity", async () => {
+  resetTransport();
+  useBackendContentRevision(7);
+  const receipt = directReceipt("validate");
+  const revision = await fastWorkflowAdapter.getRevision!("validate", receipt, contextFor(receipt, "validate"));
+  assert.equal(revision.projectKey, fastWorkflowProjectKey(project));
+  assert.match(revision.fingerprint, /^db-v1:/);
+  assert.deepEqual(transport.calls.map(([name]) => name), ["getCurrentProject", "getStats", "getStats", "getCurrentProject"]);
+});
+
+for (const changed of ["content_epoch", "content_revision"] as const) {
+  test(`backend revision detects ${changed} changing between the two stats reads`, async () => {
+    resetTransport();
+    useBackendContentRevision(7);
+    const stats = transport.responses.getStats as object;
+    let reads = 0;
+    transport.responses.getStats = () => ({ ...stats, ...(reads++ ? { [changed]: changed === "content_epoch" ? "replacement" : 8 } : {}) });
+    const receipt = directReceipt("validate");
+    await assert.rejects(
+      fastWorkflowAdapter.getRevision!("validate", receipt, contextFor(receipt, "validate")),
+      /fastWorkflow.contentChanged/,
+    );
+    assert.equal(reads, 2);
+    assert.ok(!transport.calls.some(([name]) => ["getStrings", "getTranslationRuns"].includes(name)));
+  });
+}
+
+test("backend revision changing during validation blocks injection", async () => {
+  resetTransport();
+  useBackendContentRevision(7);
+  transport.responses.validate = () => {
+    useBackendContentRevision(8);
+    return { validation: { issues_found: 0, by_kind: {}, issues: [] }, fonts: [] };
+  };
+  const { result } = await run(directReceipt("validate"), fastWorkflowAdapter);
+  assert.equal(result.error, "fastWorkflow.contentChanged");
+  assert.equal(stage(result, "validate").status, "failed");
+  assert.ok(!transport.calls.some(([name]) => ["getStrings", "getTranslationRuns", "inject", "patchPack"].includes(name)));
+});
+
+for (const [label, fields] of [
+  ["both fields absent", {}],
+  ["epoch absent", { content_revision: 1 }],
+  ["revision absent", { content_epoch: "epoch" }],
+  ["null fields", { content_epoch: null, content_revision: null }],
+  ["revision outside JavaScript's exact integer range", { content_epoch: "epoch", content_revision: Number.MAX_SAFE_INTEGER + 1 }],
+] as const) {
+  test(`row fingerprint fallback remains available with ${label}`, async () => {
+    resetTransport();
+    transport.responses.getStats = { ...(transport.responses.getStats as object), ...fields };
+    const receipt = directReceipt("validate");
+    const revision = await fastWorkflowAdapter.getRevision!("validate", receipt, contextFor(receipt, "validate"));
+    assert.match(revision.fingerprint, /^rows-v1:/);
+    assert.equal(transport.calls.filter(([name]) => name === "getStats").length, 2);
+    assert.equal(transport.calls.filter(([name]) => name === "getStrings").length, 2);
+    assert.equal(transport.calls.filter(([name]) => name === "getTranslationRuns").length, 1);
+  });
+}
+
 for (const englishPivot of [false, true]) {
   test(`resume invalidates old validation after a same-count DB row edit (${englishPivot ? "pivot" : "direct"})`, async () => {
     resetTransport();

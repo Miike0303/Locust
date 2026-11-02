@@ -148,6 +148,12 @@ pub struct ProjectStats {
     pub approved: usize,
     pub error: usize,
     pub total_cost_usd: f64,
+    /// Persistent database identity; changes when a project DB is recreated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_epoch: Option<String>,
+    /// Bumped transactionally for string writes and run insertion/deletion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_revision: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]

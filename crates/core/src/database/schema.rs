@@ -186,6 +186,50 @@ pub(super) fn init_schema(conn: &Connection) -> Result<()> {
             DELETE FROM string_revisions WHERE entry_id = old.id;
         END;",
     )?;
+    // A database identity and monotonic token cover every writer, including
+    // external connections. Triggers participate in the content transaction.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS project_content_revision (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            content_epoch TEXT NOT NULL,
+            content_revision INTEGER NOT NULL
+                CHECK(typeof(content_revision) = 'integer' AND content_revision >= 0)
+        );
+        INSERT OR IGNORE INTO project_content_revision
+            (singleton, content_epoch, content_revision)
+        VALUES (1, lower(hex(randomblob(16))), 0);
+
+        CREATE TRIGGER IF NOT EXISTS strings_content_insert
+        AFTER INSERT ON strings
+        BEGIN
+            UPDATE project_content_revision SET content_revision = content_revision + 1
+            WHERE singleton = 1;
+        END;
+        CREATE TRIGGER IF NOT EXISTS strings_content_update
+        AFTER UPDATE ON strings
+        BEGIN
+            UPDATE project_content_revision SET content_revision = content_revision + 1
+            WHERE singleton = 1;
+        END;
+        CREATE TRIGGER IF NOT EXISTS strings_content_delete
+        AFTER DELETE ON strings
+        BEGIN
+            UPDATE project_content_revision SET content_revision = content_revision + 1
+            WHERE singleton = 1;
+        END;
+        CREATE TRIGGER IF NOT EXISTS translation_runs_content_insert
+        AFTER INSERT ON translation_runs
+        BEGIN
+            UPDATE project_content_revision SET content_revision = content_revision + 1
+            WHERE singleton = 1;
+        END;
+        CREATE TRIGGER IF NOT EXISTS translation_runs_content_delete
+        AFTER DELETE ON translation_runs
+        BEGIN
+            UPDATE project_content_revision SET content_revision = content_revision + 1
+            WHERE singleton = 1;
+        END;",
+    )?;
     tx.commit()?;
     Ok(())
 }

@@ -196,6 +196,8 @@ export interface ProjectStats {
   total: number; pending: number; translated: number;
   reviewed: number; approved: number; error: number;
   total_cost_usd: number;
+  content_epoch?: string;
+  content_revision?: number;
 }
 
 export interface FileStats {
