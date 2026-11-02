@@ -1,7 +1,7 @@
 import { useTranslationSettings } from "../lib/useTranslationSettings";
 import { useTranslationEstimate } from "../lib/useTranslationEstimate";
 import TranslationEstimate from "./TranslationEstimate";
-import { localizeApiError } from "../lib/apiError";
+import { localizeApiError, normalizeProviderHealth } from "../lib/apiError";
 import { formatObservedCost } from "../lib/translationCost";
 import { useState, useEffect, useRef } from "react";
 import { X } from "lucide-react";
@@ -302,8 +302,10 @@ export default function TranslationModal({
 			const result = await api.checkProviderHealth(providerId);
 			setHealthResult(result);
 		} catch (err: unknown) {
-			const message = err instanceof Error ? err.message : String(err);
-			setHealthResult({ ok: false, message });
+			const raw = err instanceof Error ? err.message : String(err);
+			const result = normalizeProviderHealth({ ok: false, message: raw });
+			addLog("warning", result.message, result.rawMessage, "provider-health");
+			setHealthResult(result);
 		} finally {
 			setTestingHealth(false);
 		}

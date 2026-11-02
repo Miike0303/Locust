@@ -9,6 +9,7 @@ const h = {
   t, locale: "en", project: { ...project }, editor: { isTranslating: false, selectedEntryId: "selected", jobSnapshot: null as any },
   states: [] as any[], cursor: 0, changed: false, effects: [] as (() => void)[],
   calls: [] as any[], handlers: null as any, unsubscribed: 0,
+  health: { ok: true, message: "ok" }, healthError: "", logs: [] as any[],
   state(initial: any) {
     const index = this.cursor++;
     if (!(index in this.states)) this.states[index] = typeof initial === "function" ? initial() : initial;
@@ -35,7 +36,7 @@ const hooks = registerHooks({
         react: "export const useState=initial=>h.state(initial);export const useRef=initial=>h.state(()=>({current:initial}))[0];export const useEffect=(fn,deps)=>h.effect(fn,deps);",
         "@tanstack/react-query": "export const useQuery=options=>options.queryKey[0]==='providers'?{data:[{id:'google',name:'Google',is_free:true,requires_api_key:false}]}:options.queryKey[0]==='config'?{data:{default_provider:'google'},isFetched:true,isError:false}:{data:[{file_path:'menus.json'},{file_path:'intro_日本語.json'}]};",
         "react-router-dom": "export const useNavigate=()=>()=>{};",
-        "../lib/api": "export const getProviders=()=>{};export const getConfig=()=>{};export const getFileStats=()=>{};export const checkProviderHealth=async()=>({ok:true,message:'ok'});",
+        "../lib/api": "export const getProviders=()=>{};export const getConfig=()=>{};export const getFileStats=()=>{};export const checkProviderHealth=async()=>{if(h.healthError)throw new Error(h.healthError);return h.health;};",
         "../lib/useTranslationSettings": "export const useTranslationSettings=()=>({fallbackIds:[],setFallbackIds:()=>{},fallbackPick:'',setFallbackPick:()=>{},addFallback:()=>{},removeFallback:()=>{},providerReadiness:{ready:true}});",
         "../lib/useTranslationEstimate": "export const useTranslationEstimate=()=>({pending:false});",
         "./TranslationEstimate": "export default ()=>null;",
@@ -45,7 +46,7 @@ const hooks = registerHooks({
         "../stores/editorStore": "export const useEditorStore=()=>h.editor;",
         "../stores/projectStore": "export const useProjectStore=()=>({project:h.project});useProjectStore.getState=()=>({project:h.project});",
         "../lib/projectScope": "export const draftProjectKey=p=>JSON.stringify([p.database_path,p.path,p.format_id]);",
-        "../stores/logStore": "export const addLog=()=>{};",
+        "../stores/logStore": "export const addLog=(...args)=>h.logs.push(args);",
         "../stores/toastStore": "export const addToast=()=>{};",
         "../lib/modalA11y": "export const useModalA11y=()=>({dialogRef:{current:null},dialogProps:{role:'dialog'},titleProps:{id:'title'}});export const MODAL_BACKDROP_CLASS='modal';export const modalPanelClass=x=>x;",
         "../lib/i18n": "export const useT=()=>h.t;export const useLocale=()=>({locale:h.locale});",
@@ -60,6 +61,7 @@ after(() => { hooks.deregister(); Reflect.deleteProperty(globalThis, "__translat
 beforeEach(() => {
   h.states = []; h.cursor = 0; h.effects = []; h.calls = []; h.handlers = null; h.unsubscribed = 0;
   h.project = { ...project }; h.editor = { isTranslating: false, selectedEntryId: "selected", jobSnapshot: null };
+  h.health = { ok: true, message: "ok" }; h.healthError = ""; h.logs = [];
   h.locale = "en"; setLocale("en");
 });
 
@@ -218,4 +220,26 @@ test("translation builder distinguishes omitted and explicitly empty scope and c
   ids.push("new"); files.push("other");
   assert.deepEqual(params.options.entry_ids, []);
   assert.deepEqual(params.options.file_paths, [" a_日本語.json "]);
+});
+
+for (const locale of ["en", "es"] as const) {
+  test(`health transport failures show localized guidance and retain activity details in ${locale}`, async () => {
+    h.locale = locale; setLocale(locale);
+    h.healthError = "opaque English transport failure";
+    const tree = render();
+    await find(tree, node => node.type === "button" && text(node) === t("translate.testConnection")).props.onClick();
+    const expected = locale === "es"
+      ? "La comprobación del proveedor falló. Revise Ajustes → Proveedores y los detalles de actividad. Después, vuelva a intentarlo."
+      : "The provider check failed. Review Settings → Providers and the activity details, then retry.";
+    assert.ok(text(render()).includes(expected));
+    assert.ok(!text(render()).includes(h.healthError));
+    assert.equal(h.logs.length, 1);
+    assert.equal(h.logs[0][2], h.healthError);
+  });
+}
+
+test("the modal displays normalized health guidance", async () => {
+  h.health = { ok: false, message: "El proveedor está detenido. Inícielo para continuar." };
+  await find(render(), node => node.type === "button" && text(node) === t("translate.testConnection")).props.onClick();
+  assert.ok(text(render()).includes(h.health.message));
 });

@@ -335,3 +335,38 @@ export class ApiError extends Error {
 			?? (BINARY_SLOT_CAPACITY.test(originalBody) ? "api.error.binarySlotCapacity" : undefined);
 	}
 }
+
+/** HTTP 200 health responses carry diagnostics rather than translated UI text. */
+export interface ProviderHealthPayload {
+  ok: boolean;
+  message: string;
+  message_key?: string;
+}
+export interface ProviderHealthResult {
+  ok: boolean;
+  message: string;
+  rawMessage: string;
+}
+
+// Only health guidance keys are trusted; arbitrary server keys are not UI copy.
+const HEALTH_MESSAGE_KEYS: readonly MessageKey[] = [
+  "providers.healthCheckTimedOut",
+  "providers.healthHealthy",
+  "providers.healthProviderMissing",
+  "providers.healthOllamaStopped",
+  "providers.healthModelMissing",
+  "providers.healthCheckFailed",
+];
+
+export function normalizeProviderHealth(payload: ProviderHealthPayload): ProviderHealthResult {
+  const rawMessage = payload.message;
+  const recognizedKey = HEALTH_MESSAGE_KEYS.find(key => key === payload.message_key);
+  let key: MessageKey = recognizedKey ?? "providers.healthCheckFailed";
+  if (!recognizedKey) {
+    if (payload.ok) key = "providers.healthHealthy";
+    else if (rawMessage === "provider not found") key = "providers.healthProviderMissing";
+    else if (rawMessage.startsWith("provider error: Ollama is not running at ")) key = "providers.healthOllamaStopped";
+    else if (/^provider error: Model '[^\r\n]+' not found in Ollama\. Run: ollama pull [^\r\n]+$/.test(rawMessage)) key = "providers.healthModelMissing";
+  }
+  return { ok: payload.ok, message: t(key), rawMessage };
+}

@@ -74,8 +74,11 @@ export function createDraftPersistence(getStorage: () => DraftStorage = browserD
       return { record: null, issue: "tooLarge" as DraftStorageIssue };
     }
     const before = read();
-    // Read failure must not be treated as an empty store and overwritten.
-    if (before.issue === "unavailable" || before.issue === "full" || before.records.length >= MAX_DRAFT_RECORDS) {
+    const previous = before.records.find(r => r.revision === parent && r.entryKey === entryKey);
+    // At capacity, only a verified replacement may add a revision before retiring
+    // its predecessor. An incomplete snapshot still cannot authorize a write.
+    if (before.issue === "unavailable" || before.issue === "full" ||
+      (before.records.length >= MAX_DRAFT_RECORDS && !previous)) {
       return { record: null, issue: before.issue ?? "full" as DraftStorageIssue };
     }
     try {
@@ -90,7 +93,6 @@ export function createDraftPersistence(getStorage: () => DraftStorage = browserD
       serialized.set(record, raw);
       // Never delete the previous revision until the replacement is durable.
       // Checking ownership also prevents a malformed reference deleting another project.
-      const previous = before.records.find(r => r.revision === parent && r.entryKey === entryKey);
       if (previous) {
         const cleanupIssue = remove(previous);
         return { record, issue: cleanupIssue ?? before.issue };

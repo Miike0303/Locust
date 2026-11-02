@@ -4,7 +4,7 @@ import { refreshGameState } from "./queryClient";
 import { invoke } from "@tauri-apps/api/core";
 import { addLog } from "../stores/logStore";
 import { t } from "./i18n";
-import { ApiError, isMalformedPoStringError } from "./apiError";
+import { ApiError, isMalformedPoStringError, normalizeProviderHealth, type ProviderHealthPayload } from "./apiError";
 import { mergeRequestInit } from "./requestInit";
 import {
   PIVOT_OPEN_DB_HTTP_PATH,
@@ -534,8 +534,12 @@ export const createFontPatch = (body: FontPatchRequest): Promise<FontPatchRespon
 export const getProviders = (): Promise<ProviderInfo[]> =>
   IS_TAURI ? tauriInvoke("get_providers") : request("/providers");
 
-export const checkProviderHealth = (id: string) =>
-  request<{ ok: boolean; message: string }>(`/providers/${id}/health`, { method: "POST" });
+export const checkProviderHealth = async (id: string) => {
+  const payload = await request<ProviderHealthPayload>(`/providers/${id}/health`, { method: "POST" });
+  const result = normalizeProviderHealth(payload);
+  addLog(result.ok ? "info" : "warning", result.message, result.rawMessage, "provider-health");
+  return result;
+};
 
 export const openProject = (
   path: string,

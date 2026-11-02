@@ -1212,3 +1212,33 @@ test("glossary conflict keeps its typed identity and localizes HTTP and Tauri er
     }
   }
 });
+
+const healthCases = [
+  { name: "healthy", payload: { ok: true, message: "healthy" }, en: "The provider is ready.", es: "El proveedor está listo." },
+  { name: "missing provider", payload: { ok: false, message: "provider not found" }, en: "The provider is unavailable. Review its configuration in Settings → Providers.", es: "El proveedor no está disponible. Revise su configuración en Ajustes → Proveedores." },
+  { name: "stopped Ollama", payload: { ok: false, message: "provider error: Ollama is not running at http://localhost:11434. Install from https://ollama.ai. Error: connection refused" }, en: "Could not connect to Ollama. Start Ollama and check its address in Settings → Providers, then retry.", es: "No se pudo conectar con Ollama. Inicie Ollama y compruebe su dirección en Ajustes → Proveedores. Después, vuelva a intentarlo." },
+  { name: "missing model", payload: { ok: false, message: "provider error: Model 'llama3.2' not found in Ollama. Run: ollama pull llama3.2" }, en: "The selected Ollama model is not installed. Download it in Ollama or select an installed model in Settings → Providers, then retry.", es: "El modelo seleccionado de Ollama no está instalado. Descárguelo en Ollama o seleccione un modelo instalado en Ajustes → Proveedores. Después, vuelva a intentarlo." },
+  { name: "timeout key", payload: { ok: false, message: "opaque timeout diagnostic", message_key: "providers.healthCheckTimedOut" }, en: "Provider health check timed out", es: "Se agotó el tiempo de espera de la comprobación del proveedor" },
+  { name: "unknown diagnostic and unrecognized key", payload: { ok: false, message: "unrecognized English diagnostic", message_key: "common.save" }, en: "The provider check failed. Review Settings → Providers and the activity details, then retry.", es: "La comprobación del proveedor falló. Revise Ajustes → Proveedores y los detalles de actividad. Después, vuelva a intentarlo." },
+];
+for (const locale of ["en", "es"] as const) {
+  for (const fixture of healthCases) {
+    test(`HTTP 200 health ${fixture.name} localizes in ${locale} and logs the original detail`, async () => {
+      setLocale(locale);
+      rawFailure = JSON.stringify(fixture.payload);
+      httpFailureStatus = 200;
+      useLogStore.getState().clear();
+      try {
+        const result = await api.checkProviderHealth("ollama");
+        assert.equal(result.ok, fixture.payload.ok);
+        assert.equal(result.message, fixture[locale]);
+        assert.equal(result.rawMessage, fixture.payload.message);
+        const entries = useLogStore.getState().entries;
+        assert.equal(entries.length, 1);
+        assert.equal(entries[0].level, fixture.payload.ok ? "info" : "warning");
+        assert.equal(entries[0].message, fixture[locale]);
+        assert.equal(entries[0].detail, fixture.payload.message);
+      } finally { httpFailureStatus = 400; }
+    });
+  }
+}

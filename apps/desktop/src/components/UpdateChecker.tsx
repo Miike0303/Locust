@@ -1,8 +1,11 @@
 import { IS_TAURI } from "../lib/runtime";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Download, CheckCircle, AlertCircle } from "lucide-react";
 import { t as translateStandalone, useT } from "../lib/i18n";
 import { addLog } from "../stores/logStore";
+
+type UpdateFailureKey = "update.desktopOnly" | "update.checkFailedHint" | "update.installFailedHint" | "update.restartFailedHint";
+type UpdateRetry = "check" | "install" | "restart";
 
 type UpdateState =
   | { kind: "idle" }
@@ -10,68 +13,103 @@ type UpdateState =
   | { kind: "upToDate" }
   | { kind: "available"; version: string; notes: string }
   | { kind: "downloading"; progress: number }
-  | { kind: "ready" }
-  | { kind: "error"; message: string };
+  | { kind: "installing" }
+  | { kind: "installed" }
+  | { kind: "error"; messageKey: UpdateFailureKey; retry?: UpdateRetry };
+
+function updateFailure(error: unknown, messageKey: UpdateFailureKey, retry: UpdateRetry): UpdateState {
+  const detail = error instanceof Error ? error.message : String(error);
+  addLog("error", translateStandalone(messageKey === "update.checkFailedHint" ? "update.checkFailed" : "update.failed"), detail, "updater");
+  return { kind: "error", messageKey, retry };
+}
 
 export default function UpdateChecker() {
   const t = useT();
   const [state, setState] = useState<UpdateState>({ kind: "idle" });
 
+  // React state updates are deferred; a ref claims ownership before any await.
+  const busy = useRef(false);
+
   const checkForUpdate = async (silent = false) => {
+    if (busy.current) return;
     if (!IS_TAURI) {
-      if (!silent) setState({ kind: "error", message: t("update.desktopOnly") });
+      if (!silent) setState({ kind: "error", messageKey: "update.desktopOnly" });
       return;
     }
+    busy.current = true;
     if (!silent) setState({ kind: "checking" });
     try {
       const { check } = await import("@tauri-apps/plugin-updater");
       const update = await check();
       if (update) {
-        setState({
-          kind: "available",
-          version: update.version,
-          notes: update.body ?? "",
-        });
+        setState({ kind: "available", version: update.version, notes: update.body ?? "" });
       } else {
         setState({ kind: silent ? "idle" : "upToDate" });
       }
-    } catch (err: any) {
-      const message = err?.message ?? String(err);
+    } catch (error: unknown) {
       if (silent) {
-        addLog("warning", t("update.checkFailed"), message, "updater");
+        const detail = error instanceof Error ? error.message : String(error);
+        addLog("warning", t("update.checkFailed"), detail, "updater");
         setState({ kind: "idle" });
       } else {
-        setState({ kind: "error", message });
+        setState(updateFailure(error, "update.checkFailedHint", "check"));
       }
+    } finally {
+      busy.current = false;
+    }
+  };
+
+  const restartInstalled = async () => {
+    if (!IS_TAURI || busy.current) return;
+    busy.current = true;
+    setState({ kind: "installed" });
+    try {
+      const { relaunch } = await import("@tauri-apps/plugin-process");
+      await relaunch();
+    } catch (error: unknown) {
+      setState(updateFailure(error, "update.restartFailedHint", "restart"));
+    } finally {
+      busy.current = false;
     }
   };
 
   const downloadAndInstall = async () => {
-    if (!IS_TAURI) return;
+    if (!IS_TAURI || busy.current) return;
+    busy.current = true;
+    setState({ kind: "downloading", progress: 0 });
+    let installed = false;
     try {
       const { check } = await import("@tauri-apps/plugin-updater");
-      const { relaunch } = await import("@tauri-apps/plugin-process");
       const update = await check();
-      if (!update) return;
+      if (!update) {
+        setState({ kind: "upToDate" });
+        return;
+      }
 
       let totalBytes = 0;
       let downloaded = 0;
-
       await update.downloadAndInstall((ev) => {
         if (ev.event === "Started") {
           totalBytes = ev.data.contentLength ?? 0;
         } else if (ev.event === "Progress") {
           downloaded += ev.data.chunkLength;
-          const pct = totalBytes > 0 ? (downloaded / totalBytes) * 100 : 0;
-          setState({ kind: "downloading", progress: pct });
+          const progress = totalBytes > 0 ? Math.min(100, (downloaded / totalBytes) * 100) : 0;
+          setState({ kind: "downloading", progress });
         } else if (ev.event === "Finished") {
-          setState({ kind: "ready" });
+          setState({ kind: "installing" });
         }
       });
 
+      installed = true;
+      setState({ kind: "installed" });
+      const { relaunch } = await import("@tauri-apps/plugin-process");
       await relaunch();
-    } catch (err: any) {
-      setState({ kind: "error", message: err.message ?? String(err) });
+    } catch (error: unknown) {
+      setState(installed
+        ? updateFailure(error, "update.restartFailedHint", "restart")
+        : updateFailure(error, "update.installFailedHint", "install"));
+    } finally {
+      busy.current = false;
     }
   };
 
@@ -116,6 +154,7 @@ export default function UpdateChecker() {
               <div className="flex gap-2 mt-3">
                 <button
                   onClick={downloadAndInstall}
+                  disabled={busy.current}
                   className="px-3 py-1.5 bg-accent hover:bg-accent-hover text-white rounded text-body font-medium"
                 >
                   {t("update.download")}
@@ -147,7 +186,13 @@ export default function UpdateChecker() {
         </div>
       )}
 
-      {state.kind === "ready" && (
+      {state.kind === "installing" && (
+        <div className="bg-surface text-text border border-border rounded-lg shadow-xl p-4 text-body">
+          {t("update.installing")}
+        </div>
+      )}
+
+      {state.kind === "installed" && (
         <div className="bg-success-muted text-success border border-success rounded-lg shadow-lg p-3 flex items-center gap-2 text-body">
           <CheckCircle size={16} className="text-success" />
           <span>{t("update.installed")}</span>
@@ -158,8 +203,17 @@ export default function UpdateChecker() {
         <div className="bg-danger-muted text-danger border border-danger rounded-lg shadow-lg p-3 flex items-center gap-2 text-body">
           <AlertCircle size={16} className="text-danger flex-shrink-0" />
           <div className="flex-1">
-            <div className="font-semibold">{t("update.checkFailed")}</div>
-            <div className="text-caption text-text-muted">{state.message}</div>
+            <div className="font-semibold">{t(state.messageKey === "update.checkFailedHint" || state.messageKey === "update.desktopOnly" ? "update.checkFailed" : "update.failed")}</div>
+            <div className="text-caption text-text-muted">{t(state.messageKey)}</div>
+            {state.retry && (
+              <button
+                onClick={state.retry === "install" ? downloadAndInstall : state.retry === "restart" ? restartInstalled : () => checkForUpdate()}
+                disabled={busy.current}
+                className="mt-2 font-medium hover:underline"
+              >
+                {t(state.retry === "restart" ? "update.restart" : "common.retry")}
+              </button>
+            )}
           </div>
           <button
             onClick={() => setState({ kind: "idle" })}
@@ -176,7 +230,7 @@ export default function UpdateChecker() {
 /** Manual "check for updates" trigger — can be used from a menu button */
 export async function triggerUpdateCheck(): Promise<UpdateState> {
   if (!IS_TAURI) {
-    return { kind: "error", message: translateStandalone("update.desktopOnly") };
+    return { kind: "error", messageKey: "update.desktopOnly" };
   }
   try {
     const { check } = await import("@tauri-apps/plugin-updater");
@@ -185,7 +239,7 @@ export async function triggerUpdateCheck(): Promise<UpdateState> {
       return { kind: "available", version: update.version, notes: update.body ?? "" };
     }
     return { kind: "upToDate" };
-  } catch (err: any) {
-    return { kind: "error", message: err.message ?? String(err) };
+  } catch (error: unknown) {
+    return updateFailure(error, "update.checkFailedHint", "check");
   }
 }

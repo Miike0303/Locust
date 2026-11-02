@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { test } from "node:test";
 import { createDraftPersistence, DRAFT_PREFIX, MAX_DRAFT_TEXT, MAX_DRAFT_RECORDS, type DraftStorage } from "./draftPersistence";
 class MemoryStorage implements DraftStorage {
   data = new Map<string, string>();
@@ -77,3 +78,54 @@ assert.equal(bounded.read().issue, "full", "corruption cannot bypass the record 
 assert.equal(bounded.write("new project", "new text", null, null).record, null);
 assert.equal(crowded.length, MAX_DRAFT_RECORDS + 1, "hitting the cap never evicts other drafts");
 console.log("draftPersistence.test.ts: ok");
+
+function atCapacity() {
+  const storage = new MemoryStorage();
+  for (let i = 0; i < MAX_DRAFT_RECORDS; i++) {
+    const record = { ...french, revision: `capacity-${i}`, entryKey: `entry-${i}`, parent: null, text: `old-${i}` };
+    storage.setItem(DRAFT_PREFIX + record.revision, JSON.stringify(record));
+  }
+  return { storage, repository: createDraftPersistence(() => storage) };
+}
+
+test("at capacity, replacing a draft persists the new text across reload", () => {
+  const { storage, repository } = atCapacity();
+  const result = repository.write("entry-0", "edited at capacity", null, "capacity-0");
+  assert.ok(result.record);
+  assert.equal(result.issue, null);
+  assert.equal(storage.length, MAX_DRAFT_RECORDS);
+  const restored = createDraftPersistence(() => storage).read();
+  assert.equal(restored.records.find(r => r.entryKey === "entry-0")?.text, "edited at capacity");
+  assert.equal(storage.getItem(DRAFT_PREFIX + "capacity-0"), null);
+});
+
+test("at capacity, new drafts and unrelated predecessors are refused without eviction", () => {
+  const { storage, repository } = atCapacity();
+  const before = [...storage.data];
+  for (const parent of [null, "capacity-0", "missing"]) {
+    assert.equal(repository.write("new-entry", "new draft", null, parent).issue, "full");
+    assert.deepEqual([...storage.data], before);
+  }
+});
+
+test("at capacity, a replacement write failure preserves every stored byte", () => {
+  const { storage, repository } = atCapacity();
+  const before = [...storage.data];
+  storage.failWrite = true;
+  const result = repository.write("entry-0", "cannot be written", null, "capacity-0");
+  assert.equal(result.record, null);
+  assert.equal(result.issue, "unavailable", "the replacement must reach the write before failing");
+  assert.deepEqual([...storage.data], before);
+});
+
+test("at capacity, the predecessor is retired only after the replacement is written", () => {
+  const { storage, repository } = atCapacity();
+  const originalWrite = storage.setItem.bind(storage);
+  storage.setItem = (key, value) => {
+    assert.ok(storage.getItem(DRAFT_PREFIX + "capacity-0"));
+    assert.equal(storage.length, MAX_DRAFT_RECORDS);
+    originalWrite(key, value);
+  };
+  assert.ok(repository.write("entry-0", "durable first", null, "capacity-0").record);
+  assert.equal(storage.length, MAX_DRAFT_RECORDS);
+});
