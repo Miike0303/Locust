@@ -783,9 +783,10 @@ export interface ExportScope {
   status?: StringStatus[];
 }
 
-function exportQuery(lang: string, scope: ExportScope, sourceLang?: string): string {
+function exportQuery(lang: string, scope: ExportScope, sourceLang?: string, expectedDatabase?: string): string {
   const params = new URLSearchParams({ lang });
   if (sourceLang !== undefined) params.set("source_lang", sourceLang);
+  if (expectedDatabase !== undefined) params.set("expected_database", expectedDatabase);
   if (scope.file !== undefined) params.set("file", scope.file);
   if (scope.status !== undefined) {
     if (scope.status.length === 0) params.set("status", "");
@@ -794,10 +795,10 @@ function exportQuery(lang: string, scope: ExportScope, sourceLang?: string): str
   return params.toString();
 }
 
-export const exportPo = (lang: string, scope: ExportScope = {}) => requestText(`/export/po?${exportQuery(lang, scope)}`);
-export const exportXliff = (lang: string, scope: ExportScope = {}) => requestText(`/export/xliff?${exportQuery(lang, scope)}`);
-export const exportTmx = (sourceLang: string, lang: string, scope: ExportScope = {}) =>
-  requestText(`/export/tmx?${exportQuery(lang, scope, sourceLang)}`);
+export const exportPo = (lang: string, scope: ExportScope = {}, expectedDatabase?: string) => requestText(`/export/po?${exportQuery(lang, scope, undefined, expectedDatabase)}`);
+export const exportXliff = (lang: string, scope: ExportScope = {}, expectedDatabase?: string) => requestText(`/export/xliff?${exportQuery(lang, scope, undefined, expectedDatabase)}`);
+export const exportTmx = (sourceLang: string, lang: string, scope: ExportScope = {}, expectedDatabase?: string) =>
+  requestText(`/export/tmx?${exportQuery(lang, scope, sourceLang, expectedDatabase)}`);
 export const getExportSourceLanguage = (lang: string) =>
   request<{ source_lang: string }>(`/export/source-language?${new URLSearchParams({ lang })}`);
 export const importPo = (content: string, allowUndeclaredLanguage = false) =>
@@ -912,16 +913,18 @@ export async function exportTranslations(
   path?: string,
   scope: ExportScope = {},
   sourceLang?: string,
+  expectedDatabase?: string,
 ): Promise<ExportResult> {
   if (format === "tmx" && sourceLang === undefined) throw new ApiError("missing field `source_lang`");
   if (IS_TAURI) {
     if (!path) throw new Error("path required for Tauri export");
     return tauriInvoke<ExportResult>("export_translations", {
       format, lang, path, ...scope, ...(format === "tmx" ? { sourceLang } : {}),
+      ...(expectedDatabase === undefined ? {} : { expectedDatabase }),
     });
   }
-  const text = format === "po" ? await exportPo(lang, scope)
-    : format === "tmx" ? await exportTmx(sourceLang!, lang, scope) : await exportXliff(lang, scope);
+  const text = format === "po" ? await exportPo(lang, scope, expectedDatabase)
+    : format === "tmx" ? await exportTmx(sourceLang!, lang, scope, expectedDatabase) : await exportXliff(lang, scope, expectedDatabase);
   const filename = path?.split(/[/\\]/).pop() || `translation_${lang}.${format}`;
   const blob = new Blob([text], {
     type: format === "po" ? "text/plain;charset=utf-8" : "application/xml;charset=utf-8",

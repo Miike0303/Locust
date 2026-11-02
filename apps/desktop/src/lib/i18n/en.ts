@@ -1332,6 +1332,7 @@ export const en = {
   "export.filter.po": "Gettext PO",
   "export.filter.xliff": "XLIFF",
   "export.toast.exported": "Exported {format} → {path}",
+  "export.toast.projectChanged": "The open project changed. Reopen the export dialog and try again.",
   "export.toast.exportFailed": "Export failed: {error}",
   "export.toast.imported": "Imported {count} translation(s)",
   "export.toast.importedSkipped": "Imported {count} translation(s) ({skipped} skipped)",

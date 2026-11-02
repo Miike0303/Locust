@@ -136,6 +136,7 @@ export default function ExportModal({
 
 	const handleExport = async () => {
 		if (exportDisabled) return;
+		const expectedDatabase = project.database_path ?? ":memory:";
 		setLoading(true);
 		try {
 			let path: string | undefined;
@@ -158,8 +159,14 @@ export default function ExportModal({
 				path = selected;
 			}
 
+			// The store can change before React renders while the native dialog is open.
+			const current = useProjectStore.getState().project;
+			if (!current || draftProjectKey(current) !== projectKey || !scopeEnabled()) {
+				throw new Error(t("export.toast.projectChanged"));
+			}
+
 			const result = await exportTranslations(format, lang, path, { file: file || undefined, status: statuses },
-				format === "tmx" ? tmxSource : undefined);
+				format === "tmx" ? tmxSource : undefined, expectedDatabase);
 			addToast("success", t("export.toast.exported", { format: format.toUpperCase(), path: result.path }));
 			addLog(
 				"info",

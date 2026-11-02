@@ -170,6 +170,7 @@ pub async fn audit_project_fonts(
 
 struct ExportQuery {
     lang: String,
+    expected_database: Option<PathBuf>,
     source_lang: Option<String>,
     scope: export::ExportScope,
 }
@@ -200,6 +201,7 @@ impl ExportQuery {
         Ok(Self {
             lang,
             source_lang: value("source_lang"),
+            expected_database: value("expected_database").map(PathBuf::from),
             scope,
         })
     }
@@ -227,15 +229,38 @@ pub(crate) async fn export_source_language(
     Ok(Json(serde_json::json!({ "source_lang": source })))
 }
 
+// Call under the project reservation so the published identity and live
+// connection cannot change between this check and catalog generation.
+async fn check_export_project(
+    state: &AppState,
+    expected_database: Option<&std::path::Path>,
+) -> Result<(), ApiError> {
+    let project_guard = state.current_project.read().await;
+    let project = project_guard
+        .as_ref()
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "no project open"))?;
+    if let Some(expected) = expected_database {
+        let database = project
+            .database_path
+            .as_deref()
+            .unwrap_or(std::path::Path::new(":memory:"));
+        if expected != database || expected != state.db.path() {
+            return Err(err(
+                StatusCode::CONFLICT,
+                "project changed before export; retry",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn export_tmx(
     State(state): State<Arc<AppState>>,
     Query(params): Query<Vec<(String, String)>>,
 ) -> Result<(StatusCode, [(String, String); 2], String), ApiError> {
     let _guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
-    if state.current_project.read().await.is_none() {
-        return Err(err(StatusCode::BAD_REQUEST, "no project open"));
-    }
     let q = ExportQuery::parse(params)?;
+    check_export_project(&state, q.expected_database.as_deref()).await?;
     let entries = q
         .scope
         .entries(&state.db)
@@ -271,10 +296,8 @@ pub(crate) async fn export_po(
     // Export combines rows with translation-run language metadata. Both must
     // belong to the same project, even across the config-lock await below.
     let _guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
-    if state.current_project.read().await.is_none() {
-        return Err(err(StatusCode::BAD_REQUEST, "no project open"));
-    }
     let q = ExportQuery::parse(params)?;
+    check_export_project(&state, q.expected_database.as_deref()).await?;
     let entries = q
         .scope
         .entries(&state.db)
@@ -324,10 +347,8 @@ pub(crate) async fn export_xliff(
     Query(params): Query<Vec<(String, String)>>,
 ) -> Result<(StatusCode, [(String, String); 2], String), ApiError> {
     let _guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
-    if state.current_project.read().await.is_none() {
-        return Err(err(StatusCode::BAD_REQUEST, "no project open"));
-    }
     let q = ExportQuery::parse(params)?;
+    check_export_project(&state, q.expected_database.as_deref()).await?;
     let entries = q
         .scope
         .entries(&state.db)
@@ -1183,6 +1204,154 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    async fn export_project_pair() -> (tempfile::TempDir, Arc<AppState>, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("A project_日本語.db");
+        let b = dir.path().join("B project.db");
+        let state = crate::create_test_state_with_db(&a);
+        state
+            .db
+            .save_entries(&[translated("a", "Project A", "story.json", "Proyecto A")])
+            .unwrap();
+        locust_core::database::Database::open(&b)
+            .unwrap()
+            .save_entries(&[translated("b", "Project B", "story.json", "Proyecto B")])
+            .unwrap();
+        *state.current_project.write().await = Some(crate::ProjectInfo {
+            database_path: Some(a.clone()),
+            ..Default::default()
+        });
+        state.config.write().await.default_source_lang = "en".into();
+        (dir, state, a, b)
+    }
+
+    async fn project_export(
+        url: &str,
+        format: &str,
+        expected: Option<&std::path::Path>,
+    ) -> reqwest::Response {
+        let mut request = client()
+            .get(format!("{url}/api/export/{format}"))
+            .query(&[("lang", "es"), ("source_lang", "en")]);
+        if let Some(expected) = expected {
+            request = request.query(&[("expected_database", expected.to_str().unwrap())]);
+        }
+        request.send().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn export_rejects_stale_project_identity() {
+        let (_dir, state, a, b) = export_project_pair().await;
+        {
+            let _opening = try_project_operation(&state).unwrap();
+            state.db.reopen(&b).unwrap();
+            state
+                .current_project
+                .write()
+                .await
+                .as_mut()
+                .unwrap()
+                .database_path = Some(b);
+        }
+        let (url, server) = crate::start_test_server(state.clone()).await;
+        for format in ["po", "xliff", "tmx"] {
+            let response = project_export(&url, format, Some(&a)).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{format}");
+            assert!(response.headers().get("content-disposition").is_none());
+            assert_eq!(
+                response.text().await.unwrap(),
+                "project changed before export; retry"
+            );
+            assert!(try_project_operation(&state).is_ok());
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn export_identity_checks_both_project_metadata_and_live_database() {
+        let (_dir, state, a, b) = export_project_pair().await;
+        // The published project still says A while the live connection is B.
+        state.db.reopen(&b).unwrap();
+        let (url, server) = crate::start_test_server(state).await;
+        for expected in [&a, &b] {
+            for format in ["po", "xliff", "tmx"] {
+                let response = project_export(&url, format, Some(expected)).await;
+                assert_eq!(
+                    response.status(),
+                    StatusCode::CONFLICT,
+                    "{format}: {expected:?}"
+                );
+                assert_eq!(
+                    response.text().await.unwrap(),
+                    "project changed before export; retry"
+                );
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn export_matching_identity_and_legacy_keep_exact_bytes() {
+        let (_dir, state, a, b) = export_project_pair().await;
+        let (url, server) = crate::start_test_server(state.clone()).await;
+        for database in [&a, &b] {
+            {
+                let _opening = try_project_operation(&state).unwrap();
+                state.db.reopen(database).unwrap();
+                state
+                    .current_project
+                    .write()
+                    .await
+                    .as_mut()
+                    .unwrap()
+                    .database_path = Some(database.clone());
+            }
+            let entries = state.db.get_entries(&EntryFilter::default()).unwrap();
+            for format in ["po", "xliff", "tmx"] {
+                let bytes = match format {
+                    "po" => export::export_po(&entries, "en", "es"),
+                    "xliff" => export::export_xliff(&entries, "en", "es"),
+                    "tmx" => export::export_tmx(&entries, "en", "es").unwrap(),
+                    _ => unreachable!(),
+                };
+                for expected in [Some(database.as_path()), None] {
+                    let response = project_export(&url, format, expected).await;
+                    assert_eq!(response.status(), StatusCode::OK, "{format}");
+                    assert_eq!(response.bytes().await.unwrap().as_ref(), bytes.as_bytes());
+                    assert!(try_project_operation(&state).is_ok());
+                }
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn export_identity_respects_project_reservation_and_memory_fallback() {
+        let (url, server, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        state
+            .db
+            .save_entries(&[translated("a", "Hello", "story.json", "Hola")])
+            .unwrap();
+        let memory = std::path::Path::new(":memory:");
+        let held = try_project_operation(&state).unwrap();
+        for expected in [Some(memory), None] {
+            for format in ["po", "xliff", "tmx"] {
+                let response = project_export(&url, format, expected).await;
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+                assert_eq!(response.text().await.unwrap(), crate::PROJECT_BUSY_MESSAGE);
+            }
+        }
+        drop(held);
+        for format in ["po", "xliff", "tmx"] {
+            assert_eq!(
+                project_export(&url, format, Some(memory)).await.status(),
+                StatusCode::OK
+            );
+        }
+        server.abort();
     }
 
     #[tokio::test]

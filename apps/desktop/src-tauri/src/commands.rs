@@ -549,6 +549,7 @@ async fn apply_run_validation(s: &Arc<AppState>) -> Result<serde_json::Value, St
 
 /// Export current project translations to a PO, XLIFF or restricted TMX file.
 /// Frontend picks the path via the native save dialog.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn export_translations(
     format: String,
@@ -557,11 +558,23 @@ pub async fn export_translations(
     file: Option<String>,
     status: Option<Vec<String>>,
     source_lang: Option<String>,
+    expected_database: Option<PathBuf>,
     state: State<'_, AppStateWrapper>,
 ) -> Result<serde_json::Value, String> {
-    apply_export_translations(&state.0, format, lang, path, file, status, source_lang).await
+    apply_export_translations(
+        &state.0,
+        format,
+        lang,
+        path,
+        file,
+        status,
+        source_lang,
+        expected_database,
+    )
+    .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_export_translations(
     s: &Arc<AppState>,
     format: String,
@@ -570,11 +583,22 @@ async fn apply_export_translations(
     file: Option<String>,
     status: Option<Vec<String>>,
     source_lang: Option<String>,
+    expected_database: Option<PathBuf>,
 ) -> Result<serde_json::Value, String> {
     let _exclusive = try_project_operation(s)?;
-    if s.current_project.read().await.is_none() {
-        return Err("no project open".into());
+    let project_guard = s.current_project.read().await;
+    let project = project_guard.as_ref().ok_or("no project open")?;
+    if let Some(expected) = expected_database.as_deref() {
+        let database = project
+            .database_path
+            .as_deref()
+            .unwrap_or(Path::new(":memory:"));
+        // The reservation keeps the same connection through the destination write.
+        if expected != database || expected != s.db.path() {
+            return Err("project changed before export; retry".into());
+        }
     }
+    drop(project_guard);
     let scope = locust_core::export::ExportScope::parse(file, status.as_deref())?;
     let entries = scope.entries(&s.db).map_err(|e| e.to_string())?;
     if entries.is_empty() {
@@ -2058,6 +2082,7 @@ mod tests {
                     None,
                     None,
                     Some("ja".into()),
+                    None,
                 )
                 .await
                 .unwrap_err(),
@@ -2101,6 +2126,7 @@ mod tests {
                     None,
                     None,
                     Some("ja".into()),
+                    None,
                 )
                 .await
                 .unwrap_err();
@@ -2148,6 +2174,7 @@ mod tests {
             None,
             None,
             Some("ja".into()),
+            None,
         )
         .await
         .unwrap();
@@ -2211,6 +2238,203 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn export_rejects_stale_project_identity_without_touching_destinations() {
+        let (dir, state) = export_scope_state().await;
+        let a = state.db.path();
+        let b = dir.path().join("B project.db");
+        locust_core::database::Database::open(&b)
+            .unwrap()
+            .save_entries(&[translated_entry("b", "Project B", "Proyecto B")])
+            .unwrap();
+        {
+            let _opening = try_project_operation(&state).unwrap();
+            state.db.reopen(&b).unwrap();
+            state
+                .current_project
+                .write()
+                .await
+                .as_mut()
+                .unwrap()
+                .database_path = Some(b);
+        }
+        for format in ["po", "xliff", "tmx"] {
+            for existing in [false, true] {
+                let output = dir.path().join(if existing {
+                    "existing.catalog"
+                } else {
+                    "new.catalog"
+                });
+                if existing {
+                    std::fs::write(&output, b"keep this catalog").unwrap();
+                }
+                let error = apply_export_translations(
+                    &state,
+                    format.into(),
+                    "es".into(),
+                    output.to_string_lossy().into_owned(),
+                    None,
+                    None,
+                    Some("ja".into()),
+                    Some(a.clone()),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error, "project changed before export; retry");
+                if existing {
+                    assert_eq!(std::fs::read(&output).unwrap(), b"keep this catalog");
+                } else {
+                    assert!(!output.exists());
+                }
+                assert!(try_project_operation(&state).is_ok());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn export_identity_checks_both_project_metadata_and_live_database() {
+        let (dir, state) = export_scope_state().await;
+        let a = state.db.path();
+        state
+            .current_project
+            .write()
+            .await
+            .as_mut()
+            .unwrap()
+            .database_path = Some(a.clone());
+        let b = dir.path().join("B project.db");
+        locust_core::database::Database::open(&b)
+            .unwrap()
+            .save_entries(&[translated_entry("b", "Project B", "Proyecto B")])
+            .unwrap();
+        state.db.reopen(&b).unwrap();
+        for expected in [&a, &b] {
+            for format in ["po", "xliff", "tmx"] {
+                let output = dir.path().join("new.catalog");
+                let error = apply_export_translations(
+                    &state,
+                    format.into(),
+                    "es".into(),
+                    output.to_string_lossy().into_owned(),
+                    None,
+                    None,
+                    Some("ja".into()),
+                    Some(expected.clone()),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error, "project changed before export; retry");
+                assert!(!output.exists());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn export_matching_identity_and_legacy_keep_exact_bytes() {
+        let (dir, state) = export_scope_state().await;
+        let database = state.db.path();
+        state
+            .current_project
+            .write()
+            .await
+            .as_mut()
+            .unwrap()
+            .database_path = Some(database.clone());
+        let entries = state.db.get_entries(&EntryFilter::default()).unwrap();
+        for format in ["po", "xliff", "tmx"] {
+            let bytes = match format {
+                "po" => locust_core::export::export_po(&entries, "ja", "es"),
+                "xliff" => locust_core::export::export_xliff(&entries, "ja", "es"),
+                "tmx" => locust_core::export::export_tmx(&entries, "ja", "es").unwrap(),
+                _ => unreachable!(),
+            };
+            for expected in [Some(database.clone()), None] {
+                let output = dir.path().join(format!("catalog.{format}"));
+                std::fs::write(&output, b"previous catalog").unwrap();
+                let result = apply_export_translations(
+                    &state,
+                    format.into(),
+                    "es".into(),
+                    output.to_string_lossy().into_owned(),
+                    None,
+                    None,
+                    Some("ja".into()),
+                    expected,
+                )
+                .await
+                .unwrap();
+                assert_eq!(std::fs::read(&output).unwrap(), bytes.as_bytes());
+                assert_eq!(result["entries"], entries.len());
+                assert_eq!(result["bytes"], bytes.len());
+                assert!(try_project_operation(&state).is_ok());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn export_identity_respects_project_reservation_and_memory_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = locust_server::create_test_state();
+        *state.current_project.write().await = Some(ProjectInfo::default());
+        state
+            .db
+            .save_entries(&[translated_entry("a", "Hello", "Hola")])
+            .unwrap();
+        let memory = PathBuf::from(":memory:");
+        let held = try_project_operation(&state).unwrap();
+        let output = dir.path().join("absent/catalog");
+        for expected in [Some(memory.clone()), None] {
+            for format in ["po", "xliff", "tmx"] {
+                let error = apply_export_translations(
+                    &state,
+                    format.into(),
+                    "es".into(),
+                    output.to_string_lossy().into_owned(),
+                    None,
+                    None,
+                    Some("ja".into()),
+                    expected.clone(),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error, locust_server::PROJECT_BUSY_MESSAGE);
+                assert!(!output.parent().unwrap().exists());
+            }
+        }
+        drop(held);
+        // The existing destination guard cannot canonicalize an in-memory DB.
+        // A matching memory identity must reach the same legacy refusal.
+        for format in ["po", "xliff", "tmx"] {
+            let legacy = apply_export_translations(
+                &state,
+                format.into(),
+                "es".into(),
+                output.to_string_lossy().into_owned(),
+                None,
+                None,
+                Some("ja".into()),
+                None,
+            )
+            .await
+            .unwrap_err();
+            let guarded = apply_export_translations(
+                &state,
+                format.into(),
+                "es".into(),
+                output.to_string_lossy().into_owned(),
+                None,
+                None,
+                Some("ja".into()),
+                Some(memory.clone()),
+            )
+            .await
+            .unwrap_err();
+            assert!(legacy.starts_with("IO error:"), "{legacy}");
+            assert_eq!(guarded, legacy);
+            assert!(!output.parent().unwrap().exists());
+        }
+    }
+
+    #[tokio::test]
     async fn export_scopes_match_http_bytes_order_and_legacy_unfiltered_output() {
         let (dir, state) = export_scope_state().await;
         let all = state.db.get_entries(&EntryFilter::default()).unwrap();
@@ -2265,6 +2489,7 @@ mod tests {
                         .as_ref()
                         .map(|values| values.iter().map(|value| (*value).into()).collect()),
                     Some("ja".into()),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -2304,6 +2529,7 @@ mod tests {
                     if existing { std::fs::write(&output, b"keep this catalog").unwrap(); }
                     let result = apply_export_translations(&state, format.into(), "es".into(), output.to_string_lossy().into_owned(), file.map(str::to_owned), statuses.as_ref().map(|values| values.iter().map(|value| (*value).into()).collect()),
                     Some("ja".into()),
+                    None,
                 ).await;
                     assert_eq!(result.unwrap_err(), error);
                     if existing {
@@ -2329,6 +2555,7 @@ mod tests {
                     Some("story/a.rpy".into()),
                     Some(vec!["translated".into()]),
                     Some("ja".into()),
+                    None,
                 )
                 .await
                 .unwrap_err(),
@@ -2375,6 +2602,7 @@ mod tests {
                 "reviewed".into(),
             ]),
             Some("en-US".into()),
+            None,
         )
         .await
         .unwrap();
@@ -2480,6 +2708,7 @@ mod tests {
                     Some("refusal.rpy".into()),
                     None,
                     Some("ja".into()),
+                    None,
                 )
                 .await
                 .unwrap_err();
@@ -2512,6 +2741,7 @@ mod tests {
             Some("large.rpy".into()),
             None,
             Some("ja".into()),
+            None,
         )
         .await
         .unwrap_err();
@@ -2529,6 +2759,7 @@ mod tests {
                 Some("story/a.rpy".into()),
                 None,
                 source.map(str::to_owned),
+                None,
             )
             .await
             .unwrap_err();
@@ -2553,6 +2784,7 @@ mod tests {
             Some("story/a.rpy".into()),
             Some(vec!["reviewed".into()]),
             Some("ja".into()),
+            None,
         )
         .await
         .unwrap();

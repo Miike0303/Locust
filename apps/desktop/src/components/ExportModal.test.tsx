@@ -30,6 +30,7 @@ const h = {
   facets: ready(facets), files: ready(files), source: ready({ source_lang: "ja" }), queries: [] as any[],
   calls: [] as { command: string; args: any }[], requests: [] as URL[],
   bodies: [] as { path: string; body: any }[],
+  saveHandler: null as null | (() => Promise<string | null>),
   previewHandler: null as null | ((keep: boolean) => Promise<ImportPreview>),
   toasts: [] as any[], logs: [] as any[], downloads: [] as any[], revoked: [] as string[],
   closed: 0, imported: 0, output: "assignment.po" as string | null, failure: "",
@@ -68,7 +69,7 @@ const hooks = registerHooks({
         "@tanstack/react-query": "export const useQuery=options=>{h.queries.push(options);return options.queryKey[0]==='export-source-language'?h.source:options.queryKey[0]==='file-stats'?h.files:h.facets;};",
         "../lib/projectScope": "export const draftProjectKey=p=>JSON.stringify([p.database_path??null,p.path,p.format_id]);export const useProjectScopedQueryEnabled=(_key,enabled)=>()=>enabled&&h.scopeAllowed;export const projectScopedQueryFn=(_key,fn)=>fn;",
         "../lib/i18n": "export const useT=()=>h.t;",
-        "../stores/projectStore": "export const useProjectStore=()=>({project:h.project});",
+        "../stores/projectStore": "export const useProjectStore=Object.assign(()=>({project:h.project}),{getState:()=>({project:h.project})});",
         "../stores/toastStore": "export const addToast=(...args)=>h.toasts.push(args);",
         "../stores/logStore": "export const addLog=(...args)=>h.logs.push(args);",
         "../lib/modalA11y": "export const useModalA11y=()=>({dialogRef:{current:null},dialogProps:h.a11y.buildModalDialogProps({titleId:'title'}),titleProps:h.a11y.buildModalTitleProps('title')});export const MODAL_BACKDROP_CLASS=h.a11y.MODAL_BACKDROP_CLASS;export const MODAL_BODY_CLASS=h.a11y.MODAL_BODY_CLASS;export const MODAL_FOOTER_CLASS=h.a11y.MODAL_FOOTER_CLASS;export const modalPanelClass=h.a11y.modalPanelClass;",
@@ -88,7 +89,7 @@ Object.defineProperty(globalThis, "window", { configurable: true, value: {
     h.calls.push({ command, args });
     if (command === "get_server_port") return 7842;
     if (command === "get_string_facets") return facets;
-    if (command === "plugin:dialog|save") return h.output;
+    if (command === "plugin:dialog|save") return h.saveHandler ? h.saveHandler() : h.output;
     if (command === "plugin:dialog|open") return h.output;
     if (command === "preview_import_translations") {
       if (h.failure) throw h.failure;
@@ -137,7 +138,7 @@ const api = await import("../lib/api");
 await api.getCurrentProject();
 beforeEach(() => {
   h.states = []; h.effects = []; h.queries = []; h.calls = []; h.requests = [];
-  h.bodies = []; h.previewHandler = null;
+  h.bodies = []; h.previewHandler = null; h.saveHandler = null;
   h.toasts = []; h.logs = []; h.downloads = []; h.revoked = []; h.closed = 0; h.imported = 0;
   h.output = "assignment.po"; h.failure = ""; h.scopeAllowed = true; h.project = project;
   h.facets = ready(facets); h.files = ready(files); h.source = ready({ source_lang: "ja" }); h.setTauri(true); setLocale("en");
@@ -243,13 +244,14 @@ for (const native of [true, false]) {
       await clickExport();
       if (native) {
         const call = h.calls.find(call => call.command === "export_translations");
-        assert.deepEqual(call?.args, { format, lang: "es", path: "assignment.po", file: FILE, status: ["translated", "reviewed"], ...(format === "tmx" ? { sourceLang: "ja" } : {}) });
+        assert.deepEqual(call?.args, { format, lang: "es", path: "assignment.po", expectedDatabase: project.database_path, file: FILE, status: ["translated", "reviewed"], ...(format === "tmx" ? { sourceLang: "ja" } : {}) });
         const dialog = h.calls.find(call => call.command === "plugin:dialog|save");
         assert.equal(dialog?.args.options.defaultPath, `translation_es.${format}`);
         if (format === "tmx") assert.deepEqual(dialog?.args.options.filters, [{ name: "TMX", extensions: ["tmx"] }]);
         assert.equal(h.downloads.length, 0);
       } else {
         const url = h.requests.find(url => url.pathname === `/api/export/${format}`)!;
+        assert.equal(url.searchParams.get("expected_database"), project.database_path);
         assert.equal(url.searchParams.get("file"), FILE);
         assert.deepEqual(url.searchParams.getAll("status"), ["translated", "reviewed"]);
         assert.equal(url.searchParams.get("lang"), "es");
@@ -409,6 +411,61 @@ test("closing, changing database and importing gate the preview and reset the sc
   h.project = null;
   assert.equal(render(), null);
 });
+
+for (const locale of ["en", "es"] as const) {
+  for (const change of ["project", "closed", "unconfirmed"] as const) {
+    test(`${locale}: native export refuses after project state becomes ${change} while Save is open before calling the API`, async () => {
+      setLocale(locale);
+      let resolveSave!: (path: string) => void;
+      h.saveHandler = () => new Promise(resolve => { resolveSave = resolve; });
+      await clickExport();
+      assert.ok(resolveSave);
+      assert.ok(!h.calls.some(call => call.command === "export_translations"));
+      if (change === "project") h.project = { ...project, database_path: "fixture/other.db" };
+      else if (change === "closed") h.project = null;
+      else h.scopeAllowed = false;
+      // Read live store state even if React has not committed another render.
+      resolveSave("project-A.po");
+      await flush();
+      assert.ok(!h.calls.some(call => call.command === "export_translations"));
+      assert.equal(h.requests.length, 0);
+      assert.equal(h.downloads.length, 0);
+      assert.equal(h.closed, 0);
+      assert.equal(h.toasts[0]?.[0], "error");
+      assert.ok(h.toasts[0]?.[1].includes(locale === "en"
+        ? "The open project changed. Reopen the export dialog and try again."
+        : "El proyecto abierto ha cambiado. Vuelva a abrir el diálogo de exportación e inténtelo de nuevo."));
+    });
+  }
+}
+
+for (const format of ["po", "xliff", "tmx"] as const) {
+  test(`native ${format}: pending Save keeps the captured identity and scope for the unchanged project`, async () => {
+    select("format", format); select("file", FILE); selectStatuses(["reviewed"]);
+    let resolveSave!: (path: string) => void;
+    h.saveHandler = () => new Promise(resolve => { resolveSave = resolve; });
+    await clickExport();
+    h.project = { ...project, name: "Renamed project" };
+    render();
+    resolveSave(`project-A.${format}`);
+    await flush();
+    assert.deepEqual(h.calls.find(call => call.command === "export_translations")?.args, {
+      format, lang: "es", path: `project-A.${format}`, file: FILE, status: ["reviewed"],
+      expectedDatabase: project.database_path, ...(format === "tmx" ? { sourceLang: "ja" } : {}),
+    });
+    assert.equal(h.closed, 1);
+    assert.equal(h.toasts[0]?.[0], "success");
+  });
+}
+
+for (const native of [true, false]) {
+  test(`${native ? "Tauri" : "browser"}: exports without a database path use the glossary memory identity`, async () => {
+    h.setTauri(native); h.project = { ...project, database_path: undefined };
+    await clickExport();
+    if (native) assert.equal(h.calls.find(call => call.command === "export_translations")?.args.expectedDatabase, ":memory:");
+    else assert.equal(h.requests.find(url => url.pathname === "/api/export/po")?.searchParams.get("expected_database"), ":memory:");
+  });
+}
 
 test("native save cancellation writes nothing and keeps the dialog available", async () => {
   h.output = null;

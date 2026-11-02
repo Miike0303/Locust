@@ -1310,6 +1310,7 @@ export const es: Record<keyof typeof en, string> = {
   "export.filter.po": "Gettext PO",
   "export.filter.xliff": "XLIFF",
   "export.toast.exported": "Exportado {format} → {path}",
+  "export.toast.projectChanged": "El proyecto abierto ha cambiado. Vuelva a abrir el diálogo de exportación e inténtelo de nuevo.",
   "export.toast.exportFailed": "La exportación falló: {error}",
   "export.toast.imported": "Importadas {count} traducción(es)",
   "export.toast.importedSkipped": "Importadas {count} traducción(es) ({skipped} omitidas)",
