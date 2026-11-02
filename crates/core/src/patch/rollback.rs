@@ -1,14 +1,15 @@
 //! Rollback to the pristine (or pre-apply) state using RULE R1.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
 use crate::database::sha256_path;
 use crate::error::{LocustError, Result};
 
-use super::manifest::{BackupBaseline, JournalState};
+use super::manifest::{BackupBaseline, BackupManifest, JournalState, ReceiptReplaced};
 use super::store::{PatchStatus, PatchStore};
-use super::zipsec::safe_stored_rel;
+use super::zipsec::{case_fold_key, safe_stored_rel};
 
 #[derive(Debug, Clone, Default)]
 pub struct RollbackOptions {
@@ -66,7 +67,20 @@ fn rollback_under_lock_impl(
     // added-file deletion, restored destination, or rolling-back marker.
     let backup_manifest = store.read_backup_manifest()?;
     if let Some(backup) = &backup_manifest {
-        store.preflight_restore(backup)?;
+        let replaced = match &status {
+            PatchStatus::Patched(receipt) => &receipt.replaced[..],
+            PatchStatus::Interrupted(journal) => &journal.plan.replaced[..],
+            _ => &[][..],
+        };
+        preflight_backup_inventory(&store, backup, replaced)?;
+        store
+            .preflight_restore(backup)
+            .map_err(|error| match error {
+                LocustError::PatchBackupIncomplete(detail) => {
+                    LocustError::PatchBackupIncomplete(format!("{detail} — nothing was changed"))
+                }
+                other => other,
+            })?;
     }
     let (added, dirs) = match &status {
         PatchStatus::Patched(receipt) => (&receipt.added[..], &receipt.created_dirs[..]),
@@ -297,6 +311,47 @@ fn rollback_under_lock_impl(
             })
         }
     }
+}
+
+/// The manifest remains the restore authority, but cannot silently omit an
+/// original required by the receipt or journal. Normalize stored paths just as
+/// restoration does so spelling aliases cannot hide ambiguous entries.
+fn preflight_backup_inventory(
+    store: &PatchStore,
+    backup: &BackupManifest,
+    replaced: &[ReceiptReplaced],
+) -> Result<()> {
+    let mut inventory = HashMap::new();
+    for entry in &backup.files {
+        let rel = safe_stored_rel(&entry.path)?;
+        let (_, count) = inventory.entry(case_fold_key(&rel)).or_insert((rel, 0));
+        *count += 1;
+    }
+    let mut problems = Vec::new();
+    for entry in replaced {
+        let rel = safe_stored_rel(&entry.path)?;
+        match inventory.get(&case_fold_key(&rel)) {
+            Some((_, count)) if *count > 1 => problems.push(format!(
+                "ambiguous backup entries ({count}): {}",
+                entry.path
+            )),
+            // Require the same normalized spelling even on case-sensitive
+            // filesystems; case folding above only detects portable aliases.
+            Some((stored_rel, _)) if stored_rel == &rel => {
+                if !store.backup_files_dir().join(&rel).is_file() {
+                    problems.push(format!("missing backup payload: {}", entry.path));
+                }
+            }
+            _ => problems.push(format!("missing backup entry: {}", entry.path)),
+        }
+    }
+    if !problems.is_empty() {
+        return Err(LocustError::PatchBackupIncomplete(format!(
+            "{} — refusing rollback; nothing was changed",
+            problems.join("; ")
+        )));
+    }
+    Ok(())
 }
 
 fn restore_manifest_only(

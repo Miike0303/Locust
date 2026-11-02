@@ -7,10 +7,10 @@ use std::path::{Path, PathBuf};
 
 use locust_core::database::sha256_hex;
 use locust_core::error::LocustError;
-use locust_core::patch::manifest::{BackupManifest, PatchFileEntry, PatchManifest};
+use locust_core::patch::manifest::{BackupManifest, JournalState, PatchFileEntry, PatchManifest};
 use locust_core::patch::{
-    apply, apply_cancellable, rollback, verify, ApplyOptions, PatchStatus, PatchStore,
-    RollbackOptions, VerificationOutcome,
+    apply, apply_cancellable, preview_rollback, rollback, verify, ApplyOptions, PatchStatus,
+    PatchStore, RollbackOptions, VerificationOutcome,
 };
 use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
@@ -867,6 +867,216 @@ fn patch_tree_hashes(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<
         .into_iter()
         .map(|(path, bytes)| (path, bytes.map(|bytes| sha256_hex(&bytes))))
         .collect()
+}
+
+fn rollback_inventory_fixture(state: Option<JournalState>) -> tempfile::TempDir {
+    let game = tmp_game("rollback_inventory");
+    write_file(game.path(), "a.txt", b"ORIGINAL_A");
+    write_file(game.path(), "z.txt", b"ORIGINAL_Z");
+    write_file(game.path(), "untouched.txt", b"KEEP_ME");
+    let zip = game.path().join("patch.zip");
+    build_patch_zip(
+        &zip,
+        &[
+            ("a.txt", b"PATCHED_A", Some(b"ORIGINAL_A")),
+            ("z.txt", b"PATCHED_Z", Some(b"ORIGINAL_Z")),
+            ("b.txt", b"ADDED_B", None),
+            ("new/c.txt", b"ADDED_C", None),
+        ],
+        "1.0.0",
+        "rollback-inventory",
+    );
+    let store = PatchStore::new(game.path());
+    if let Some(state) = state {
+        let error = apply_cancellable(game.path(), &zip, ApplyOptions::default(), |progress| {
+            if progress.current == 4 {
+                return Err(LocustError::PatchInterrupted("cancelled".into()));
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(matches!(error, LocustError::PatchInterrupted(_)));
+        let mut journal = store.read_journal().unwrap().unwrap();
+        journal.state = state;
+        store.write_journal(&journal).unwrap();
+        assert!(!store.receipt_path().exists());
+    } else {
+        apply(game.path(), &zip, ApplyOptions::default(), |_| {}).unwrap();
+        assert!(store.receipt_path().is_file());
+    }
+    assert_eq!(fs::read(game.path().join("b.txt")).unwrap(), b"ADDED_B");
+    game
+}
+
+fn assert_incomplete_rollback_inventory_refused(game: &Path, paths: &[&str]) {
+    let before = patch_tree_hashes(game);
+    for force in [false, true] {
+        for preview in [true, false] {
+            let opts = RollbackOptions {
+                delete_modified_added: force,
+            };
+            let result = if preview {
+                preview_rollback(game, opts)
+            } else {
+                rollback(game, opts)
+            };
+            assert_eq!(
+                patch_tree_hashes(game),
+                before,
+                "force={force}, preview={preview}: game or recovery evidence changed"
+            );
+            let error = result.expect_err("incomplete backup inventory must refuse rollback");
+            assert!(
+                matches!(error, LocustError::PatchBackupIncomplete(_)),
+                "force={force}, preview={preview}: {error:?}"
+            );
+            let message = error.to_string();
+            for path in paths {
+                assert!(message.contains(path), "{message}");
+            }
+            assert!(message.contains("backup incomplete"), "{message}");
+            assert!(message.contains("nothing was changed"), "{message}");
+        }
+    }
+}
+
+#[test]
+fn rollback_inventory_missing_entries_refuses_before_any_mutation() {
+    for state in [
+        None,
+        Some(JournalState::Applying),
+        Some(JournalState::RollingBack),
+    ] {
+        for empty in [true, false] {
+            let game = rollback_inventory_fixture(state);
+            let store = PatchStore::new(game.path());
+            let mut manifest = store.read_backup_manifest().unwrap().unwrap();
+            if empty {
+                manifest.files.clear();
+            } else {
+                manifest.files.retain(|entry| entry.path != "z.txt");
+            }
+            store.write_backup_manifest(&manifest).unwrap();
+            // Omitted originals still exist and are the only recoverable copies.
+            assert_eq!(
+                fs::read(store.backup_files_dir().join("a.txt")).unwrap(),
+                b"ORIGINAL_A"
+            );
+            assert_eq!(
+                fs::read(store.backup_files_dir().join("z.txt")).unwrap(),
+                b"ORIGINAL_Z"
+            );
+            let paths = if empty {
+                &["a.txt", "z.txt"][..]
+            } else {
+                &["z.txt"][..]
+            };
+            assert_incomplete_rollback_inventory_refused(game.path(), paths);
+        }
+    }
+}
+
+#[test]
+fn rollback_inventory_duplicate_entries_refuses_before_any_mutation() {
+    for state in [
+        None,
+        Some(JournalState::Applying),
+        Some(JournalState::RollingBack),
+    ] {
+        for alias in ["case", "exact", "normalized"] {
+            let game = rollback_inventory_fixture(state);
+            let store = PatchStore::new(game.path());
+            let mut manifest = store.read_backup_manifest().unwrap().unwrap();
+            let mut duplicate = manifest.files[0].clone();
+            if alias == "normalized" {
+                duplicate.path = format!("./{}", duplicate.path);
+            } else if alias == "case" {
+                duplicate.path = duplicate.path.to_uppercase();
+            }
+            let path = manifest.files[0].path.clone();
+            manifest.files.push(duplicate);
+            store.write_backup_manifest(&manifest).unwrap();
+            assert_incomplete_rollback_inventory_refused(game.path(), &[&path]);
+        }
+    }
+}
+
+#[test]
+fn rollback_inventory_missing_payload_refuses_before_any_mutation() {
+    for state in [
+        None,
+        Some(JournalState::Applying),
+        Some(JournalState::RollingBack),
+    ] {
+        let game = rollback_inventory_fixture(state);
+        let store = PatchStore::new(game.path());
+        fs::remove_file(store.backup_files_dir().join("z.txt")).unwrap();
+        assert_incomplete_rollback_inventory_refused(game.path(), &["z.txt"]);
+    }
+}
+
+#[test]
+fn rollback_inventory_valid_completed_backup_previews_and_restores() {
+    let game = rollback_inventory_fixture(None);
+    let before = patch_tree_hashes(game.path());
+    let preview = preview_rollback(game.path(), RollbackOptions::default()).unwrap();
+    assert_eq!((preview.restored, preview.deleted), (2, 2));
+    assert_eq!(patch_tree_hashes(game.path()), before);
+    let report = rollback(game.path(), RollbackOptions::default()).unwrap();
+    assert_eq!((report.restored, report.deleted), (2, 2));
+    assert_eq!(fs::read(game.path().join("a.txt")).unwrap(), b"ORIGINAL_A");
+    assert_eq!(fs::read(game.path().join("z.txt")).unwrap(), b"ORIGINAL_Z");
+    assert!(!game.path().join("b.txt").exists());
+    assert!(!game.path().join("new").exists());
+    assert!(!game.path().join(".locust").exists());
+}
+
+#[test]
+fn rollback_inventory_valid_interrupted_rollback_recovers() {
+    let game = rollback_inventory_fixture(Some(JournalState::RollingBack));
+    // Simulate a crash after one restore and after deleting the installed add.
+    fs::write(game.path().join("a.txt"), b"ORIGINAL_A").unwrap();
+    fs::remove_file(game.path().join("b.txt")).unwrap();
+    let before = patch_tree_hashes(game.path());
+    let preview = preview_rollback(game.path(), RollbackOptions::default()).unwrap();
+    assert_eq!((preview.restored, preview.deleted), (2, 0));
+    assert_eq!(patch_tree_hashes(game.path()), before);
+    let report = rollback(game.path(), RollbackOptions::default()).unwrap();
+    assert_eq!((report.restored, report.deleted), (2, 0));
+    assert_eq!(fs::read(game.path().join("a.txt")).unwrap(), b"ORIGINAL_A");
+    assert_eq!(fs::read(game.path().join("z.txt")).unwrap(), b"ORIGINAL_Z");
+    assert!(!game.path().join("b.txt").exists());
+    assert!(!game.path().join("new/c.txt").exists());
+    assert!(!game.path().join(".locust").exists());
+}
+
+#[test]
+fn rollback_inventory_valid_added_only_empty_backup_restores() {
+    let game = tmp_game("rollback_added_only");
+    write_file(game.path(), "untouched.txt", b"KEEP_ME");
+    let zip = game.path().join("patch.zip");
+    build_patch_zip(&zip, &[("b.txt", b"ADDED_B", None)], "1.0.0", "added-only");
+    let before = patch_tree_hashes(game.path());
+    apply(
+        game.path(),
+        &zip,
+        ApplyOptions {
+            confirm_legacy: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .unwrap();
+    let store = PatchStore::new(game.path());
+    assert!(store
+        .read_backup_manifest()
+        .unwrap()
+        .unwrap()
+        .files
+        .is_empty());
+    let report = rollback(game.path(), RollbackOptions::default()).unwrap();
+    assert_eq!((report.restored, report.deleted), (0, 1));
+    assert_eq!(patch_tree_hashes(game.path()), before);
 }
 
 fn assert_manifestless_overlay_refused(dry_run: bool) {
