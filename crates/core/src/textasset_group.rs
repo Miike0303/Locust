@@ -529,7 +529,7 @@ fn patch_from_entry_checked<'a>(
 }
 
 /// Rebuild the original blob with the given cell replacements. Failed patches
-/// leave that line untouched. This is the same layout inject writes.
+/// leave their target untouched. This is the same layout inject writes.
 pub fn apply_patches(original: &str, kind: GroupKind, patches: &[CellPatch<'_>]) -> AppliedBlob {
     #[cfg(test)]
     tests::APPLY_PATCHES_CALLS.with(|calls| calls.set(calls.get() + 1));
@@ -556,6 +556,8 @@ pub fn apply_patches(original: &str, kind: GroupKind, patches: &[CellPatch<'_>])
         })
         .unwrap_or_default();
     let mut used_lines = std::collections::HashSet::new();
+    let mut used_cells = std::collections::HashSet::new();
+    let mut csv_cells: HashMap<usize, Vec<String>> = HashMap::new();
     let mut outcomes = Vec::with_capacity(patches.len());
     for patch in patches {
         let result: std::result::Result<usize, &'static str> = (|| {
@@ -573,7 +575,7 @@ pub fn apply_patches(original: &str, kind: GroupKind, patches: &[CellPatch<'_>])
                         return Err("error");
                     }
                     let i = *rows.get(row).ok_or("target_missing")?;
-                    if used_lines.contains(&i) {
+                    if used_cells.contains(&(row, col)) {
                         return Err("error");
                     }
                     let header = headers.get(col).ok_or("target_missing")?;
@@ -583,10 +585,12 @@ pub fn apply_patches(original: &str, kind: GroupKind, patches: &[CellPatch<'_>])
                     {
                         return Err("source_changed");
                     }
-                    let mut cells: Vec<String> = line_body(&lines[i])
-                        .split(',')
-                        .map(str::to_string)
-                        .collect();
+                    let cells = csv_cells.entry(i).or_insert_with(|| {
+                        line_body(&lines[i])
+                            .split(',')
+                            .map(str::to_string)
+                            .collect()
+                    });
                     if cells.len() != headers.len() {
                         return Err("source_changed");
                     }
@@ -597,8 +601,7 @@ pub fn apply_patches(original: &str, kind: GroupKind, patches: &[CellPatch<'_>])
                     let leading = &cell[..cell.len() - cell.trim_start().len()];
                     let trailing = &cell[cell.trim_end().len()..];
                     *cell = format!("{leading}{}{trailing}", patch.translation);
-                    let ending = &lines[i][line_body(&lines[i]).len()..];
-                    lines[i] = format!("{}{ending}", cells.join(","));
+                    used_cells.insert((row, col));
                     Ok(i)
                 }
                 GroupKind::LocLine => {
@@ -642,11 +645,18 @@ pub fn apply_patches(original: &str, kind: GroupKind, patches: &[CellPatch<'_>])
         })();
         match result {
             Ok(i) => {
-                used_lines.insert(i);
+                if kind == GroupKind::LocLine {
+                    used_lines.insert(i);
+                }
                 outcomes.push((patch.entry_id.to_string(), Ok(())));
             }
             Err(reason) => outcomes.push((patch.entry_id.to_string(), Err(reason))),
         }
+    }
+    // Compose each CSV row once, after all of its independent cell edits.
+    for (i, cells) in csv_cells {
+        let ending = &lines[i][line_body(&lines[i]).len()..];
+        lines[i] = format!("{}{ending}", cells.join(","));
     }
     AppliedBlob {
         text: lines.concat(),
@@ -962,6 +972,272 @@ mod tests {
             csv_col: None,
             csv_header: None,
         }
+    }
+
+    fn csv_entry(id: &str, source: &str, row: usize, col: usize, header: &str) -> StringEntry {
+        let mut entry = StringEntry::new(id, source, PathBuf::from("items.assets"));
+        entry.metadata.insert(
+            "extraction_method".into(),
+            serde_json::json!("textasset_csv_cell"),
+        );
+        entry
+            .metadata
+            .insert("csv_row".into(), serde_json::json!(row));
+        entry
+            .metadata
+            .insert("csv_col".into(), serde_json::json!(col));
+        entry
+            .metadata
+            .insert("csv_header".into(), serde_json::json!(header));
+        entry
+    }
+
+    #[test]
+    fn csv_same_data_row_reconstructs_both_cells_in_either_order() {
+        // Unity's private apply_table_translations helper writes this exact blob.
+        let original = "NAME,DESC\nSword,Sharp blade\nShield,Strong guard\n";
+        let expected = "NAME,DESC\nEspada,Hoja afilada\nShield,Strong guard\n";
+        let name = csv_entry("name", "Sword", 1, 0, "NAME");
+        let desc = csv_entry("desc", "Sharp blade", 1, 1, "DESC");
+        let patches = [
+            patch_from_entry(&name, "Espada").unwrap(),
+            patch_from_entry(&desc, "Hoja afilada").unwrap(),
+        ];
+        for patches in [patches.clone(), [patches[1].clone(), patches[0].clone()]] {
+            let applied = apply_patches(original, GroupKind::Csv, &patches);
+            assert_eq!(applied.text, expected);
+            assert_eq!(
+                applied.outcomes,
+                patches
+                    .iter()
+                    .map(|patch| (patch.entry_id.to_string(), Ok(())))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn csv_interleaved_row_patches_preserve_spacing_blank_lines_and_endings() {
+        let original = "\r\n NAME , DESC \r\n Sword , Sharp blade \r\n\r\nShield,Strong guard";
+        let entries = [
+            csv_entry("sword-name", "Sword", 1, 0, "NAME"),
+            csv_entry("shield-desc", "Strong guard", 2, 1, "DESC"),
+            csv_entry("sword-desc", "Sharp blade", 1, 1, "DESC"),
+            csv_entry("shield-name", "Shield", 2, 0, "NAME"),
+        ];
+        let translations = ["Espada", "Buena defensa", "Hoja afilada", "Escudo"];
+        let patches: Vec<_> = entries
+            .iter()
+            .zip(translations)
+            .map(|(entry, translation)| patch_from_entry(entry, translation).unwrap())
+            .collect();
+        let applied = apply_patches(original, GroupKind::Csv, &patches);
+        assert_eq!(
+            applied.text,
+            "\r\n NAME , DESC \r\n Espada , Hoja afilada \r\n\r\nEscudo,Buena defensa"
+        );
+        assert!(applied.outcomes.iter().all(|(_, result)| result.is_ok()));
+    }
+
+    #[test]
+    fn csv_same_row_validation_and_budget_use_both_translations() {
+        let original = "NAME,DESC\nSword,Sharp blade\nShield,Strong guard\n";
+        let expected = "NAME,DESC\nEspada,Hoja afilada\nShield,Strong guard\n";
+        for capacity in [expected.len(), expected.len() - 1] {
+            let mut entries = [
+                csv_entry("name", "Sword", 1, 0, "NAME"),
+                csv_entry("desc", "Sharp blade", 1, 1, "DESC"),
+            ];
+            entries[0].translation = Some("Espada".into());
+            entries[1].translation = Some("Hoja afilada".into());
+            attach_to_entries(&mut entries, GroupKind::Csv, original, capacity, "same-row");
+            let meta = parse_group_meta(&entries[0]).unwrap();
+            let patches: Vec<_> = entries
+                .iter()
+                .map(|entry| {
+                    patch_from_entry(entry, entry.translation.as_deref().unwrap()).unwrap()
+                })
+                .collect();
+            let issues = crate::validation::Validator::validate_all(&entries);
+            assert!(
+                !issues.iter().any(|issue| matches!(
+                    issue.kind,
+                    ValidationKind::InvalidInjectionProvenance {
+                        reason: Some(
+                            InjectionProvenanceReason::UnsupportedTextAssetReconstruction { .. }
+                        )
+                    }
+                )),
+                "{issues:?}"
+            );
+            assert_eq!(reconstructed_len(&meta, &patches), Ok(expected.len()));
+            assert_eq!(
+                reconstructed_fits(&meta, &patches),
+                Ok(expected.len() <= capacity)
+            );
+            if capacity == expected.len() {
+                assert!(issues.is_empty(), "{issues:?}");
+            } else {
+                assert_eq!(issues.len(), 2, "{issues:?}");
+                for issue in issues {
+                    assert!(matches!(
+                        issue.kind,
+                        ValidationKind::ExceedsBinarySlot { actual, limit, .. }
+                            if actual == expected.len() && limit == capacity
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn csv_duplicate_cell_is_refused_even_when_source_matches_replacement() {
+        let original = "NAME,DESC\nSword,Sharp blade\nShield,Strong guard\n";
+        let entry = csv_entry("first", "Sword", 1, 0, "NAME");
+        let patch = patch_from_entry(&entry, "Espada").unwrap();
+        let patches = [
+            patch.clone(),
+            CellPatch {
+                entry_id: "duplicate-original",
+                translation: "Sable",
+                ..patch.clone()
+            },
+            CellPatch {
+                entry_id: "duplicate-replacement",
+                physical_source: "Espada",
+                translation: "Sable",
+                ..patch
+            },
+        ];
+        assert_eq!(
+            apply_patches(original, GroupKind::Csv, &patches),
+            AppliedBlob {
+                text: "NAME,DESC\nEspada,Sharp blade\nShield,Strong guard\n".into(),
+                outcomes: vec![
+                    ("first".into(), Ok(())),
+                    ("duplicate-original".into(), Err("error")),
+                    ("duplicate-replacement".into(), Err("error")),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn csv_invalid_patches_keep_existing_outcomes_and_leave_cells_available() {
+        let original = "NAME,DESC\nSword,Sharp blade\nShield,Strong guard\n";
+        let entry = csv_entry("valid", "Sword", 1, 0, "NAME");
+        let patch = patch_from_entry(&entry, "Espada").unwrap();
+        let invalid = [
+            (
+                CellPatch {
+                    csv_row: Some(0),
+                    ..patch.clone()
+                },
+                "error",
+            ),
+            (
+                CellPatch {
+                    translation: "a,b",
+                    ..patch.clone()
+                },
+                "error",
+            ),
+            (
+                CellPatch {
+                    translation: "\"Sword\"",
+                    ..patch.clone()
+                },
+                "error",
+            ),
+            (
+                CellPatch {
+                    translation: "a\nb",
+                    ..patch.clone()
+                },
+                "error",
+            ),
+            (
+                CellPatch {
+                    translation: "a\rb",
+                    ..patch.clone()
+                },
+                "error",
+            ),
+            (
+                CellPatch {
+                    csv_row: None,
+                    ..patch.clone()
+                },
+                "error",
+            ),
+            (
+                CellPatch {
+                    csv_col: None,
+                    ..patch.clone()
+                },
+                "error",
+            ),
+            (
+                CellPatch {
+                    csv_row: Some(3),
+                    ..patch.clone()
+                },
+                "target_missing",
+            ),
+            (
+                CellPatch {
+                    csv_col: Some(2),
+                    ..patch.clone()
+                },
+                "target_missing",
+            ),
+            (
+                CellPatch {
+                    csv_header: Some("TEXT"),
+                    ..patch.clone()
+                },
+                "source_changed",
+            ),
+            (
+                CellPatch {
+                    physical_source: "Old",
+                    ..patch.clone()
+                },
+                "source_changed",
+            ),
+        ];
+        for (invalid, reason) in invalid {
+            let applied = apply_patches(original, GroupKind::Csv, &[invalid, patch.clone()]);
+            assert_eq!(applied.outcomes[0].1, Err(reason));
+            assert_eq!(applied.outcomes[1].1, Ok(()));
+            assert_eq!(
+                applied.text,
+                "NAME,DESC\nEspada,Sharp blade\nShield,Strong guard\n"
+            );
+        }
+    }
+
+    #[test]
+    fn loc_line_still_allows_only_one_patch_per_physical_line() {
+        let original = "Menu.A: Sword\r\nMenu.B: Sharp blade\r\n";
+        let patches = [
+            loc_patch("first", Some("Menu.A"), "Sword", "Espada", Some(0)),
+            loc_patch("duplicate", Some("Menu.A"), "Sword", "Sable", Some(0)),
+            loc_patch("replacement", Some("Menu.A"), "Espada", "Sable", Some(0)),
+            loc_patch(
+                "other",
+                Some("Menu.B"),
+                "Sharp blade",
+                "Hoja afilada",
+                Some(1),
+            ),
+        ];
+        assert_loc_patches(
+            original,
+            &patches,
+            "Menu.A: Espada\r\nMenu.B: Hoja afilada\r\n",
+            &[Ok(()), Err("target_missing"), Err("target_missing"), Ok(())],
+        );
     }
 
     // Deliberately retain the old whole-table scan as an independent oracle.
