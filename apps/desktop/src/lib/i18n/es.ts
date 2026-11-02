@@ -845,6 +845,7 @@ export const es: Record<keyof typeof en, string> = {
   "detail.memory.use": "Usar",
   "detail.history.empty": "Aún no hay cambios registrados",
   "detail.history.restore": "Restaurar esta versión",
+  "detail.history.restoreBefore": "Restaurar anterior",
   "detail.history.before": "Antes",
   "detail.history.after": "Después",
   "detail.context": "Contexto",

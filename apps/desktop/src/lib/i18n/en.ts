@@ -860,6 +860,7 @@ export const en = {
   "detail.memory.use": "Use",
   "detail.history.empty": "No changes recorded yet",
   "detail.history.restore": "Restore this version",
+  "detail.history.restoreBefore": "Restore before",
   "detail.history.before": "Before",
   "detail.history.after": "After",
   "detail.context": "Context",
