@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
-use crate::database::{sha256_hex, Database};
+use crate::database::{fold_path_case, path_identity_key, sha256_hex, Database};
 use crate::error::{LocustError, Result};
 use crate::extraction::{resolve_game_root, FormatRegistry};
 use crate::file_identity::same_file;
@@ -104,10 +104,8 @@ fn preflight_project_open_with(
         if format_id.is_some() || registry.detect(&path).is_some() {
             source_plugin(registry, raw_path, &path, format_id)?;
         }
-        let existing = unique_existing_saved_dbs_with(
-            &saved_project_db_candidates(&path, config_dir),
-            |candidate| std::fs::metadata(candidate),
-        )?;
+        let existing =
+            owned_saved_dbs_with(&path, config_dir, |candidate| std::fs::metadata(candidate))?;
         if existing.len() > 1 {
             return Err(ambiguous_saved_dbs_error(&existing));
         }
@@ -182,7 +180,7 @@ pub fn open_verified_saved_project(
                 &path,
                 format_id,
                 total,
-                Some(warnings),
+                SavedProjectOpen::Verified(warnings),
             )
         }
         ProjectOpenPreflight::NeedsAttention { reason } => Err(LocustError::InjectionError(reason)),
@@ -284,8 +282,52 @@ fn short_path_hash(game_root: &Path) -> String {
     hex.chars().take(8).collect()
 }
 
-/// Preferred: `<parent>/<game_name>.locust.db`. Fallback when that directory
-/// is not writable: `config_dir/projects/<sanitized>-<hash>.locust.db`.
+// Reserve SQLite's longest sidecar suffix (-journal), including initial open.
+const MAX_DB_COMPONENT_BYTES: usize = 255 - 8;
+const DB_SUFFIX: &str = ".locust.db";
+const GAME_ROOT_IDENTITY: &str = "game_root_identity";
+
+fn raw_project_name(game_root: &Path) -> String {
+    game_root
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "project".to_string())
+}
+
+fn project_db_filename(game_root: &Path, directory: &Path, with_hash: bool) -> String {
+    #[cfg(windows)]
+    let max_bytes = {
+        // SQLite's default Windows VFS also limits the full path to MAX_PATH.
+        // UTF-8 bounds are conservative for UTF-16, including non-BMP names.
+        let directory = std::path::absolute(directory).unwrap_or_else(|_| directory.to_path_buf());
+        let parent_units = directory.to_string_lossy().encode_utf16().count();
+        MAX_DB_COMPONENT_BYTES.min(259_usize.saturating_sub(parent_units + 1 + 8))
+    };
+    #[cfg(not(windows))]
+    let max_bytes = {
+        let _ = directory;
+        MAX_DB_COMPONENT_BYTES
+    };
+    let raw = raw_project_name(game_root);
+    let stem = sanitize_project_stem(&raw);
+    if !with_hash
+        && stem.len() + DB_SUFFIX.len() <= max_bytes
+        && project_stem_unambiguous(game_root).unwrap_or(false)
+    {
+        return format!("{stem}{DB_SUFFIX}");
+    }
+    let hash = short_path_hash(game_root);
+    let limit = max_bytes.saturating_sub(DB_SUFFIX.len() + 1 + hash.len());
+    let mut end = stem.len().min(limit);
+    while !stem.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}-{hash}{DB_SUFFIX}", &stem[..end])
+}
+
+/// Preferred: `<parent>/<game_name>.locust.db` for unambiguous names.
+/// Sanitized, colliding and overlong names use a bounded stem plus a path hash. An unwritable
+/// parent falls back to `config_dir/projects/<stem>-<hash>.locust.db`.
 pub fn resolve_project_db_path(game_root: &Path) -> PathBuf {
     resolve_project_db_path_with(game_root, &AppConfig::config_dir(), dir_is_writable)
 }
@@ -295,45 +337,167 @@ fn resolve_project_db_path_with(
     config_dir: &Path,
     writable: impl Fn(&Path) -> bool,
 ) -> PathBuf {
-    let raw_name = game_root
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "project".to_string());
-    let stem = sanitize_project_stem(&raw_name);
     if let Some(parent) = game_root.parent() {
         if !parent.as_os_str().is_empty() && writable(parent) {
-            return parent.join(format!("{stem}.locust.db"));
+            return parent.join(project_db_filename(game_root, parent, false));
         }
     }
-    let hash = short_path_hash(game_root);
-    config_dir
-        .join("projects")
-        .join(format!("{stem}-{hash}.locust.db"))
+    let directory = config_dir.join("projects");
+    directory.join(project_db_filename(game_root, &directory, true))
 }
 
-/// Adjacent sibling and profile-fallback DB paths for a resolved game root.
-/// Both locations are returned without probing parent writability: an existing
-/// file at either path is a saved project, even if a later extract would have
-/// chosen the other location.
+/// Generated and valid legacy paths, without probing parent writability.
+/// Ownership is checked separately before any automatic reuse.
 pub(crate) fn saved_project_db_candidates(game_root: &Path, config_dir: &Path) -> Vec<PathBuf> {
-    let raw_name = game_root
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "project".to_string());
-    let stem = sanitize_project_stem(&raw_name);
-    let mut out = Vec::with_capacity(2);
-    if let Some(parent) = game_root.parent() {
-        if !parent.as_os_str().is_empty() {
-            out.push(parent.join(format!("{stem}.locust.db")));
+    let parent = game_root.parent().filter(|p| !p.as_os_str().is_empty());
+    let mut out = Vec::with_capacity(4);
+    if let Some(parent) = parent {
+        out.push(parent.join(project_db_filename(game_root, parent, false)));
+    }
+    let fallback_dir = config_dir.join("projects");
+    out.push(fallback_dir.join(project_db_filename(game_root, &fallback_dir, true)));
+
+    let stem = sanitize_project_stem(&raw_project_name(game_root));
+    let hash = short_path_hash(game_root);
+    let mut legacy = Vec::new();
+    // Still validate legacy files so corruption is reported. The ownership
+    // check below excludes ambiguous plain names even with a matching stamp.
+    if let Some(parent) = parent {
+        legacy.push(parent.join(format!("{stem}{DB_SUFFIX}")));
+    }
+    legacy.push(fallback_dir.join(format!("{stem}-{hash}{DB_SUFFIX}")));
+    for path in legacy {
+        let name = path.file_name().unwrap().to_string_lossy();
+        // Do not stat an impossible legacy component: ENAMETOOLONG must not
+        // hide the valid bounded candidate. Windows measures UTF-16 units.
+        #[cfg(windows)]
+        let fits = name.encode_utf16().count() <= 255;
+        #[cfg(not(windows))]
+        let fits = name.len() <= 255;
+        if fits && !out.contains(&path) {
+            out.push(path);
         }
     }
-    let hash = short_path_hash(game_root);
-    out.push(
-        config_dir
-            .join("projects")
-            .join(format!("{stem}-{hash}.locust.db")),
-    );
     out
+}
+
+/// Plain adjacent names are safe only when sanitization changes nothing and
+/// no sibling folder collapses to that stem. Path stamps are informational for
+/// these names, so a game and its adjacent database can move together.
+fn project_stem_unambiguous(game_root: &Path) -> Result<bool> {
+    let raw = raw_project_name(game_root);
+    let stem = sanitize_project_stem(&raw);
+    if stem != raw {
+        return Ok(false);
+    }
+    let parent = game_root
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    for sibling in std::fs::read_dir(parent)? {
+        let sibling = sibling?;
+        let sibling_path = sibling.path();
+        if path_identity_key(&sibling_path) == path_identity_key(game_root) {
+            continue;
+        }
+        if sibling_path.is_dir()
+            && fold_path_case(&sanitize_project_stem(
+                &sibling.file_name().to_string_lossy(),
+            )) == fold_path_case(&stem)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn identity_matches_game(
+    database_path: &Path,
+    identity: Option<serde_json::Value>,
+    game_root: &Path,
+) -> Result<bool> {
+    let unambiguous = project_stem_unambiguous(game_root)?;
+    if let Some(parent) = game_root.parent() {
+        let plain = parent.join(format!(
+            "{}{DB_SUFFIX}",
+            sanitize_project_stem(&raw_project_name(game_root))
+        ));
+        if same_saved_db(database_path, &plain) {
+            return Ok(unambiguous);
+        }
+    }
+    match identity {
+        Some(identity) => Ok(identity == serde_json::json!(path_identity_key(game_root))),
+        None => Ok(unambiguous),
+    }
+}
+
+/// Read-only ownership probe, including DBs predating project_metadata.
+fn saved_db_belongs_to_game(database_path: &Path, game_root: &Path) -> Result<bool> {
+    let mut missing_sidecar = false;
+    for suffix in ["-wal", "-shm"] {
+        let mut name = database_path.as_os_str().to_os_string();
+        name.push(suffix);
+        missing_sidecar |= !PathBuf::from(name).try_exists()?;
+    }
+    let read_identity = || -> Result<Option<serde_json::Value>> {
+        let conn = Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|_| not_a_locust_db(database_path))?;
+        conn.execute_batch("BEGIN DEFERRED TRANSACTION")?;
+        let has_metadata: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'project_metadata')",
+            [], |row| row.get(0),
+        ).map_err(|_| not_a_locust_db(database_path))?;
+        if !has_metadata {
+            return Ok(None);
+        }
+        conn.query_row(
+            "SELECT value FROM project_metadata WHERE key = ?1",
+            [GAME_ROOT_IDENTITY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|value| serde_json::from_str(&value).map_err(LocustError::from))
+        .transpose()
+    };
+    let identity = read_identity();
+    if missing_sidecar {
+        // As in Database::snapshot_existing, let SQLite's last-close locking
+        // clean up empty sidecars created by a read-only WAL probe. Never
+        // unlink files, migrate, or change journal settings. Active writers
+        // retain their sidecars; unwritable sources simply skip cleanup.
+        if let Ok(conn) =
+            Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+        {
+            let _ = conn.pragma_query_value(None, "schema_version", |row| row.get::<_, i64>(0));
+        }
+    }
+    identity_matches_game(database_path, identity?, game_root)
+}
+
+fn owned_saved_dbs_with(
+    game_root: &Path,
+    config_dir: &Path,
+    metadata: impl Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+) -> Result<Vec<PathBuf>> {
+    let existing = unique_existing_saved_dbs_with(
+        &saved_project_db_candidates(game_root, config_dir),
+        metadata,
+    )?;
+    let mut owned = Vec::new();
+    for path in existing {
+        if saved_db_belongs_to_game(&path, game_root)? {
+            owned.push(path);
+        }
+    }
+    Ok(owned)
+}
+
+fn foreign_project_db_error(path: &Path) -> LocustError {
+    LocustError::IoError(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("project database ownership does not match this game or is ambiguous: {}; open a .locust.db explicitly to inspect saved work", path.display()),
+    ))
 }
 
 fn same_saved_db(left: &Path, right: &Path) -> bool {
@@ -415,14 +579,24 @@ fn folder_open_db_path_with(
     config_dir: &Path,
     writable: impl Fn(&Path) -> bool,
 ) -> Result<PathBuf> {
-    let existing = unique_existing_saved_dbs_with(
-        &saved_project_db_candidates(game_root, config_dir),
-        |candidate| std::fs::metadata(candidate),
-    )?;
+    let existing = owned_saved_dbs_with(game_root, config_dir, |candidate| {
+        std::fs::metadata(candidate)
+    })?;
     match existing.as_slice() {
-        [] => Ok(resolve_project_db_path_with(
-            game_root, config_dir, writable,
-        )),
+        [] => {
+            let preferred = resolve_project_db_path_with(game_root, config_dir, writable);
+            if !preferred.try_exists()? {
+                return Ok(preferred);
+            }
+            // A foreign or ambiguous DB occupies the preferred hashed name.
+            // Leave it intact and use the deterministic hashed profile name.
+            let directory = config_dir.join("projects");
+            let fallback = directory.join(project_db_filename(game_root, &directory, true));
+            if fallback.try_exists()? {
+                return Err(foreign_project_db_error(&fallback));
+            }
+            Ok(fallback)
+        }
         [database_path] => Ok(database_path.clone()),
         _ => Err(ambiguous_saved_dbs_error(&existing)),
     }
@@ -471,7 +645,17 @@ fn open_project_with(
     let extraction = plugin.extract_with_diagnostics(&path)?;
     let extraction_warnings = extraction.bounded_warnings();
 
+    let existing = database_path.try_exists()?;
     let candidate = Database::open(&database_path)?;
+    if existing
+        && !identity_matches_game(
+            &database_path,
+            candidate.get_project_metadata(GAME_ROOT_IDENTITY)?,
+            &path,
+        )?
+    {
+        return Err(foreign_project_db_error(&database_path));
+    }
     let merge = if extraction.complete {
         candidate.merge_entries(&extraction.entries)?
     } else {
@@ -480,6 +664,10 @@ fn open_project_with(
     candidate.set_project_metadata(
         "extraction_warnings",
         &serde_json::json!(extraction_warnings),
+    )?;
+    candidate.set_project_metadata(
+        GAME_ROOT_IDENTITY,
+        &serde_json::json!(path_identity_key(&path)),
     )?;
     let total_strings = candidate.get_stats()?.total;
 
@@ -582,8 +770,14 @@ pub fn open_project_db(
         game_path,
         format_id,
         total_strings,
-        None,
+        SavedProjectOpen::Explicit,
     )
+}
+
+enum SavedProjectOpen {
+    Explicit,
+    Discovered,
+    Verified(Vec<String>),
 }
 
 fn open_project_db_under_lock(
@@ -593,13 +787,33 @@ fn open_project_db_under_lock(
     game_path: &Path,
     format_id: &str,
     total_strings: usize,
-    verified_warnings: Option<Vec<String>>,
+    saved: SavedProjectOpen,
 ) -> Result<ProjectOpenOutcome> {
     let plugin = registry
         .get(format_id)
         .ok_or_else(|| LocustError::UnsupportedFormat(format!("Unknown format: {format_id}")))?;
     plugin.validate_source(game_path)?;
     let candidate = Database::open(database_path)?;
+    let automatic = !matches!(&saved, SavedProjectOpen::Explicit);
+    // Initialize legacy schemas before reading metadata, but finish warning
+    // validation before claiming ownership or publishing the live connection.
+    let extraction_warnings = match saved {
+        SavedProjectOpen::Verified(warnings) => warnings,
+        _ => saved_extraction_warnings(&candidate)?,
+    };
+    if automatic {
+        if !identity_matches_game(
+            database_path,
+            candidate.get_project_metadata(GAME_ROOT_IDENTITY)?,
+            game_path,
+        )? {
+            return Err(foreign_project_db_error(database_path));
+        }
+        candidate.set_project_metadata(
+            GAME_ROOT_IDENTITY,
+            &serde_json::json!(path_identity_key(game_path)),
+        )?;
+    }
 
     let project_name = game_path
         .file_name()
@@ -620,10 +834,7 @@ fn open_project_db_under_lock(
         stale_source_reset: 0,
         removed: 0,
         preserved_translations: 0,
-        extraction_warnings: match verified_warnings {
-            Some(warnings) => warnings,
-            None => saved_extraction_warnings(&candidate)?,
-        },
+        extraction_warnings,
     };
     db.replace_with(candidate);
     Ok(outcome)
@@ -671,10 +882,16 @@ fn open_recent_project_with_metadata(
     if format_id.is_some() || registry.detect(&path).is_some() {
         source_plugin(registry, raw_path, &path, format_id)?;
     }
-    let existing =
-        unique_existing_saved_dbs_with(&saved_project_db_candidates(&path, config_dir), metadata)?;
+    let existing = owned_saved_dbs_with(&path, config_dir, metadata)?;
     match existing.as_slice() {
-        [] => open_project(db, registry, raw_path, format_id),
+        [] => open_project_with(
+            db,
+            registry,
+            raw_path,
+            format_id,
+            config_dir,
+            dir_is_writable,
+        ),
         [database_path] => {
             let plugin = if let Some(fid) = format_id {
                 registry.get(fid).ok_or_else(|| {
@@ -685,7 +902,17 @@ fn open_recent_project_with_metadata(
                     LocustError::UnsupportedFormat("format not detected".to_string())
                 })?
             };
-            open_project_db(db, registry, database_path, &path, plugin.id())
+            let _source_lock = lock_game_source(&path)?;
+            let total = probe_locust_project_db(database_path)?;
+            open_project_db_under_lock(
+                db,
+                registry,
+                database_path,
+                &path,
+                plugin.id(),
+                total,
+                SavedProjectOpen::Discovered,
+            )
         }
         _ => Err(ambiguous_saved_dbs_error(&existing)),
     }
@@ -749,6 +976,352 @@ mod tests {
         let mut reg = FormatRegistry::new();
         reg.register(Box::new(TsvPlugin));
         reg
+    }
+
+    fn w10_game(parent: &Path, name: &str, rows: &str) -> PathBuf {
+        let game = parent.join(name);
+        std::fs::create_dir(&game).unwrap();
+        std::fs::write(game.join("extract.tsv"), rows).unwrap();
+        game
+    }
+
+    #[tokio::test]
+    async fn w10_colliding_project_names_preserve_both_games_in_either_order() {
+        for reverse in [false, true] {
+            let fixture = tempfile::tempdir().unwrap();
+            let config = fixture.path().join("config");
+            let a = w10_game(fixture.path(), "Game", "hero\tHello");
+            let b = w10_game(fixture.path(), "_Game", "villain\tEvil");
+            let games = if reverse { [&b, &a] } else { [&a, &b] };
+            let live = Database::open_in_memory().unwrap();
+            let reg = registry();
+            let mut saved = Vec::new();
+            for game in games {
+                let out = open_project_with(&live, &reg, game, None, &config, |_| true).unwrap();
+                let id = if game == &a { "hero" } else { "villain" };
+                live.save_translation(id, "Traducido", "manual")
+                    .await
+                    .unwrap();
+                live.update_entry_status(id, StringStatus::Approved)
+                    .await
+                    .unwrap();
+                assert_eq!(out.database_path.parent(), Some(fixture.path()));
+                assert_eq!(
+                    out.database_path.file_name().unwrap().to_str().unwrap(),
+                    format!("Game-{}.locust.db", short_path_hash(game)),
+                    "both colliding names must use a path hash"
+                );
+                saved.push((game, out.database_path, id));
+            }
+            assert_ne!(
+                saved[0].1, saved[1].1,
+                "sibling games must own distinct DBs"
+            );
+            for (game, db_path, id) in &saved {
+                let before = Database::read_project_snapshot(db_path).unwrap();
+                let identity = before.get_project_metadata("game_root_identity").unwrap();
+                assert!(identity.is_some(), "new projects must record ownership");
+                drop(before);
+                let out = open_project_with(&live, &reg, game, None, &config, |_| true).unwrap();
+                assert_eq!(&out.database_path, db_path);
+                assert_eq!(out.removed, 0);
+                assert_eq!(out.total_strings, 1);
+                let row = live.get_entry(id).unwrap().unwrap();
+                assert_eq!(row.translation.as_deref(), Some("Traducido"));
+                assert_eq!(row.status, StringStatus::Approved);
+                assert_eq!(
+                    live.get_project_metadata("game_root_identity").unwrap(),
+                    identity
+                );
+                let recent = open_recent_project_with(&live, &reg, game, None, &config).unwrap();
+                assert_eq!(&recent.database_path, db_path);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn w10_moved_unambiguous_project_reuses_adjacent_db_and_restamps_identity() {
+        for recent in [false, true] {
+            let fixture = tempfile::tempdir().unwrap();
+            let config = fixture.path().join("config");
+            let original = fixture.path().join("original");
+            std::fs::create_dir(&original).unwrap();
+            let game = w10_game(&original, "Game", "hero\tHello");
+            let live = Database::open_in_memory().unwrap();
+            let reg = registry();
+            let first = open_project_with(&live, &reg, &game, None, &config, |_| true).unwrap();
+            assert_eq!(first.database_path, original.join("Game.locust.db"));
+            live.save_translation("hero", "Hola", "manual")
+                .await
+                .unwrap();
+            live.update_entry_status("hero", StringStatus::Approved)
+                .await
+                .unwrap();
+            let old_identity = live.get_project_metadata(GAME_ROOT_IDENTITY).unwrap();
+            drop(live);
+
+            let moved = fixture.path().join("moved");
+            std::fs::rename(&original, &moved).unwrap();
+            let game = moved.join("Game");
+            let live = Database::open_in_memory().unwrap();
+            let reopened = if recent {
+                open_recent_project_with(&live, &reg, &game, None, &config).unwrap()
+            } else {
+                open_project_with(&live, &reg, &game, None, &config, |_| true).unwrap()
+            };
+            assert_eq!(reopened.database_path, moved.join("Game.locust.db"));
+            assert_eq!(reopened.total_strings, 1);
+            let row = live.get_entry("hero").unwrap().unwrap();
+            assert_eq!(row.source, "Hello");
+            assert_eq!(row.translation.as_deref(), Some("Hola"));
+            assert_eq!(row.status, StringStatus::Approved);
+            let identity = live.get_project_metadata(GAME_ROOT_IDENTITY).unwrap();
+            assert_ne!(identity, old_identity);
+            assert_eq!(identity, Some(serde_json::json!(path_identity_key(&game))));
+            let reopened = open_project_with(&live, &reg, &game, None, &config, |_| true).unwrap();
+            assert_eq!(reopened.database_path, moved.join("Game.locust.db"));
+            assert_eq!(reopened.preserved_translations, 1);
+        }
+    }
+
+    #[test]
+    fn w10_ambiguous_plain_legacy_db_is_preserved_for_both_names() {
+        for (name, sibling) in [("Game", true), ("_Game", true), ("_Game", false)] {
+            for stamped in [false, true] {
+                let fixture = tempfile::tempdir().unwrap();
+                let config = fixture.path().join("config");
+                let game = w10_game(fixture.path(), name, "hero\tHello");
+                if sibling {
+                    let other = if name == "Game" { "_Game" } else { "Game" };
+                    w10_game(fixture.path(), other, "villain\tEvil");
+                }
+                let game = &game;
+                let legacy = fixture.path().join("Game.locust.db");
+                save_folder_translation(&legacy, game);
+                if stamped {
+                    Database::open(&legacy)
+                        .unwrap()
+                        .set_project_metadata(
+                            GAME_ROOT_IDENTITY,
+                            &serde_json::json!(path_identity_key(game)),
+                        )
+                        .unwrap();
+                }
+                let before = std::fs::read(&legacy).unwrap();
+                let live = Database::open_in_memory().unwrap();
+                let out =
+                    open_project_with(&live, &registry(), game, None, &config, |_| true).unwrap();
+                assert_eq!(
+                    out.database_path,
+                    fixture
+                        .path()
+                        .join(format!("Game-{}.locust.db", short_path_hash(game)))
+                );
+                assert_eq!(std::fs::read(&legacy).unwrap(), before);
+                assert_eq!(out.preserved_translations, 0);
+            }
+        }
+    }
+
+    async fn w10_long_project_name(name: &str) {
+        for writable in [true, false] {
+            let fixture = tempfile::tempdir().unwrap();
+            let config = fixture.path().join("profile");
+            let game = w10_game(fixture.path(), name, "hero\tHello");
+            let path = resolve_project_db_path_with(&game, &config, |_| writable);
+            let component = path.file_name().unwrap().to_str().unwrap();
+            assert!(
+                component.len() + 4 <= 255,
+                "UTF-8 plus SQLite sidecar suffix: {}",
+                component.len()
+            );
+            assert!(
+                component.encode_utf16().count() + 4 <= 255,
+                "UTF-16 component limit"
+            );
+            assert_eq!(
+                path,
+                resolve_project_db_path_with(&game, &config, |_| writable)
+            );
+            if writable {
+                assert_eq!(path.parent().unwrap(), fixture.path());
+            } else {
+                assert_eq!(path.parent().unwrap(), config.join("projects"));
+            }
+            let live = Database::open_in_memory().unwrap();
+            let reg = registry();
+            let first = open_project_with(&live, &reg, &game, None, &config, |_| writable).unwrap();
+            assert_eq!(first.database_path, path);
+            live.save_translation("hero", "Hola", "manual")
+                .await
+                .unwrap();
+            let second =
+                open_project_with(&live, &reg, &game, None, &config, |_| !writable).unwrap();
+            assert_eq!(
+                second.database_path, path,
+                "existing DB wins over current writability"
+            );
+            assert_eq!(second.preserved_translations, 1);
+            assert_eq!(
+                live.get_entry("hero")
+                    .unwrap()
+                    .unwrap()
+                    .translation
+                    .as_deref(),
+                Some("Hola")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn w10_long_ascii_project_names_fit_and_reopen() {
+        w10_long_project_name(&"a".repeat(250)).await;
+    }
+
+    #[tokio::test]
+    async fn w10_long_unicode_project_names_fit_and_reopen() {
+        // 250 UTF-8 bytes and 84 UTF-16 units: valid on Windows and Unix.
+        w10_long_project_name(&format!("{}a", "界".repeat(83))).await;
+        #[cfg(windows)]
+        w10_long_project_name(&"界".repeat(250)).await;
+    }
+
+    #[test]
+    fn w10_legacy_unambiguous_project_names_are_claimed_in_place() {
+        for name in ["Game", "My Game", "日本語"] {
+            for fallback in [false, true] {
+                let fixture = tempfile::tempdir().unwrap();
+                let config = fixture.path().join("config");
+                let game = w10_game(fixture.path(), name, "hero\tHello");
+                let stem = sanitize_project_stem(name);
+                let legacy = if fallback {
+                    config
+                        .join("projects")
+                        .join(format!("{stem}-{}.locust.db", short_path_hash(&game)))
+                } else {
+                    fixture.path().join(format!("{stem}.locust.db"))
+                };
+                save_folder_translation(&legacy, &game);
+                let live = Database::open_in_memory().unwrap();
+                let reg = registry();
+                let out = open_project_with(&live, &reg, &game, None, &config, |_| true).unwrap();
+                assert_eq!(out.database_path, legacy);
+                assert_eq!(out.preserved_translations, 1);
+                let identity = live.get_project_metadata("game_root_identity").unwrap();
+                assert!(
+                    identity.is_some(),
+                    "a safely adopted legacy DB must record ownership"
+                );
+                let out = open_project_with(&live, &reg, &game, None, &config, |_| false).unwrap();
+                assert_eq!(out.database_path, legacy);
+                assert_eq!(
+                    live.get_project_metadata("game_root_identity").unwrap(),
+                    identity
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn w10_recent_legacy_db_without_metadata_is_claimed_without_extraction() {
+        let fixture = tempfile::tempdir().unwrap();
+        let game = w10_game(fixture.path(), "Game", "hero\tChanged");
+        let legacy = fixture.path().join("Game.locust.db");
+        save_folder_translation(&legacy, &game);
+        Connection::open(&legacy)
+            .unwrap()
+            .execute_batch("DROP TABLE project_metadata")
+            .unwrap();
+        let live = Database::open_in_memory().unwrap();
+        let out = open_recent_project_with(
+            &live,
+            &panic_extract_registry(),
+            &game,
+            Some("tsv-no-extract"),
+            &fixture.path().join("config"),
+        )
+        .unwrap();
+        assert_eq!(out.database_path, legacy);
+        let hero = live.get_entry("hero").unwrap().unwrap();
+        assert_eq!(hero.source, "Hello");
+        assert_eq!(hero.translation.as_deref(), Some("Hola"));
+        assert_eq!(hero.status, StringStatus::Approved);
+        assert!(live
+            .get_project_metadata("game_root_identity")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn w10_ambiguous_legacy_db_is_preserved_and_new_name_is_used() {
+        let fixture = tempfile::tempdir().unwrap();
+        let config = fixture.path().join("config");
+        let a = w10_game(fixture.path(), "Game", "hero\tHello");
+        let b = w10_game(fixture.path(), "_Game", "villain\tEvil");
+        let legacy = fixture.path().join("Game.locust.db");
+        save_folder_translation(&legacy, &a);
+        let before = std::fs::read(&legacy).unwrap();
+        let live = Database::open_in_memory().unwrap();
+        let out = open_project_with(&live, &registry(), &b, None, &config, |_| true).unwrap();
+        assert_ne!(out.database_path, legacy);
+        assert!(live.get_entry("hero").unwrap().is_none());
+        assert!(live.get_entry("villain").unwrap().is_some());
+        assert_eq!(std::fs::read(&legacy).unwrap(), before);
+        let saved = Database::read_project_snapshot(&legacy).unwrap();
+        assert_eq!(
+            saved
+                .get_entry("hero")
+                .unwrap()
+                .unwrap()
+                .translation
+                .as_deref(),
+            Some("Hola")
+        );
+        assert_eq!(
+            saved.get_project_metadata("game_root_identity").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn w10_ambiguous_invalid_legacy_db_still_reports_corruption() {
+        let fixture = tempfile::tempdir().unwrap();
+        let config = fixture.path().join("config");
+        let game = w10_game(fixture.path(), "_Game", "hero\tMust not extract");
+        let legacy = fixture.path().join("Game.locust.db");
+        let invalid = b"not-a-sqlite-database";
+        std::fs::write(&legacy, invalid).unwrap();
+        let live = Database::open_in_memory().unwrap();
+        let error = open_recent_project_with(&live, &registry(), &game, None, &config).unwrap_err();
+        assert!(
+            error.to_string().contains("not a Locust project database"),
+            "{error}"
+        );
+        assert_eq!(live.path(), PathBuf::from(":memory:"));
+        assert_eq!(std::fs::read(&legacy).unwrap(), invalid);
+    }
+
+    #[test]
+    fn w10_foreign_owned_hashed_db_is_never_adopted() {
+        let fixture = tempfile::tempdir().unwrap();
+        let config = fixture.path().join("config");
+        let a = w10_game(fixture.path(), "Game", "hero\tHello");
+        let b = w10_game(fixture.path(), "_Other", "villain\tEvil");
+        let live = Database::open_in_memory().unwrap();
+        let reg = registry();
+        let first = open_project_with(&live, &reg, &a, None, &config, |_| true).unwrap();
+        drop(live);
+        let foreign = resolve_project_db_path_with(&b, &config, |_| true);
+        std::fs::copy(&first.database_path, &foreign).unwrap();
+        let before = std::fs::read(&foreign).unwrap();
+        let live = Database::open_in_memory().unwrap();
+        let out = open_project_with(&live, &reg, &b, None, &config, |_| true).unwrap();
+        assert_ne!(out.database_path, foreign);
+        assert_eq!(std::fs::read(&foreign).unwrap(), before);
+        let reopened = open_project_with(&live, &reg, &b, None, &config, |_| true).unwrap();
+        assert_eq!(reopened.database_path, out.database_path);
+        let recent = open_recent_project_with(&live, &reg, &b, None, &config).unwrap();
+        assert_eq!(recent.database_path, out.database_path);
     }
 
     async fn assert_failed_saved_open_keeps_live_database(open_path: &str) {
