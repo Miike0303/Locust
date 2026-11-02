@@ -859,6 +859,7 @@ impl RenPyPlugin {
         // Track multi-line define blocks (dicts, lists, parenthesized values).
         // These contain internal identifiers/config values, not translatable text.
         let mut define_bracket_depth: i32 = 0;
+        let mut define_triple_quote = None;
         // Track the current label — needed to generate Ren'Py translation identifiers
         // in the format `<label>_<hash>`.
         let mut current_label: Option<String> = None;
@@ -880,26 +881,17 @@ impl RenPyPlugin {
                 }
             }
 
-            // Track multi-line define blocks: `define x = { ... }`, `define x = [ ... ]`, `define x = ( ... )`
-            // When opened, skip all content until closed.
-            if define_bracket_depth == 0 && trimmed.starts_with("define ") {
-                // Count opening vs closing brackets on this line
-                let opens = trimmed.matches(['{', '[', '(']).count() as i32;
-                let closes = trimmed.matches(['}', ']', ')']).count() as i32;
-                if opens > closes {
-                    define_bracket_depth = opens - closes;
-                    // Still process this line (the `define x = {` might have extract logic)
-                    // But don't skip — the first line is the define itself
-                }
-            } else if define_bracket_depth > 0 {
-                let opens = trimmed.matches(['{', '[', '(']).count() as i32;
-                let closes = trimmed.matches(['}', ']', ')']).count() as i32;
-                define_bracket_depth += opens - closes;
-                if define_bracket_depth < 0 {
-                    define_bracket_depth = 0;
-                }
-                // Skip all content inside the multi-line define block
+            // Skip continuation lines through the end of the define's brackets
+            // and triple-quoted strings, including the closing line.
+            if define_bracket_depth > 0 || define_triple_quote.is_some() {
+                define_bracket_depth = (define_bracket_depth
+                    + define_bracket_delta(line, &mut define_triple_quote))
+                .max(0);
                 continue;
+            }
+            if trimmed.starts_with("define ") {
+                define_bracket_depth = define_bracket_delta(line, &mut define_triple_quote).max(0);
+                // Preserve normal extraction on the first line of the define.
             }
 
             // Track python blocks (skip most content inside them)
@@ -1067,6 +1059,48 @@ impl RenPyPlugin {
 
         entries
     }
+}
+
+/// Count define brackets outside strings/comments with constant-size state.
+/// This is not a Python parser: bracket kinds are not matched, and only triple
+/// quotes carry string state across lines (ordinary strings are line-local).
+fn define_bracket_delta(line: &str, triple_quote: &mut Option<u8>) -> i32 {
+    let bytes = line.as_bytes();
+    let mut pos = 0;
+    let mut delta = 0;
+    let mut quote = triple_quote.map(|delimiter| (delimiter, true));
+
+    while pos < bytes.len() {
+        if let Some((delimiter, triple)) = quote {
+            if bytes[pos] == b'\\' {
+                pos += 2;
+            } else if bytes[pos] == delimiter
+                && (!triple || bytes[pos..].starts_with(&[delimiter; 3]))
+            {
+                pos += if triple { 3 } else { 1 };
+                quote = None;
+            } else {
+                pos += 1;
+            }
+            continue;
+        }
+        match bytes[pos] {
+            b'#' => break,
+            b'\'' | b'"' => {
+                let delimiter = bytes[pos];
+                let triple = bytes[pos..].starts_with(&[delimiter; 3]);
+                quote = Some((delimiter, triple));
+                pos += if triple { 3 } else { 1 };
+                continue;
+            }
+            b'{' | b'[' | b'(' => delta += 1,
+            b'}' | b']' | b')' => delta -= 1,
+            _ => {}
+        }
+        pos += 1;
+    }
+    *triple_quote = quote.and_then(|(delimiter, triple)| triple.then_some(delimiter));
+    delta
 }
 
 /// Recognize complete Python headers, including init priorities and named stores.
@@ -6099,6 +6133,196 @@ label next:
         let title = entries.iter().find(|e| e.source == "My Visual Novel");
         assert!(title.is_some());
         assert!(title.unwrap().tags.contains(&"ui_label".to_string()));
+    }
+
+    #[test]
+    fn define_depth_regression_quoted_bracket_preserves_rows() {
+        let script = r#"label before:
+    e "Before"
+define marker = "["
+label start:
+    e "Hello"
+# ]
+    e "After"
+"#;
+        let entries = RenPyPlugin::extract_content(Path::new("script.rpy"), script);
+        let rows: Vec<_> = entries
+            .iter()
+            .map(|entry| (entry.id.as_str(), entry.source.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("script.rpy#2", "Before"),
+                ("script.rpy#3", "["),
+                ("script.rpy#5", "Hello"),
+                ("script.rpy#7", "After"),
+            ]
+        );
+        assert_menu_dialogue(&entries, "Before", Some("e"), "before");
+        assert_menu_dialogue(&entries, "Hello", Some("e"), "start");
+        assert_menu_dialogue(&entries, "After", Some("e"), "start");
+    }
+
+    #[test]
+    fn define_depth_regression_translatable_call_preserves_rows() {
+        let script = r#"define gui.about = _("Welcome (")
+label start:
+    e "Hello"
+"#;
+        let entries = RenPyPlugin::extract_content(Path::new("script.rpy"), script);
+        let rows: Vec<_> = entries
+            .iter()
+            .map(|entry| (entry.id.as_str(), entry.source.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [("script.rpy#1", "Welcome ("), ("script.rpy#3", "Hello")]
+        );
+        assert_eq!(entries[0].tags, ["ui_label"]);
+        assert_menu_dialogue(&entries, "Hello", Some("e"), "start");
+    }
+
+    #[test]
+    fn define_depth_regression_comments_do_not_start_blocks() {
+        for comment in [
+            "# [",
+            "# (",
+            "# {",
+            "# ]",
+            "# )",
+            "# }",
+            "# ''' [",
+            "# \"\"\" (",
+        ] {
+            let script = format!("define marker = True {comment}\nlabel start:\n    e \"Hello\"\n");
+            let entries = RenPyPlugin::extract_content(Path::new("script.rpy"), &script);
+            assert_eq!(entries.len(), 1, "{comment}: {entries:?}");
+            assert_eq!(entries[0].id, "script.rpy#3", "{comment}");
+            assert_menu_dialogue(&entries, "Hello", Some("e"), "start");
+        }
+    }
+
+    #[test]
+    fn define_depth_regression_escaped_quotes() {
+        for define in [
+            r##"define marker = "say \"(\"""##,
+            r##"define marker = 'say \'(\''"##,
+            r##"define marker = "say \"# [\"""##,
+            r##"define marker = 'say \'# [\''"##,
+        ] {
+            let script = format!("{define}\nlabel start:\n    e \"Hello\"\n");
+            let entries = RenPyPlugin::extract_content(Path::new("script.rpy"), &script);
+            assert_menu_dialogue(&entries, "Hello", Some("e"), "start");
+            assert_eq!(entries.last().unwrap().id, "script.rpy#3", "{define}");
+        }
+    }
+
+    #[test]
+    fn define_depth_regression_single_quoted_strings() {
+        for define in [
+            r#"define marker = '['"#,
+            r#"define marker = 'one " [ # ('"#,
+            r#"define marker = r'zażółć [ ('"#,
+        ] {
+            let script = format!("{define}\nlabel start:\n    e \"Hello\"\n");
+            let entries = RenPyPlugin::extract_content(Path::new("script.rpy"), &script);
+            assert_eq!(entries.len(), 1, "{define}: {entries:?}");
+            assert_eq!(entries[0].id, "script.rpy#3", "{define}");
+            assert_menu_dialogue(&entries, "Hello", Some("e"), "start");
+        }
+    }
+
+    #[test]
+    fn define_depth_regression_inline_triple_quoted_strings() {
+        for define in [
+            r##"define marker = """one " [ # (""""##,
+            r##"define marker = '''one ' [ # ('''"##,
+        ] {
+            let script = format!("{define}\nlabel start:\n    e \"Hello\"\n");
+            let entries = RenPyPlugin::extract_content(Path::new("script.rpy"), &script);
+            assert_menu_dialogue(&entries, "Hello", Some("e"), "start");
+            assert_eq!(entries.last().unwrap().id, "script.rpy#3", "{define}");
+        }
+    }
+
+    #[test]
+    fn define_depth_regression_multiline_dict_and_list_stay_hidden() {
+        for (name, open, body, close) in [
+            ("x", "{", r#"    "key": _("Hidden UI"),"#, "}"),
+            ("y", "[", r#"    _("Hidden UI"),"#, "]"),
+            ("z", "(", r#"    _("Hidden UI"),"#, ")"),
+        ] {
+            let script =
+                format!("define {name} = {open}\n{body}\n{close}\nlabel start:\n    e \"Hello\"\n");
+            let entries = RenPyPlugin::extract_content(Path::new("script.rpy"), &script);
+            assert_eq!(entries.len(), 1, "{name}: {entries:?}");
+            assert_eq!(entries[0].id, "script.rpy#5", "{name}");
+            assert_menu_dialogue(&entries, "Hello", Some("e"), "start");
+        }
+    }
+
+    #[test]
+    fn define_depth_regression_nested_brackets_ignore_strings_and_comments() {
+        let script = r#"define x = { # [
+    "nested": [
+        ")]}", # [(
+        # }]) """
+        _("Hidden UI"),
+        (
+            "path\\",
+            "say \"(\"",
+            'say \'[\'',
+        ),
+    ],
+}
+label start:
+    e "Hello"
+"#;
+        let entries = RenPyPlugin::extract_content(Path::new("script.rpy"), script);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].id, "script.rpy#14");
+        assert_menu_dialogue(&entries, "Hello", Some("e"), "start");
+    }
+
+    #[test]
+    fn define_depth_regression_triple_quoted_block_contents_stay_hidden() {
+        for quote in ["\"\"\"", "'''"] {
+            let script = format!(
+                "define values = [\n\
+                 \x20   {quote}\n\
+                 \x20       )]}} # comment-looking text\n\
+                 \x20       \\{quote} ([{{\n\
+                 \x20       \"Hidden literal.\"\n\
+                 \x20       # {quote}, # [(\n\
+                 \x20   _(\"Hidden UI\"),\n\
+                 ]\n\
+                 label start:\n\
+                 \x20   e \"Hello\"\n"
+            );
+            let entries = RenPyPlugin::extract_content(Path::new("script.rpy"), &script);
+            assert_eq!(entries.len(), 1, "{quote}: {entries:?}");
+            assert_eq!(entries[0].id, "script.rpy#10", "{quote}");
+            assert_menu_dialogue(&entries, "Hello", Some("e"), "start");
+        }
+    }
+
+    #[test]
+    fn define_depth_regression_multiline_triple_quote_without_brackets() {
+        for quote in ["\"\"\"", "'''"] {
+            let script = format!(
+                "define marker = {quote}\n\
+                 \x20   ([{{\n\
+                 \x20   \"Hidden literal.\"\n\
+                 \x20   # {quote}\n\
+                 label start:\n\
+                 \x20   e \"Hello\"\n"
+            );
+            let entries = RenPyPlugin::extract_content(Path::new("script.rpy"), &script);
+            assert_eq!(entries.len(), 1, "{quote}: {entries:?}");
+            assert_eq!(entries[0].id, "script.rpy#6", "{quote}");
+            assert_menu_dialogue(&entries, "Hello", Some("e"), "start");
+        }
     }
 
     #[test]
