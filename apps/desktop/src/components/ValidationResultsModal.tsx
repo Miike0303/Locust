@@ -1,3 +1,5 @@
+import { useEffect, useMemo, useState } from "react";
+import { QA_PAGE_SIZE, qaPagination } from "../lib/qaDashboard";
 import { pathBasename } from "../lib/path";
 import { X, Shield, AlertTriangle, Type } from "lucide-react";
 import clsx from "clsx";
@@ -163,6 +165,14 @@ export default function ValidationResultsModal({
 	onFontPatch,
 }: ValidationResultsModalProps) {
 	const t = useT();
+	const [offset, setOffset] = useState(0);
+	useEffect(() => {
+		setOffset(0);
+	}, [open, result]);
+	const worklistIds = useMemo(
+		() => uniqueIssueEntryIds(result?.validation.issues ?? []),
+		[result?.validation.issues],
+	);
 	const { dialogRef, dialogProps, titleProps } = useModalA11y({
 		open: open && !!result,
 		ownEscape: false,
@@ -173,7 +183,8 @@ export default function ValidationResultsModal({
 	const issues = validation.issues ?? [];
 	const fontProblems = (fonts ?? []).filter((font) => font.missing_count > 0).length + (result.font_issues?.length ?? 0);
 	const ResultIcon = fontProblems > 0 ? AlertTriangle : Shield;
-	const worklistIds = uniqueIssueEntryIds(issues);
+	const pagination = qaPagination(offset, issues.length);
+	const pageIssues = issues.slice(pagination.offset, pagination.offset + QA_PAGE_SIZE);
 	const canReview = canStartValidationWorklist(worklistIds.length);
 	const kindEntries = Object.entries(validation.by_kind || {}).sort(
 		(a, b) => b[1] - a[1],
@@ -277,10 +288,10 @@ export default function ValidationResultsModal({
 								<AlertTriangle size={14} /> {t("validate.issuesHeading")}
 							</h3>
 							<ul className="divide-y divide-border border border-border rounded-lg overflow-hidden">
-								{issues.map((issue, i) => {
+								{pageIssues.map((issue, i) => {
 									const label = validationKindLabel(issue.kind);
 									return (
-										<li key={`${issue.entry_id}-${label}-${i}`}>
+										<li key={`${issue.entry_id}-${label}-${pagination.offset + i}`}>
 											<button
 												type="button"
 												onClick={() => handleClick(issue)}
@@ -317,6 +328,34 @@ export default function ValidationResultsModal({
 									);
 								})}
 							</ul>
+							{pagination.pages > 1 && (
+								<div className="flex flex-wrap items-center justify-between gap-2 mt-3">
+									<p className="text-caption text-text-muted">
+										{t("qa.showing", { from: pagination.from, to: pagination.to, total: issues.length })}
+									</p>
+									<div className="flex items-center gap-2">
+										<button
+											type="button"
+											disabled={pagination.page === 1}
+											onClick={() => setOffset(Math.max(0, pagination.offset - QA_PAGE_SIZE))}
+											className="px-3 py-2 text-body rounded border border-border bg-surface text-text hover:bg-surface-muted disabled:opacity-50"
+										>
+											{t("common.previous")}
+										</button>
+										<span className="text-body text-text-muted" aria-live="polite">
+											{pagination.page} / {pagination.pages}
+										</span>
+										<button
+											type="button"
+											disabled={pagination.page === pagination.pages}
+											onClick={() => setOffset(Math.min((pagination.pages - 1) * QA_PAGE_SIZE, pagination.offset + QA_PAGE_SIZE))}
+											className="px-3 py-2 text-body rounded border border-border bg-surface text-text hover:bg-surface-muted disabled:opacity-50"
+										>
+											{t("common.next")}
+										</button>
+									</div>
+								</div>
+							)}
 							<p className="text-caption text-text-muted mt-2">
 								{t("validate.clickHint")}
 							</p>

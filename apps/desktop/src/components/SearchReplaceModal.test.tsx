@@ -226,3 +226,32 @@ for (const snapshot of [{ completed: 1, total: 2 }, { done: true, completed: 2, 
     }
   });
 }
+
+for (const caseSensitive of [false, true]) {
+  for (const replacement of ["$$", "$&", "$`", "$'", "$1"]) {
+    for (const action of ["replace.previewBtn", "replace.replaceAll"] as const) {
+      test(`${action}: keeps ${replacement} literal (case sensitive: ${caseSensitive})`, async () => {
+        reset();
+        const before = caseSensitive ? "Reward: gold, gold!" : "Reward: GoLd, GOLD!";
+        const after = `Reward: ${replacement}, ${replacement}!`;
+        h.entries = [{ ...row, translation: before }];
+        const inputs = nodes(render()).filter(n => n.type === "input");
+        inputs[0].props.onChange({ target: { value: "gold" } });
+        inputs[1].props.onChange({ target: { value: replacement } });
+        inputs[2].props.onChange({ target: { checked: caseSensitive } });
+        await click(action);
+        if (action === "replace.previewBtn") {
+          const sample = nodes(render()).find(n => n.props?.className === "text-success truncate");
+          assert.ok(sample, "preview must include the replacement sample");
+          assert.equal(sample.props.children.join(""), `+ ${after}`);
+          assert.equal(h.writes.length, 0);
+        } else {
+          assert.deepEqual(h.writes, [{ provider: "search-replace", updates: [
+            { id: "row", translation: after, expected_translation: before },
+          ] }]);
+          assert.equal(h.toasts[0][0], "success");
+        }
+      });
+    }
+  }
+}

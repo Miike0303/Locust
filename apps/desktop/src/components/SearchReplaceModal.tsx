@@ -57,7 +57,7 @@ function replaceAll(
 	// Case-insensitive replace preserving original match casing is overkill —
 	// use the provided replacement string for every hit.
 	const re = new RegExp(find.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
-	return text.replace(re, replace);
+	return text.replace(re, () => replace);
 }
 
 export default function SearchReplaceModal({
