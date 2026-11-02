@@ -576,6 +576,9 @@ export const es: Record<keyof typeof en, string> = {
   "pivot.toast.openFailed": "No se pudo cambiar al proyecto pivotado: sigue abierto el original. {error}",
   "pivot.toast.noTranslations": "No hay nada que pivotar: traduzca algunas cadenas primero.",
 
+  "review.scope.label": "Archivo",
+  "review.scope.all": "Todos los archivos",
+  "review.scope.loadError": "No se pudieron cargar los archivos.",
   "review.loading": "Cargando traducciones…",
   "review.loadError": "No se pudo cargar la revisión",
   "review.complete": "Revisión completada",

@@ -580,6 +580,9 @@ export const en = {
   "pivot.toast.noTranslations": "Nothing to pivot — translate some strings first.",
 
   // ── review ──────────────────────────────────────────────────────────────
+  "review.scope.label": "File",
+  "review.scope.all": "All files",
+  "review.scope.loadError": "Could not load files.",
   "review.loading": "Loading translations…",
   "review.loadError": "Could not load review",
   "review.complete": "Review complete",
