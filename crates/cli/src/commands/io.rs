@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -205,7 +205,7 @@ pub(crate) fn cmd_export(
         ),
     };
 
-    std::fs::write(&output, &content)?;
+    export::write_file_atomically(&output, |file| file.write_all(content.as_bytes()))?;
     println!(
         "Exported {} entries to {} ({}→{})",
         entries.len(),

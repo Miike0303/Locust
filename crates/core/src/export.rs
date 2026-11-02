@@ -4,7 +4,9 @@ use crate::models::{StringEntry, StringStatus, STALE_TRANSLATION_METADATA_KEY};
 
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::path::Path;
+use std::fs::{File, OpenOptions};
+use std::io;
+use std::path::{Path, PathBuf};
 
 mod tmx;
 pub use tmx::{export_tmx, import_tmx, tmx_units_for_batch, TmxUnit};
@@ -110,6 +112,80 @@ pub fn check_export_destination(output: &Path, project_db: &Path) -> Result<()> 
         }
     }
     Ok(())
+}
+
+/// Write a complete generation to a new sibling file, sync it, then replace the
+/// destination atomically. The callback can set permissions before writing secrets.
+/// Callers must perform their destination-safety checks before calling this helper.
+pub fn write_file_atomically(
+    output: &Path,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<()> {
+    write_file_atomically_with(output, write, File::sync_all, |from, to| {
+        std::fs::rename(from, to)
+    })
+}
+
+// Keep failure injection local to this module; production always syncs and renames.
+fn write_file_atomically_with(
+    output: &Path,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+    sync: impl FnOnce(&File) -> io::Result<()>,
+    publish: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    // A fixed-length name also works for destinations near the component limit.
+    let path = parent.join(format!(".locust-write-{}.tmp", uuid::Uuid::new_v4()));
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    let mut staged = StagedPath {
+        path,
+        published: false,
+    };
+    {
+        // Close before either publication or the outer guard's failure cleanup,
+        // including on Windows and when a callback unwinds.
+        let mut file = file;
+        write(&mut file)?;
+        sync(&file)?;
+    }
+    publish(&staged.path, output).map_err(|error| {
+        let guidance = if cfg!(windows)
+            && (error.kind() == io::ErrorKind::PermissionDenied
+                || matches!(error.raw_os_error(), Some(32 | 33)))
+        {
+            "; check destination permissions; close any application using the destination and retry"
+        } else {
+            ""
+        };
+        io::Error::new(
+            error.kind(),
+            format!(
+                "could not atomically replace '{}': {error}{guidance}",
+                output.display()
+            ),
+        )
+    })?;
+    staged.published = true;
+    Ok(())
+}
+
+struct StagedPath {
+    path: PathBuf,
+    published: bool,
+}
+
+impl Drop for StagedPath {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 // ─── PO format ─────────────────────────────────────────────────────────────
@@ -1187,6 +1263,117 @@ fn escape_xml(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum ExportFailure {
+        Write,
+        Sync,
+        Publish,
+    }
+
+    fn assert_staged_export_failure(failure: ExportFailure) {
+        use std::cell::Cell;
+        use std::io::Write;
+
+        for format in ["po", "xliff", "tmx"] {
+            let directory = tempfile::tempdir().unwrap();
+            let output = directory.path().join(format!("traducción_日本語.{format}"));
+            let sentinel = b"previous catalog\0\xff\n";
+            std::fs::write(&output, sentinel).unwrap();
+            let content = language_catalog(format, "en", "es");
+            let bytes = content.as_bytes();
+            let sync_called = Cell::new(false);
+            let publish_called = Cell::new(false);
+            let error = write_file_atomically_with(
+                &output,
+                |file| {
+                    assert_eq!(std::fs::read(&output).unwrap(), sentinel);
+                    file.write_all(&bytes[..bytes.len() / 2])?;
+                    assert_eq!(std::fs::read(&output).unwrap(), sentinel);
+                    if failure == ExportFailure::Write {
+                        return Err(io::Error::other("injected partial write failure"));
+                    }
+                    file.write_all(&bytes[bytes.len() / 2..])
+                },
+                |file| {
+                    sync_called.set(true);
+                    assert_eq!(file.metadata()?.len(), bytes.len() as u64);
+                    assert_eq!(std::fs::read(&output).unwrap(), sentinel);
+                    if failure == ExportFailure::Sync {
+                        return Err(io::Error::other("injected sync failure"));
+                    }
+                    file.sync_all()
+                },
+                |from, to| {
+                    publish_called.set(true);
+                    assert_eq!(from.parent(), to.parent());
+                    assert_eq!(std::fs::read(from).unwrap(), bytes);
+                    assert_eq!(std::fs::read(to).unwrap(), sentinel);
+                    Err(io::Error::other("injected publish failure"))
+                },
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("injected"), "{error}");
+            assert_eq!(sync_called.get(), failure != ExportFailure::Write);
+            assert_eq!(publish_called.get(), failure == ExportFailure::Publish);
+            assert_eq!(std::fs::read(&output).unwrap(), sentinel);
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn export_staged_write_failure_preserves_catalog_and_cleans_staging() {
+        assert_staged_export_failure(ExportFailure::Write);
+    }
+
+    #[test]
+    fn export_staged_sync_failure_preserves_catalog_and_cleans_staging() {
+        assert_staged_export_failure(ExportFailure::Sync);
+    }
+
+    #[test]
+    fn export_staged_publish_failure_preserves_catalog_and_cleans_staging() {
+        assert_staged_export_failure(ExportFailure::Publish);
+    }
+
+    #[test]
+    fn export_staged_success_publishes_complete_catalog_with_unicode_destination() {
+        use std::io::Write;
+
+        let directory = tempfile::tempdir().unwrap();
+        for format in ["po", "xliff", "tmx"] {
+            let output = directory.path().join(format!("traducción_日本語.{format}"));
+            let content = language_catalog(format, "en", "es");
+            for existing in [false, true] {
+                if existing {
+                    std::fs::write(&output, b"previous catalog").unwrap();
+                }
+                write_file_atomically(&output, |file| file.write_all(content.as_bytes())).unwrap();
+                assert_eq!(std::fs::read(&output).unwrap(), content.as_bytes());
+                assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+                std::fs::remove_file(&output).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn export_staged_failure_leaves_no_new_destination_or_owned_temp() {
+        use std::io::Write;
+
+        let directory = tempfile::tempdir().unwrap();
+        let foreign = directory.path().join(".locust-write-foreign.tmp");
+        std::fs::write(&foreign, b"not owned by this write").unwrap();
+        let output = directory.path().join("catalog.po");
+        let error = write_file_atomically(&output, |file| {
+            file.write_all(b"partial catalog")?;
+            Err(io::Error::other("injected write failure"))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("injected"));
+        assert!(!output.exists());
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"not owned by this write");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
 
     fn import_pair(source: &str, target: &str) -> ImportLanguagePair {
         ImportLanguagePair {

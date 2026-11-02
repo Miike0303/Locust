@@ -5,6 +5,7 @@
 //! the stored refresh token. Note: xAI gates this surface server-side and
 //! may return 403 for some subscription tiers.
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, RwLock};
@@ -79,18 +80,28 @@ pub fn load_tokens() -> Option<TokenStore> {
 }
 
 fn save_tokens(tokens: &TokenStore) -> Result<()> {
+    save_tokens_with(tokens, |file, bytes| file.write_all(bytes))
+}
+
+fn save_tokens_with(
+    tokens: &TokenStore,
+    write: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+) -> Result<()> {
     let path = token_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, serde_json::to_string_pretty(tokens)?)?;
-    // Tokens are secrets — restrict to the owner on Unix (Windows relies on the
-    // NTFS ACLs already applied under the per-user data dir).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    let json = serde_json::to_string_pretty(tokens)?;
+    locust_core::export::write_file_atomically(&path, |file| {
+        // Restrict the staging file before writing any secrets. Windows relies
+        // on the NTFS ACLs inherited from the per-user data directory.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        write(file, json.as_bytes())
+    })?;
     Ok(())
 }
 
@@ -729,6 +740,117 @@ mod tests {
         fn drop(&mut self) {
             set_token_path_override(None);
         }
+    }
+
+    #[test]
+    fn save_tokens_partial_write_failure_preserves_readable_login_and_cleans_staging() {
+        let fixture = RefreshFixture::new();
+        let original = std::fs::read(&fixture.path).unwrap();
+        let replacement = TokenStore {
+            access_token: "new-access".into(),
+            refresh_token: "new-refresh".into(),
+            expires_at: now_secs() + 7200,
+        };
+        let error = save_tokens_with(&replacement, |file, bytes| {
+            file.write_all(&bytes[..bytes.len() / 2])?;
+            Err(std::io::Error::other("injected token write failure"))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("injected token write failure"));
+        assert_eq!(std::fs::read(&fixture.path).unwrap(), original);
+        let loaded = load_tokens().unwrap();
+        assert_eq!(loaded.access_token, fixture.tokens.access_token);
+        assert_eq!(loaded.refresh_token, fixture.tokens.refresh_token);
+        assert_eq!(loaded.expires_at, fixture.tokens.expires_at);
+        assert_eq!(
+            std::fs::read_dir(fixture.path.parent().unwrap())
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn save_tokens_success_replaces_complete_login() {
+        let fixture = RefreshFixture::new();
+        let replacement = TokenStore {
+            access_token: "new-access-日本語".into(),
+            refresh_token: "new-refresh".into(),
+            expires_at: now_secs() + 7200,
+        };
+        save_tokens(&replacement).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&fixture.path).unwrap(),
+            serde_json::to_string_pretty(&replacement).unwrap()
+        );
+        let loaded = load_tokens().unwrap();
+        assert_eq!(loaded.access_token, replacement.access_token);
+        assert_eq!(loaded.refresh_token, replacement.refresh_token);
+        assert_eq!(loaded.expires_at, replacement.expires_at);
+        assert_eq!(
+            std::fs::read_dir(fixture.path.parent().unwrap())
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_tokens_restricts_staging_permissions_before_writing_secrets() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = RefreshFixture::new();
+        save_tokens_with(&fixture.tokens, |file, bytes| {
+            assert_eq!(file.metadata()?.permissions().mode() & 0o777, 0o600);
+            assert_eq!(file.metadata()?.len(), 0);
+            file.write_all(bytes)
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(&fixture.path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn save_tokens_locked_destination_preserves_login_and_cleans_staging() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let fixture = RefreshFixture::new();
+        let original = std::fs::read(&fixture.path).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(&fixture.path)
+            .unwrap();
+        let replacement = TokenStore {
+            access_token: "new-access".into(),
+            refresh_token: "new-refresh".into(),
+            expires_at: now_secs() + 7200,
+        };
+        let error = save_tokens(&replacement).unwrap_err().to_string();
+        assert!(
+            error.contains("close any application using the destination and retry"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&fixture.path).unwrap(), original);
+        let loaded = load_tokens().unwrap();
+        assert_eq!(loaded.access_token, fixture.tokens.access_token);
+        assert_eq!(loaded.refresh_token, fixture.tokens.refresh_token);
+        assert_eq!(loaded.expires_at, fixture.tokens.expires_at);
+        drop(held);
+        assert_eq!(
+            std::fs::read_dir(fixture.path.parent().unwrap())
+                .unwrap()
+                .count(),
+            1
+        );
     }
 
     async fn assert_refresh_failure(

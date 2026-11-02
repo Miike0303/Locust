@@ -626,7 +626,11 @@ async fn apply_export_translations(
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
     }
-    std::fs::write(&out, body.as_bytes()).map_err(|e| e.to_string())?;
+    locust_core::export::write_file_atomically(&out, |file| {
+        use std::io::Write;
+        file.write_all(body.as_bytes())
+    })
+    .map_err(|e| e.to_string())?;
     Ok(serde_json::json!({
         "path": path,
         "format": format,
@@ -2187,6 +2191,47 @@ mod tests {
         std::fs::remove_file(&output).unwrap();
         std::fs::remove_file(&project).unwrap();
         std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn export_locked_destination_preserves_catalog_and_cleans_staging() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let (dir, state) = export_scope_state().await;
+        let catalogs = dir.path().join("exports_日本語");
+        std::fs::create_dir(&catalogs).unwrap();
+        for format in ["po", "xliff", "tmx"] {
+            let output = catalogs.join(format!("traducción_日本語.{format}"));
+            let sentinel = b"translator edits\0\xff\n";
+            std::fs::write(&output, sentinel).unwrap();
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(3)
+                .open(&output)
+                .unwrap();
+            let error = apply_export_translations(
+                &state,
+                format.into(),
+                "es".into(),
+                output.to_string_lossy().into_owned(),
+                None,
+                None,
+                Some("ja".into()),
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.contains("close any application using the destination and retry"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(&output).unwrap(), sentinel);
+            drop(held);
+            assert_eq!(std::fs::read_dir(&catalogs).unwrap().count(), 1);
+            std::fs::remove_file(&output).unwrap();
+            assert!(try_project_operation(&state).is_ok());
+        }
     }
 
     async fn export_scope_state() -> (tempfile::TempDir, Arc<AppState>) {

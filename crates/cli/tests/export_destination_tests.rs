@@ -156,3 +156,96 @@ async fn cli_export_refuses_sidecars_and_hard_links_even_with_overwrite() {
         assert_eq!(rows(&project), before_rows);
     }
 }
+
+#[cfg(windows)]
+#[tokio::test]
+async fn cli_export_locked_destination_preserves_catalog_and_cleans_staging() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let (dir, project) = project_fixture().await;
+    let catalogs = dir.path().join("exports_日本語");
+    std::fs::create_dir(&catalogs).unwrap();
+    for format in ["po", "xliff", "tmx"] {
+        let output = catalogs.join(format!("traducción_日本語.{format}"));
+        let sentinel = b"translator edits\0\xff\n";
+        std::fs::write(&output, sentinel).unwrap();
+        // Permit reading/writing, but deny the delete sharing required by rename.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(&output)
+            .unwrap();
+        locust()
+            .arg("export")
+            .arg(&project)
+            .args([
+                "-f",
+                format,
+                "-l",
+                "es",
+                "--source-lang",
+                "en",
+                "--overwrite",
+                "-o",
+            ])
+            .arg(&output)
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains(
+                "close any application using the destination and retry",
+            ));
+        assert_eq!(std::fs::read(&output).unwrap(), sentinel);
+        drop(held);
+        assert_eq!(std::fs::read_dir(&catalogs).unwrap().count(), 1);
+        std::fs::remove_file(&output).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn cli_export_publishes_complete_catalogs_with_unicode_destinations() {
+    let (dir, project) = project_fixture().await;
+    let catalogs = dir.path().join("exports_日本語");
+    std::fs::create_dir(&catalogs).unwrap();
+    let db = Database::open(&project).unwrap();
+    let entries = db.get_entries(&EntryFilter::default()).unwrap();
+    let source = db
+        .resolve_export_source_lang(
+            "es",
+            &locust_core::config::AppConfig::default().default_source_lang,
+        )
+        .unwrap();
+    drop(db);
+    for format in ["po", "xliff", "tmx"] {
+        let output = catalogs.join(format!("traducción_日本語.{format}"));
+        let expected = match format {
+            "po" => locust_core::export::export_po(&entries, &source, "es"),
+            "xliff" => locust_core::export::export_xliff(&entries, &source, "es"),
+            "tmx" => locust_core::export::export_tmx(&entries, "en", "es").unwrap(),
+            _ => unreachable!(),
+        };
+        for existing in [false, true] {
+            if existing {
+                std::fs::write(&output, b"previous catalog").unwrap();
+            }
+            locust()
+                .arg("export")
+                .arg(&project)
+                .args([
+                    "-f",
+                    format,
+                    "-l",
+                    "es",
+                    "--source-lang",
+                    "en",
+                    "--overwrite",
+                    "-o",
+                ])
+                .arg(&output)
+                .assert()
+                .success();
+            assert_eq!(std::fs::read(&output).unwrap(), expected.as_bytes());
+            assert_eq!(std::fs::read_dir(&catalogs).unwrap().count(), 1);
+            std::fs::remove_file(&output).unwrap();
+        }
+    }
+}
