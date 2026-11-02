@@ -16,8 +16,8 @@ use super::rollback::{rollback_under_lock, RollbackOptions};
 use super::store::{PatchStatus, PatchStore};
 use super::stream::StagingDir;
 use super::verify::{
-    classify_files_with_hashes, open_archive, scan_zip_entries, verify_scanned,
-    VerificationOutcome, VerificationReport, ZipEntryMeta,
+    classify_files_with_hashes, ensure_file_destinations, open_archive, scan_zip_entries,
+    verify_scanned, VerificationOutcome, VerificationReport, ZipEntryMeta,
 };
 
 /// Staged ZIP content in an operation-owned `.locust-stage-*/` directory.
@@ -148,6 +148,9 @@ where
         manifest: report.manifest.clone(),
         files,
     };
+    // Path types are never force-overridable, including before a transition
+    // rolls back the installed patch. No recovery state has been published.
+    ensure_file_destinations(game_root, prepared.files.keys().map(String::as_str))?;
     enforce_verify_gates(&report, &opts)?;
 
     // R2: only a strict-tier Clean verify may authorize discarding a
@@ -401,6 +404,10 @@ where
     let _empty_locust_guard = EmptyLocustGuard(game_root.to_path_buf());
     let manifest = &prepared.manifest;
     let zip_files = &prepared.files;
+
+    // Recheck the entire destination set on the actual install baseline,
+    // including after rollback, before backup, journal or any game write.
+    ensure_file_destinations(game_root, zip_files.keys().map(String::as_str))?;
 
     // Build plan.
     let (mut replaced, mut added, mut user_edits, mut current_hashes) =

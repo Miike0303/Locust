@@ -749,6 +749,112 @@ fn snapshot_patch_tree(root: &Path) -> std::collections::BTreeMap<PathBuf, Optio
         .collect()
 }
 
+fn assert_non_file_destination_refused(
+    game: &Path,
+    zip: &Path,
+    blocked: &str,
+    ancestor: Option<&str>,
+) {
+    let before = snapshot_patch_tree(game);
+    let report = verify(game, zip).expect("non-file destinations must produce a conflict report");
+    assert_eq!(report.conflicts, [blocked]);
+    let VerificationOutcome::Mismatch(mismatches) = &report.outcome else {
+        panic!("expected destination mismatch, got {:?}", report.outcome);
+    };
+    let mismatch = mismatches.iter().find(|m| m.path == blocked).unwrap();
+    if let Some(ancestor) = ancestor {
+        assert!(mismatch.found.contains(ancestor), "{mismatch:?}");
+        assert!(mismatch.found.contains("not a directory"), "{mismatch:?}");
+    } else {
+        assert!(
+            mismatch.found.contains("not a regular file"),
+            "{mismatch:?}"
+        );
+    }
+    assert_ne!(mismatch.found, "absent");
+    assert!(!report.added.iter().any(|path| path == blocked));
+    assert!(!report.replaced.iter().any(|path| path == blocked));
+    assert_eq!(snapshot_patch_tree(game), before);
+
+    // Force may override content conflicts, but cannot make these paths files.
+    for force in [false, true] {
+        for dry_run in [true, false] {
+            let mut progress = Vec::new();
+            let error = apply(
+                game,
+                zip,
+                ApplyOptions {
+                    force,
+                    dry_run,
+                    confirm_legacy: true,
+                },
+                |event| progress.push(event),
+            )
+            .expect_err("non-file destinations must refuse before publishing recovery state");
+            assert!(
+                matches!(error, LocustError::PatchVerificationFailed(_)),
+                "force={force}, dry_run={dry_run}: {error:?}"
+            );
+            assert!(error.to_string().contains(blocked), "{error}");
+            assert!(progress.is_empty(), "refusal must precede every game write");
+            assert_eq!(snapshot_patch_tree(game), before);
+            let store = PatchStore::new(game);
+            assert_eq!(store.status().unwrap(), PatchStatus::NotPatched);
+            assert!(!store.journal_path().exists());
+            assert!(!store.locust_dir().exists());
+            assert!(!game.join(".locust-injections").exists());
+        }
+    }
+}
+
+#[test]
+fn non_file_destination_replace_then_add_directory_refuses_before_any_write() {
+    let game_guard = tmp_game("replace_then_directory");
+    let game = game_guard.path();
+    write_file(game, "a.txt", b"ORIGINAL_A");
+    write_file(game, "b.txt/keep.txt", b"DIRECTORY_CONTENT");
+    let zip = game.join("patch.zip");
+    build_patch_zip(
+        &zip,
+        &[
+            ("a.txt", b"PATCHED_A", Some(b"ORIGINAL_A")),
+            ("b.txt", b"ADDED_B", None),
+        ],
+        "1.0.0",
+        "replace-then-directory",
+    );
+    assert_non_file_destination_refused(game, &zip, "b.txt", None);
+}
+
+#[test]
+fn non_file_destination_file_ancestor_refuses_before_any_write() {
+    for path in ["dir/x.txt", "dir/nested/x.txt"] {
+        let game_guard = tmp_game("file_ancestor");
+        let game = game_guard.path();
+        write_file(game, "dir", b"USER_FILE_BLOCKING_DIRECTORY");
+        write_file(game, "untouched.txt", b"KEEP_ME");
+        let zip = game.join("patch.zip");
+        build_patch_zip(&zip, &[(path, b"ADDED_X", None)], "1.0.0", "file-ancestor");
+        assert_non_file_destination_refused(game, &zip, path, Some("dir"));
+    }
+}
+
+#[test]
+fn non_file_destination_add_then_add_directory_refuses_before_any_write() {
+    let game_guard = tmp_game("add_then_directory");
+    let game = game_guard.path();
+    write_file(game, "untouched.txt", b"KEEP_ME");
+    write_file(game, "b.txt/keep.txt", b"DIRECTORY_CONTENT");
+    let zip = game.join("patch.zip");
+    build_patch_zip(
+        &zip,
+        &[("a.txt", b"ADDED_A", None), ("b.txt", b"ADDED_B", None)],
+        "1.0.0",
+        "add-then-directory",
+    );
+    assert_non_file_destination_refused(game, &zip, "b.txt", None);
+}
+
 fn build_legacy_zip(path: &Path, rel: &str, contents: &[u8]) {
     let mut zip = ZipWriter::new(File::create(path).unwrap());
     zip.start_file(rel, SimpleFileOptions::default()).unwrap();

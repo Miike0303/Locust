@@ -42,7 +42,7 @@ pub struct VerificationReport {
     pub replaced: Vec<String>,
     /// Paths that would be newly added.
     pub added: Vec<String>,
-    /// Added paths that already exist with non-patched content (conflicts).
+    /// Paths with conflicting content or an incompatible destination type.
     pub conflicts: Vec<String>,
     /// Warning when receipt exists but backup commit marker is missing.
     pub backup_compromised: bool,
@@ -205,15 +205,19 @@ pub(super) fn verify_scanned(
     super::zipsec::ensure_safe_store(game_root)?;
     let store = PatchStore::new(game_root);
     let manifest = load_manifest_from_entries(entries)?;
+    let mut destinations = HashMap::new();
     for entry in entries {
         if let Some(rel) = &entry.rel {
-            super::zipsec::ensure_no_links(game_root, rel)?;
+            destinations.insert(
+                entry.normalized.clone(),
+                classify_destination(game_root, rel)?,
+            );
         }
     }
     if let Some(manifest) = &manifest {
         for file in &manifest.files {
             let rel = super::zipsec::safe_stored_rel(&file.path)?;
-            super::zipsec::ensure_no_links(game_root, &rel)?;
+            classify_destination(game_root, &rel)?;
         }
     }
 
@@ -224,12 +228,107 @@ pub(super) fn verify_scanned(
     let backup_ok = store.backup_manifest_valid();
     let backup_compromised = receipt.is_some() && !backup_ok && store.backup_dir().exists();
 
-    match manifest {
-        Some(m) => {
-            verify_with_manifest(game_root, entries, m, receipt.as_ref(), backup_compromised)
+    let mut report = match manifest {
+        Some(m) => verify_with_manifest(
+            game_root,
+            entries,
+            m,
+            receipt.as_ref(),
+            backup_compromised,
+            &destinations,
+        ),
+        None => verify_legacy(entries, backup_compromised, &destinations),
+    }?;
+
+    // Destination conflicts also override receipt/version shortcuts. Keep them
+    // distinct from missing files and never include them in the install plan.
+    let mut destination_mismatches: Vec<_> = destinations
+        .values()
+        .filter_map(|destination| match destination {
+            Destination::Conflict(mismatch) => Some(mismatch.clone()),
+            _ => None,
+        })
+        .collect();
+    destination_mismatches.sort_by(|a, b| a.path.cmp(&b.path));
+    if !destination_mismatches.is_empty() {
+        report.conflicts.extend(
+            destination_mismatches
+                .iter()
+                .map(|mismatch| mismatch.path.clone()),
+        );
+        match &mut report.outcome {
+            VerificationOutcome::Mismatch(mismatches) => mismatches.extend(destination_mismatches),
+            _ => report.outcome = VerificationOutcome::Mismatch(destination_mismatches),
         }
-        None => verify_legacy(game_root, entries, backup_compromised),
     }
+    Ok(report)
+}
+
+enum Destination {
+    File,
+    Absent,
+    Conflict(FileMismatch),
+}
+
+/// Inspect ancestors from the root outward so a file blocking a parent is not
+/// mistaken for a missing leaf (or surfaced as an OS-specific traversal error).
+fn classify_destination(game_root: &Path, rel: &Path) -> Result<Destination> {
+    let mut ancestors: Vec<_> = rel
+        .ancestors()
+        .skip(1)
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+        .collect();
+    ancestors.reverse();
+    for ancestor in ancestors {
+        match std::fs::symlink_metadata(game_root.join(ancestor)) {
+            Ok(metadata) if !metadata.is_dir() => {
+                super::zipsec::ensure_no_links(game_root, ancestor)?;
+                let ancestor = ancestor.to_string_lossy().replace('\\', "/");
+                return Ok(Destination::Conflict(FileMismatch {
+                    path: rel.to_string_lossy().replace('\\', "/"),
+                    expected: format!("directory at ancestor {ancestor}"),
+                    found: format!("ancestor {ancestor} exists but is not a directory"),
+                }));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                super::zipsec::ensure_no_links(game_root, ancestor)?;
+                return Ok(Destination::Absent);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    // Preserve the existing rejection of links/reparse points, including
+    // dangling links. Installation retains its independent link/type checks.
+    super::zipsec::ensure_no_links(game_root, rel)?;
+    match std::fs::symlink_metadata(game_root.join(rel)) {
+        Ok(metadata) if metadata.is_file() => Ok(Destination::File),
+        Ok(_) => Ok(Destination::Conflict(FileMismatch {
+            path: rel.to_string_lossy().replace('\\', "/"),
+            expected: "regular file or absent".into(),
+            found: "exists but is not a regular file".into(),
+        })),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Destination::Absent),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Force can replace conflicting file content, but cannot override path types.
+/// Check the whole plan before publishing backup/journal state or mutating games.
+pub(super) fn ensure_file_destinations<'a>(
+    game_root: &Path,
+    paths: impl IntoIterator<Item = &'a str>,
+) -> Result<()> {
+    for path in paths {
+        let rel = super::zipsec::safe_stored_rel(path)?;
+        if let Destination::Conflict(mismatch) = classify_destination(game_root, &rel)? {
+            return Err(LocustError::PatchVerificationFailed(format!(
+                "{}: expected {}, found {}",
+                mismatch.path, mismatch.expected, mismatch.found
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(super) struct ZipEntryMeta {
@@ -375,6 +474,7 @@ fn verify_with_manifest(
     mut manifest: PatchManifest,
     receipt: Option<&Receipt>,
     backup_compromised: bool,
+    destinations: &HashMap<String, Destination>,
 ) -> Result<VerificationReport> {
     // Index zip content by normalized rel path for hash checks.
     let mut zip_by_path: HashMap<String, &ZipEntryMeta> = HashMap::new();
@@ -515,9 +615,9 @@ fn verify_with_manifest(
     }
 
     if manifest.supports_strict_tier() {
-        verify_strict(game_root, &manifest, backup_compromised)
+        verify_strict(game_root, &manifest, backup_compromised, destinations)
     } else {
-        verify_structural(game_root, &manifest, backup_compromised)
+        verify_structural(game_root, &manifest, backup_compromised, destinations)
     }
 }
 
@@ -525,6 +625,7 @@ fn verify_strict(
     game_root: &Path,
     manifest: &PatchManifest,
     backup_compromised: bool,
+    destinations: &HashMap<String, Destination>,
 ) -> Result<VerificationReport> {
     let mut replaced = Vec::new();
     let mut added = Vec::new();
@@ -539,7 +640,12 @@ fn verify_strict(
         // Identity patch: translation equals source → original hash == patched hash.
         // A pristine game matching that hash is Clean, not AlreadyApplied/Unknown.
         let identity_patch = !original.is_empty() && original == f.patched_sha256;
-        if target.is_file() {
+        let present = match &destinations[&f.path] {
+            Destination::File => true,
+            Destination::Absent => false,
+            Destination::Conflict(_) => continue,
+        };
+        if present {
             let hash = sha256_path(&target)?;
             if hash == f.patched_sha256 {
                 if identity_patch || hash == original {
@@ -623,6 +729,7 @@ fn verify_structural(
     game_root: &Path,
     manifest: &PatchManifest,
     backup_compromised: bool,
+    destinations: &HashMap<String, Destination>,
 ) -> Result<VerificationReport> {
     let mut replaced = Vec::new();
     let mut added = Vec::new();
@@ -631,7 +738,12 @@ fn verify_structural(
 
     for f in &manifest.files {
         let target = game_root.join(f.path.replace('/', std::path::MAIN_SEPARATOR_STR));
-        if target.is_file() {
+        let present = match &destinations[&f.path] {
+            Destination::File => true,
+            Destination::Absent => false,
+            Destination::Conflict(_) => continue,
+        };
+        if present {
             let hash = sha256_path(&target)?;
             if hash == f.patched_sha256 {
                 // looks already applied
@@ -710,9 +822,9 @@ fn verify_structural(
 }
 
 fn verify_legacy(
-    game_root: &Path,
     entries: &[ZipEntryMeta],
     backup_compromised: bool,
+    destinations: &HashMap<String, Destination>,
 ) -> Result<VerificationReport> {
     let content: Vec<_> = entries
         .iter()
@@ -725,10 +837,7 @@ fn verify_legacy(
     }
     let existing = content
         .iter()
-        .filter(|e| {
-            let rel = e.rel.as_ref().unwrap();
-            game_root.join(rel).is_file()
-        })
+        .filter(|e| matches!(destinations[&e.normalized], Destination::File))
         .count();
     let ratio = existing as f64 / content.len() as f64;
     let mut replaced = Vec::new();
@@ -736,10 +845,10 @@ fn verify_legacy(
     for e in &content {
         let rel = e.rel.as_ref().unwrap();
         let s = rel.to_string_lossy().replace('\\', "/");
-        if game_root.join(rel).is_file() {
-            replaced.push(s);
-        } else {
-            added.push(s);
+        match &destinations[&e.normalized] {
+            Destination::File => replaced.push(s),
+            Destination::Absent => added.push(s),
+            Destination::Conflict(_) => {}
         }
     }
     if ratio < 0.8 {
@@ -1095,7 +1204,11 @@ mod tests {
         };
 
         crate::database::SHA256_PATH_CALLS.with(|calls| calls.set(Some(0)));
-        let report = verify_strict(game.path(), &manifest, false).unwrap();
+        let destinations = HashMap::from([(
+            "script.rpy".into(),
+            classify_destination(game.path(), Path::new("script.rpy")).unwrap(),
+        )]);
+        let report = verify_strict(game.path(), &manifest, false, &destinations).unwrap();
         let hashes = crate::database::SHA256_PATH_CALLS.with(|calls| calls.replace(None));
 
         assert_eq!(report.outcome, VerificationOutcome::Unknown);
