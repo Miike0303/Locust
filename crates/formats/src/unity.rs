@@ -2897,28 +2897,43 @@ impl FormatPlugin for UnityPlugin {
         }
         let mut occurrences = HashMap::new();
         for entry in &mut all {
-            if counts[&entry.id] > 1 {
-                let local_id = entry.id.clone();
+            let local_id = entry.id.clone();
+            let physical_path = entry.file_path.to_string_lossy().replace('\\', "/");
+            let occurrence = occurrences
+                .entry((physical_path.clone(), local_id.clone()))
+                .or_insert(0usize);
+            // Persist identity even while the local ID is unique: a later
+            // extraction can add/remove collisions without changing this slot.
+            entry.metadata.insert(
+                "unity_identity".into(),
+                serde_json::json!({
+                    "version": 1,
+                    "physical_path": physical_path,
+                    "local_id": local_id,
+                    "occurrence": *occurrence,
+                }),
+            );
+            entry
+                .metadata
+                .insert("format_id".into(), serde_json::json!("unity"));
+            if counts[&local_id] > 1 {
                 let relative = entry
                     .file_path
                     .strip_prefix(path)
                     .unwrap_or(&entry.file_path);
                 let physical = relative.to_string_lossy().replace('\\', "/");
-                let occurrence = occurrences
-                    .entry((physical.clone(), local_id.clone()))
-                    .or_insert(0usize);
                 // JSON escaping makes the tuple unambiguous even for paths
                 // containing separators used by local IDs.
                 entry.id = format!(
                     "unity:{}:{local_id}",
                     serde_json::json!([physical, *occurrence])
                 );
-                *occurrence += 1;
-                entry.metadata.insert(
-                    "unity_local_id".to_string(),
-                    serde_json::Value::String(local_id),
-                );
             }
+            *occurrence += 1;
+            entry.metadata.insert(
+                "unity_local_id".to_string(),
+                serde_json::Value::String(local_id),
+            );
         }
         Ok(all)
     }

@@ -1068,11 +1068,100 @@ impl Database {
             }
         }
 
-        let mut incoming: HashMap<&str, &StringEntry> = HashMap::new();
+        let mut incoming: HashMap<String, &StringEntry> = HashMap::new();
         let mut originals = OriginalCache::new();
-        for entry in entries {
-            incoming.insert(entry.id.as_str(), entry);
+        // Only Unity opts into physical identity reconciliation. Keep saved IDs
+        // (and thus history/references) by aliasing incoming keys inside this
+        // transaction, before pivot validation or deletion. The plugin cannot
+        // do this itself because extraction cannot see the saved rows.
+        let reconcile_unity = entries.iter().any(|entry| {
+            entry.metadata.get("format_id").and_then(|v| v.as_str()) == Some("unity")
+                && entry.metadata.contains_key("unity_identity")
+        });
+        let mut unity_existing: HashMap<UnityRowIdentity, Vec<&String>> = HashMap::new();
+        let mut skipped_saved_ids = HashSet::new();
+        if reconcile_unity {
+            for (id, old) in &existing {
+                match unity_row_identity(id, &old.file_path, &old.metadata, true) {
+                    Ok(Some(identity)) => unity_existing.entry(identity).or_default().push(id),
+                    Ok(None) => {}
+                    Err(error) => {
+                        // Saved metadata can predate the current plugin. Leave
+                        // an unprovable saved field untouched rather than make
+                        // the project impossible to open or guess its identity.
+                        tracing::warn!(%id, %error, "Skipping Unity refresh for malformed saved identity");
+                        skipped_saved_ids.insert(id.clone());
+                    }
+                }
+            }
         }
+        let mut unity_incoming = HashSet::new();
+        let mut replaced_ids = HashSet::new();
+        let mut conflicting_ids = HashSet::new();
+        for entry in entries {
+            let identity = if reconcile_unity {
+                unity_row_identity(
+                    &entry.id,
+                    &entry.file_path.to_string_lossy(),
+                    &entry.metadata,
+                    false,
+                )?
+            } else {
+                None
+            };
+            let id = if let Some(identity) = identity {
+                if !unity_incoming.insert(identity.clone()) {
+                    return Err(LocustError::Other(anyhow::anyhow!(
+                        "ambiguous Unity physical identity for incoming entry '{}'",
+                        entry.id
+                    )));
+                }
+                match unity_existing.get(&identity).map(Vec::as_slice) {
+                    Some([id]) => (*id).clone(),
+                    Some(_) => {
+                        // Historical partial extractions may have saved both
+                        // aliases for one field. Use plain ID-based merging for
+                        // this identity; never choose one saved translation.
+                        tracing::warn!(id = %entry.id, "Ambiguous saved Unity identity; using plain ID-based merge");
+                        entry.id.clone()
+                    }
+                    None => {
+                        // An unchanged ID can now name a different physical
+                        // field. It must be a fresh pending row, never inherit
+                        // the disappeared field's translation or history.
+                        if existing.contains_key(&entry.id) {
+                            replaced_ids.insert(entry.id.clone());
+                        }
+                        entry.id.clone()
+                    }
+                }
+            } else {
+                entry.id.clone()
+            };
+            if conflicting_ids.contains(&id) {
+                continue;
+            }
+            if let Some(previous) = incoming.insert(id.clone(), entry) {
+                if reconcile_unity
+                    && [previous, entry].iter().any(|row| {
+                        row.metadata.get("format_id").and_then(|v| v.as_str()) == Some("unity")
+                            && row.metadata.contains_key("unity_identity")
+                    })
+                {
+                    // Even unique physical identities can have conflicting
+                    // saved aliases. Skip both incoming fields instead of
+                    // picking one or overwriting another field's translation.
+                    tracing::warn!(%id, "Skipping Unity refresh for conflicting saved aliases");
+                    incoming.remove(&id);
+                    replaced_ids.remove(&id);
+                    if existing.contains_key(&id) {
+                        skipped_saved_ids.insert(id.clone());
+                    }
+                    conflicting_ids.insert(id);
+                }
+            }
+        }
+        drop(unity_existing);
 
         // A pivot DB's source is semantic text, so a fresh extraction may only
         // refresh locators after every existing row proves the same untouched
@@ -1080,11 +1169,22 @@ impl Database {
         let database_is_pivoted = existing
             .values()
             .any(|stored| stored.metadata.contains_key(INJECTION_SOURCE_METADATA_KEY));
+        if preserve_missing || database_is_pivoted {
+            for id in replaced_ids.drain() {
+                // A partial extraction cannot prove the old field disappeared,
+                // and pivot rows own semantic text that must not be replaced.
+                // Defer this incoming field to a later complete extraction.
+                tracing::warn!(%id, "Skipping Unity field with a reused ID; saved row preserved");
+                skipped_saved_ids.insert(id);
+            }
+        }
+        incoming.retain(|id, _| !skipped_saved_ids.contains(id));
+        replaced_ids.retain(|id| !skipped_saved_ids.contains(id));
         if database_is_pivoted {
             let mut validation_originals = OriginalCache::new();
             let mut matched = 0usize;
             for (id, entry) in &incoming {
-                let Some(old) = existing.get(*id) else {
+                let Some(old) = existing.get(id) else {
                     continue; // no semantic pivot source exists for a newly extracted row
                 };
                 let expected = match old.metadata.get(INJECTION_SOURCE_METADATA_KEY) {
@@ -1114,7 +1214,7 @@ impl Database {
                         .metadata
                         .contains_key(crate::textasset_group::GROUP_ORIGINAL_KEY)
                 {
-                    let mut old_entry = StringEntry::new(*id, &old.source, PathBuf::new());
+                    let mut old_entry = StringEntry::new(id, &old.source, PathBuf::new());
                     old_entry.metadata = old.metadata.clone();
                     hydrate_original(&tx, &mut old_entry, &mut validation_originals)?;
                     let expected = crate::textasset_group::shared_original(&old_entry)
@@ -1128,22 +1228,31 @@ impl Database {
                 }
                 matched += 1;
             }
-            if !preserve_missing && matched != existing.len() {
+            if !preserve_missing && matched + skipped_saved_ids.len() != existing.len() {
                 return Err(LocustError::Other(anyhow::anyhow!(
                     "source_changed: extraction is missing entries from this pivot's original baseline; extract a fresh project for this game copy"
                 )));
             }
             // Do not mix newly extracted physical-language rows into a DB whose
             // source language is the prior pivot translation.
-            incoming.retain(|id, _| existing.contains_key(*id));
+            incoming.retain(|id, _| existing.contains_key(id));
         }
 
-        let mut stats = MergeStats::default();
+        let mut stats = MergeStats {
+            preserved_translations: skipped_saved_ids
+                .iter()
+                .filter(|id| has_saved_translation(&existing[*id].translation))
+                .count(),
+            ..MergeStats::default()
+        };
 
         {
             let mut delete = tx.prepare_cached("DELETE FROM strings WHERE id = ?1")?;
             for (id, stored) in &existing {
-                if !preserve_missing && !incoming.contains_key(id.as_str()) {
+                if !skipped_saved_ids.contains(id)
+                    && (replaced_ids.contains(id)
+                        || (!preserve_missing && !incoming.contains_key(id)))
+                {
                     delete.execute(params![id])?;
                     stats.removed += 1;
                     if has_saved_translation(&stored.translation) {
@@ -1151,6 +1260,9 @@ impl Database {
                     }
                 }
             }
+        }
+        for id in replaced_ids {
+            existing.remove(&id);
         }
 
         {
@@ -1182,7 +1294,7 @@ impl Database {
                 let file_path_str = entry.file_path.to_string_lossy().to_string();
                 let char_limit = entry.char_limit.map(|l| l as i64);
 
-                if let Some(old) = existing.get(id) {
+                if let Some(old) = existing.get(&id) {
                     let pivoted = old.metadata.contains_key(INJECTION_SOURCE_METADATA_KEY);
                     let source_changed = !pivoted && old.source != entry.source;
                     let status = if source_changed {
@@ -1270,7 +1382,7 @@ impl Database {
                         old.created_at,
                         old.translated_at,
                         old.reviewed_at,
-                        entry.id,
+                        id,
                     ])?;
                 } else {
                     let metadata_json = serde_json::to_string(&persist_original_metadata(
@@ -1281,7 +1393,7 @@ impl Database {
                     stats.added += 1;
                     let created_at = entry.created_at.to_rfc3339();
                     insert.execute(params![
-                        entry.id,
+                        id,
                         entry.source,
                         file_path_str,
                         entry.context,
@@ -1297,6 +1409,88 @@ impl Database {
         tx.commit()?;
         Ok(stats)
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct UnityRowIdentity {
+    physical_path: String,
+    local_id: String,
+    occurrence: u64,
+}
+
+fn unity_row_identity(
+    id: &str,
+    file_path: &str,
+    metadata: &HashMap<String, serde_json::Value>,
+    allow_legacy: bool,
+) -> Result<Option<UnityRowIdentity>> {
+    // Explicit provenance for another format always retains ID-based merging.
+    if metadata
+        .get("format_id")
+        .is_some_and(|value| value.as_str() != Some("unity"))
+        || (!allow_legacy && metadata.get("format_id").and_then(|v| v.as_str()) != Some("unity"))
+    {
+        return Ok(None);
+    }
+    let physical_path = file_path.replace('\\', "/");
+    if let Some(value) = metadata.get("unity_identity") {
+        let invalid = || {
+            LocustError::Other(anyhow::anyhow!(
+                "invalid Unity physical identity for entry '{id}'; saved rows were preserved"
+            ))
+        };
+        if value.get("version").and_then(|v| v.as_u64()) != Some(1)
+            || value.get("physical_path").and_then(|v| v.as_str()) != Some(&physical_path)
+        {
+            return Err(invalid());
+        }
+        let local_id = value
+            .get("local_id")
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.is_empty())
+            .ok_or_else(invalid)?;
+        let occurrence = value
+            .get("occurrence")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(invalid)?;
+        return Ok(Some(UnityRowIdentity {
+            physical_path,
+            local_id: local_id.into(),
+            occurrence,
+        }));
+    }
+    if !allow_legacy {
+        return Ok(None);
+    }
+    // Before identity metadata, unique rows used their local ID directly;
+    // qualified rows persisted unity_local_id and encoded the occurrence in
+    // their JSON tuple. Exact stored file paths bind both to the physical slot.
+    let local_id = metadata
+        .get("unity_local_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or(id);
+    let occurrence = if id == local_id && !id.starts_with("unity:") {
+        0
+    } else {
+        let Some(tuple) = id
+            .strip_prefix("unity:")
+            .and_then(|rest| rest.strip_suffix(&format!(":{local_id}")))
+        else {
+            return Ok(None);
+        };
+        let Ok((relative, occurrence)) = serde_json::from_str::<(String, u64)>(tuple) else {
+            return Ok(None);
+        };
+        if !Path::new(&physical_path).ends_with(Path::new(&relative)) {
+            return Ok(None);
+        }
+        occurrence
+    };
+    Ok(Some(UnityRowIdentity {
+        physical_path,
+        local_id: local_id.into(),
+        occurrence,
+    }))
 }
 
 enum ImportDecision {
