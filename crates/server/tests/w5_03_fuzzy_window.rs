@@ -92,6 +92,15 @@ async fn normalized_suggestions_survive_window(global: bool) {
         (format!("{prefix}{}", "x".repeat(1000)), prefix.clone()),
         ("hello\0world".into(), "Hello\0world".into()),
         (" \t".into(), "\u{2003}".repeat(100)),
+        (
+            "".into(),
+            format!("{}İ", " ".repeat(locust_core::fuzzy::MAX_CHARS)),
+        ),
+        // Normalize after the raw cutoff: final sigma sees the capped word.
+        (
+            "ας".into(),
+            format!("{}ΑΣΑ", " ".repeat(locust_core::fuzzy::MAX_CHARS - 2)),
+        ),
     ] {
         suggestion_survives_window(&query, &source, global).await;
     }
@@ -105,4 +114,48 @@ async fn project_fuzzy_window_is_conservative_for_normalization() {
 #[tokio::test]
 async fn global_fuzzy_window_is_conservative_for_normalization() {
     normalized_suggestions_survive_window(true).await;
+}
+
+#[tokio::test]
+async fn prepared_suggestions_keep_full_dedupe_keys_beyond_comparison_cap() {
+    let state = create_test_state();
+    *state.current_project.write().await = Some(ProjectInfo::default());
+    let prefix = "界".repeat(locust_core::fuzzy::MAX_CHARS);
+    state
+        .db
+        .save_entries(&[StringEntry::new("row", &prefix, "story.html".into())])
+        .unwrap();
+    let sources = [format!("{prefix}A"), format!("{prefix}B")];
+    for (source, global) in sources.iter().zip([false, true]) {
+        let hash = sha256_hex(source.as_bytes());
+        if global {
+            state
+                .global_memory
+                .save_memory(&hash, source, "Shared", "en-es")
+                .await
+        } else {
+            state.db.save_memory(&hash, source, "Shared", "en-es").await
+        }
+        .unwrap();
+    }
+    let (base, server) = start_test_server(state).await;
+    let response = Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(format!("{base}/api/memory/suggestions"))
+        .query(&[("entry_id", "row"), ("lang_pair", "en-es")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(
+        body["suggestions"],
+        json!([
+            {"source": sources[0], "translation": "Shared", "score": 1.0, "origin": "project", "uses": 1},
+            {"source": sources[1], "translation": "Shared", "score": 1.0, "origin": "global", "uses": 1},
+        ])
+    );
+    server.abort();
 }

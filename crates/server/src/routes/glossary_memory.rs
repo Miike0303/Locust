@@ -2,7 +2,7 @@ use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use locust_core::database::{Database, GlobalMemoryDb, GlossaryEntry};
-use locust_core::fuzzy::{normalize, similarity_at_threshold};
+use locust_core::fuzzy::{prepare, similarity_prepared};
 use locust_core::models::StringEntry;
 use serde::{Deserialize, Serialize};
 use std::collections::{hash_map::Entry, HashMap};
@@ -151,6 +151,11 @@ struct MemorySuggestion {
     uses: i64,
 }
 
+#[cfg(test)]
+thread_local! {
+    static PREPARATIONS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 /// The entry's saved translation is required to distinguish redundant exact
 /// matches from useful alternatives. Reads never increment memory usage.
 fn fuzzy_suggestions(
@@ -164,6 +169,12 @@ fn fuzzy_suggestions(
     if limit == 0 {
         return Ok(Vec::new());
     }
+    #[cfg(test)]
+    PREPARATIONS.with(|counts| {
+        let (query, candidates) = counts.get();
+        counts.set((query + 1, candidates));
+    });
+    let query = prepare(&entry.source);
     let source_hash = entry.source_hash();
     let mut unique: HashMap<(String, String), MemorySuggestion> = HashMap::new();
     // Exact hits bypass the fuzzy cap and still share exclusion and deduplication.
@@ -184,16 +195,24 @@ fn fuzzy_suggestions(
             if exact && entry.translation.as_deref() == Some(candidate.translation.as_str()) {
                 continue;
             }
+            #[cfg(test)]
+            PREPARATIONS.with(|counts| {
+                let (query, candidates) = counts.get();
+                counts.set((query, candidates + 1));
+            });
+            let prepared_candidate = prepare(&candidate.source);
             let score = if exact {
                 1.0
-            } else if let Some(score) =
-                similarity_at_threshold(&entry.source, &candidate.source, threshold)
+            } else if let Some(score) = similarity_prepared(&query, &prepared_candidate, threshold)
             {
                 score
             } else {
                 continue;
             };
-            let key = (normalize(&candidate.source), candidate.translation.clone());
+            let key = (
+                prepared_candidate.into_normalized(),
+                candidate.translation.clone(),
+            );
             let suggestion = MemorySuggestion {
                 source: candidate.source,
                 translation: candidate.translation,
@@ -323,6 +342,209 @@ pub(crate) async fn memory_lang_pairs(
 #[cfg(test)]
 mod tests {
     use crate::routes::test_support::*;
+
+    use super::*;
+    use locust_core::fuzzy::{normalize, similarity_at_threshold};
+
+    // Frozen route control flow; the compatibility scorer is checked against
+    // the W5-03 snapshot in core, so this isolates ranking/dedupe changes.
+    fn legacy_fuzzy_suggestions(
+        entry: &StringEntry,
+        lang_pair: &str,
+        project_db: &Database,
+        global_db: &GlobalMemoryDb,
+        limit: usize,
+        threshold: f64,
+    ) -> locust_core::Result<Vec<MemorySuggestion>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let source_hash = entry.source_hash();
+        let mut unique: HashMap<(String, String), MemorySuggestion> = HashMap::new();
+        // Exact hits bypass the fuzzy cap and still share exclusion and deduplication.
+        for (origin, exact, candidates) in [
+            (
+                "project",
+                project_db.lookup_memory_entry(&source_hash, lang_pair)?,
+                project_db.memory_candidates(lang_pair, &entry.source, threshold, 3000)?,
+            ),
+            (
+                "global",
+                global_db.lookup_memory_entry(&source_hash, lang_pair)?,
+                global_db.memory_candidates(lang_pair, &entry.source, threshold, 3000)?,
+            ),
+        ] {
+            for candidate in candidates.into_iter().chain(exact) {
+                let exact = candidate.source_hash == source_hash;
+                if exact && entry.translation.as_deref() == Some(candidate.translation.as_str()) {
+                    continue;
+                }
+                let score = if exact {
+                    1.0
+                } else if let Some(score) =
+                    similarity_at_threshold(&entry.source, &candidate.source, threshold)
+                {
+                    score
+                } else {
+                    continue;
+                };
+                let key = (normalize(&candidate.source), candidate.translation.clone());
+                let suggestion = MemorySuggestion {
+                    source: candidate.source,
+                    translation: candidate.translation,
+                    score,
+                    origin,
+                    uses: candidate.uses,
+                };
+                match unique.entry(key) {
+                    Entry::Vacant(slot) => {
+                        slot.insert(suggestion);
+                    }
+                    Entry::Occupied(mut slot) => {
+                        let winner = slot.get();
+                        if suggestion.score > winner.score
+                            || (suggestion.score == winner.score && suggestion.uses > winner.uses)
+                        {
+                            slot.insert(suggestion);
+                        }
+                    }
+                }
+            }
+        }
+        let mut suggestions: Vec<_> = unique.into_values().collect();
+        suggestions.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| b.uses.cmp(&a.uses))
+                .then_with(|| a.source.cmp(&b.source))
+                .then_with(|| a.translation.cmp(&b.translation))
+        });
+        suggestions.truncate(limit);
+        Ok(suggestions)
+    }
+
+    #[tokio::test]
+    async fn memory_suggestions_prepared_match_legacy_bytes_and_order() {
+        let project = locust_core::database::Database::open_in_memory().unwrap();
+        let global = locust_core::database::GlobalMemoryDb::open_in_memory().unwrap();
+        for (source, translation, uses, in_global) in [
+            ("Hello", "Alternative", 1, false),
+            ("Hello", "Current", 1, true),
+            ("HELLO", "Alternative", 1, false),
+            (" hello \t", "Alternative", 3, true),
+            ("Hullo", "Beta", 2, false),
+            ("Hallo", "Alpha", 2, false),
+            ("Hxllo", "Zeta", 2, true),
+            ("Hexxo", "At threshold", 1, false),
+            ("xxxxx", "Below threshold", 1, true),
+            ("HÉLLO 世界", "Unicode", 1, false),
+            ("héllo\t世界", "Unicode", 2, true),
+            ("İ", "Expansion", 1, false),
+            ("i\u{307}", "Expansion", 2, true),
+            ("\t", "Empty", 1, false),
+            ("", "Empty", 1, true),
+            ("  ", "Other empty", 1, true),
+            ("hello\0world", "NUL", 1, false),
+        ] {
+            let hash = locust_core::database::sha256_hex(source.as_bytes());
+            for _ in 0..uses {
+                if in_global {
+                    global
+                        .save_memory(&hash, source, translation, "en-es")
+                        .await
+                        .unwrap();
+                } else {
+                    project
+                        .save_memory(&hash, source, translation, "en-es")
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+        // Equal capped comparisons must still have distinct full dedupe keys.
+        let prefix = "a".repeat(locust_core::fuzzy::MAX_CHARS);
+        for (suffix, in_global) in [("X", false), ("Y", true)] {
+            let source = format!("{prefix}{suffix}");
+            let hash = locust_core::database::sha256_hex(source.as_bytes());
+            if in_global {
+                global
+                    .save_memory(&hash, &source, "Long", "en-es")
+                    .await
+                    .unwrap();
+            } else {
+                project
+                    .save_memory(&hash, &source, "Long", "en-es")
+                    .await
+                    .unwrap();
+            }
+        }
+        let mut comparisons = 0;
+        for query in ["Hello", " HÉLLO\t世界 ", "İ", " \t", "", prefix.as_str()] {
+            let entry = translated("row", query, "story.html", "Current");
+            for threshold in [0.0, 0.6, 1.0] {
+                for limit in [0, 5, 50] {
+                    let old = legacy_fuzzy_suggestions(
+                        &entry, "en-es", &project, &global, limit, threshold,
+                    )
+                    .unwrap();
+                    let new = super::fuzzy_suggestions(
+                        &entry, "en-es", &project, &global, limit, threshold,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        serde_json::to_vec(&new).unwrap(),
+                        serde_json::to_vec(&old).unwrap(),
+                        "query={query:?}, threshold={threshold}, limit={limit}"
+                    );
+                    comparisons += 1;
+                }
+            }
+        }
+        println!("suggestion equivalence: {comparisons} byte-identical ordered JSON arrays");
+    }
+
+    #[tokio::test]
+    async fn memory_suggestions_prepare_query_once_per_request() {
+        let project = locust_core::database::Database::open_in_memory().unwrap();
+        let global = locust_core::database::GlobalMemoryDb::open_in_memory().unwrap();
+        let entry = translated("row", "Hello world query", "story.html", "Current");
+        for i in 0..32 {
+            project
+                .save_memory(
+                    &format!("p{i}"),
+                    "Hello world here",
+                    &format!("Project {i}"),
+                    "en-es",
+                )
+                .await
+                .unwrap();
+            global
+                .save_memory(
+                    &format!("g{i}"),
+                    "Hello world there",
+                    &format!("Global {i}"),
+                    "en-es",
+                )
+                .await
+                .unwrap();
+        }
+        // Synchronous scoring stays on this thread, isolating concurrent tests.
+        for _ in 0..2 {
+            super::PREPARATIONS.with(|counts| counts.set((0, 0)));
+            let rows =
+                super::fuzzy_suggestions(&entry, "en-es", &project, &global, 5, 0.6).unwrap();
+            assert_eq!(rows.len(), 5);
+            assert_eq!(super::PREPARATIONS.with(|counts| counts.get()), (1, 64));
+        }
+        super::PREPARATIONS.with(|counts| counts.set((0, 0)));
+        assert!(
+            super::fuzzy_suggestions(&entry, "en-es", &project, &global, 0, 0.6)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(super::PREPARATIONS.with(|counts| counts.get()), (0, 0));
+        println!("request preparation counts: query=1, candidates=64, repeated for 2 requests; zero limit=0");
+    }
 
     #[test]
     fn memory_limit_caps_valid_decimal_integers_without_overflow() {
