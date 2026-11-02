@@ -15,6 +15,7 @@ const cases = [
   ["EmptyTranslation", "EmptyTranslation", "validate.kind.emptyLabel"],
   ["IdenticalToSource", "IdenticalToSource", "validate.kind.identicalLabel"],
   [{ InconsistentTranslation: { variants: 2, common: "Guardar" } }, "InconsistentTranslation", "validate.kind.inconsistentLabel"],
+  [{ NumberMismatch: { missing: ["12"], extra: ["2"] } }, "NumberMismatch", "validate.kind.numberMismatchLabel"],
   ["StaleTranslation", "StaleTranslation", "validate.kind.staleLabel"],
   ["InvalidInjectionProvenance", "InvalidInjectionProvenance", "validate.kind.provenanceLabel"],
   [{ InvalidInjectionProvenance: { reason: "MissingTextAssetOriginal" } }, "InvalidInjectionProvenance", "validate.kind.provenanceLabel"],

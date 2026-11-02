@@ -491,6 +491,7 @@ export function validationKindLabel(kind: ValidationKind): string {
   if ("ExceedsBinarySlot" in kind) return "ExceedsBinarySlot";
   if ("UnencodableTranslation" in kind) return "UnencodableTranslation";
   if ("InconsistentTranslation" in kind) return "InconsistentTranslation";
+  if ("NumberMismatch" in kind) return "NumberMismatch";
   if ("InvalidInjectionProvenance" in kind) return "InvalidInjectionProvenance";
   return "Unknown";
 }
