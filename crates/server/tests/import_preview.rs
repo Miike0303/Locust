@@ -129,6 +129,8 @@ fn snapshot(state: &AppState) -> Value {
         "rows": state.db.get_entries(&EntryFilter::default()).unwrap(),
         "history": history,
         "issues": state.db.get_validation_issues(None).unwrap(),
+        "stats": state.db.get_stats().unwrap(),
+        "memory": state.db.memory_count().unwrap(),
     })
 }
 
@@ -921,4 +923,415 @@ async fn pivot_imports_use_semantic_pair_after_reopen_and_ignore_physical_source
     assert_eq!(saved.translation.as_deref(), Some("Imported"));
     assert_eq!(saved.injection_source().unwrap(), "日本語");
     server.abort();
+}
+
+// Exercise the server functions called by Tauri as well as their HTTP wrappers.
+async fn w4_08_refused(state: Arc<AppState>, format: &str, content: &str) {
+    let before = snapshot(&state);
+    let accepted = {
+        let config = state.config.read().await;
+        let pair = export::project_import_languages(
+            &state.db,
+            &config.default_source_lang,
+            &config.default_target_lang,
+        )
+        .unwrap();
+        language_catalog(
+            format,
+            pair.source.as_deref().unwrap_or("en"),
+            pair.target.as_deref().unwrap_or("es"),
+        )
+    };
+    let previous = locust_server::preview_catalog(state.clone(), format.into(), accepted, true)
+        .await
+        .unwrap();
+    let native = locust_server::preview_catalog(state.clone(), format.into(), content.into(), true)
+        .await
+        .expect_err("native preview must refuse");
+    assert_eq!(native.0.as_u16(), 400);
+    let (base, server) = start_test_server(state.clone()).await;
+    let client = client();
+    for allow in [false, true] {
+        let response = client
+            .post(format!("{base}/api/import/{format}/preview"))
+            .json(&json!({"content": content, "allow_undeclared_language": allow}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        assert_eq!(response.text().await.unwrap(), native.1);
+        let response = client
+            .post(format!(
+                "{base}/api/import/{format}?allow_undeclared_language={allow}"
+            ))
+            .body(content.to_owned())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        assert_eq!(response.text().await.unwrap(), native.1);
+        let error = locust_server::apply_catalog_preview(
+            state.clone(),
+            format.into(),
+            content.into(),
+            true,
+            previous.plan_token.clone(),
+            allow,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0.as_u16(), 409);
+        let response = client
+            .post(format!("{base}/api/import/{format}/apply"))
+            .json(&json!({"content": content, "keep_existing": true,
+                "plan_token": previous.plan_token, "allow_undeclared_language": allow}))
+            .send()
+            .await
+            .unwrap();
+        assert_stale(response, &state, before.clone()).await;
+        assert_eq!(snapshot(&state), before);
+    }
+    server.abort();
+}
+
+async fn w4_08_confirmation(state: Arc<AppState>, format: &str, content: &str) {
+    let before = snapshot(&state);
+    let (base, server) = start_test_server(state.clone()).await;
+    let client = client();
+    let plan = preview(&client, &base, format, content, true).await;
+    assert_eq!(plan["languages"]["requires_confirmation"], true);
+    let native = locust_server::preview_catalog(state.clone(), format.into(), content.into(), true)
+        .await
+        .unwrap();
+    assert_eq!(serde_json::to_value(&native).unwrap(), plan);
+    assert_eq!(snapshot(&state), before);
+    let error = locust_server::apply_catalog_preview(
+        state.clone(),
+        format.into(),
+        content.into(),
+        true,
+        native.plan_token.clone(),
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.0.as_u16(), 400);
+    let response = apply(&client, &base, format, content, true, &native.plan_token).await;
+    assert_eq!(response.status(), 400);
+    assert_eq!(response.text().await.unwrap(), error.1);
+    let response = client
+        .post(format!("{base}/api/import/{format}"))
+        .body(content.to_owned())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    assert_eq!(snapshot(&state), before);
+    // Even an innocuous byte change invalidates an ambiguous catalog's plan.
+    let changed = format!("{content}\n");
+    let error = locust_server::apply_catalog_preview(
+        state.clone(),
+        format.into(),
+        changed.clone(),
+        true,
+        native.plan_token.clone(),
+        true,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.0.as_u16(), 409);
+    assert_stale(
+        apply(&client, &base, format, &changed, true, &native.plan_token).await,
+        &state,
+        before.clone(),
+    )
+    .await;
+    let response = client
+        .post(format!("{base}/api/import/{format}/apply"))
+        .json(&json!({"content": content, "keep_existing": true,
+            "plan_token": native.plan_token, "allow_undeclared_language": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "{format}: {}",
+        response.text().await.unwrap()
+    );
+    let native = locust_server::preview_catalog(state.clone(), format.into(), content.into(), true)
+        .await
+        .unwrap();
+    locust_server::apply_catalog_preview(
+        state.clone(),
+        format.into(),
+        content.into(),
+        true,
+        native.plan_token,
+        true,
+    )
+    .await
+    .unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn w4_08_script_conflicts_refuse_http_and_native_with_zero_writes() {
+    for (expected, conflicting) in [("zh-Hans", "zh-Hant"), ("sr-Latn", "sr-Cyrl")] {
+        for format in FORMATS {
+            let state = seeded_state().await;
+            state.config.write().await.default_target_lang = expected.into();
+            w4_08_refused(state, format, &language_catalog(format, "en", conflicting)).await;
+            if format != "po" {
+                let state = seeded_state().await;
+                state.config.write().await.default_source_lang = expected.into();
+                w4_08_refused(state, format, &language_catalog(format, conflicting, "es")).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn w4_08_script_omission_requires_confirmation_http_and_native() {
+    for format in FORMATS {
+        for (expected, declared) in [("zh-Hans", "zh"), ("sr", "sr-Latn")] {
+            let state = seeded_state().await;
+            state.config.write().await.default_target_lang = expected.into();
+            w4_08_confirmation(state, format, &language_catalog(format, "en", declared)).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn w4_08_partial_and_disagreeing_xliff_files_keep_all_evidence() {
+    let complete = language_catalog("xliff", "en", "es");
+    for content in [
+        complete.replace(" target-language=\"es\"", ""),
+        complete.replace(
+            "</xliff>",
+            "<file source-language=\"en\"><body/></file></xliff>",
+        ),
+        complete.replace(
+            "</xliff>",
+            "<file source-language=\"en\" target-language=\"es-MX\"><body/></file></xliff>",
+        ),
+    ] {
+        w4_08_confirmation(seeded_state().await, "xliff", &content).await;
+    }
+    for attrs in [
+        "source-language=\"fr\"",
+        "source-language=\"en\" target-language=\"fr\"",
+    ] {
+        let content =
+            complete.replace("</xliff>", &format!("<file {attrs}><body/></file></xliff>"));
+        w4_08_refused(seeded_state().await, "xliff", &content).await;
+    }
+}
+
+#[tokio::test]
+async fn w4_08_po_duplicate_and_empty_headers_do_not_hide_conflicts() {
+    let complete = language_catalog("po", "en", "es");
+    for headers in [
+        "Language: \\n",
+        "Language: es\\nLanguage: \\n",
+        "Language: es\\nLanguage: es-MX\\n",
+    ] {
+        let content = complete.replace("Language: es\\n", headers);
+        w4_08_confirmation(seeded_state().await, "po", &content).await;
+    }
+    let conflicting = complete.replace("Language: es\\n", "Language: es\\nLanguage: fr\\n");
+    w4_08_refused(seeded_state().await, "po", &conflicting).await;
+    let equivalent = complete.replace("Language: es\\n", "Language: es\\nLanguage: ES\\n");
+    let state = seeded_state().await;
+    let native = locust_server::preview_catalog(state, "po".into(), equivalent, true)
+        .await
+        .unwrap();
+    assert!(!native.languages.requires_confirmation);
+}
+
+#[tokio::test]
+async fn w4_08_tmx_undeclared_orientation_and_strict_structure_agree() {
+    let complete = language_catalog("tmx", "en", "es");
+    for source in ["", "*all*"] {
+        let content = complete.replace("srclang=\"en\"", &format!("srclang=\"{source}\""));
+        w4_08_confirmation(seeded_state().await, "tmx", &content).await;
+    }
+    for content in [
+        export::export_tmx(&[], "en", "es").unwrap(),
+        export::export_tmx(&[], "en", "es")
+            .unwrap()
+            .replace("srclang=\"en\"", "srclang=\"*all*\""),
+    ] {
+        w4_08_confirmation(seeded_state().await, "tmx", &content).await;
+    }
+    for content in [
+        complete.replace(" xml:lang=\"es\"", ""),
+        complete.replace("</tu>", "<tuv xml:lang=\"fr\"><seg>Third</seg></tuv></tu>"),
+    ] {
+        w4_08_refused(seeded_state().await, "tmx", &content).await;
+    }
+}
+
+#[tokio::test]
+async fn w4_08_unknown_project_pair_requires_confirmation_and_known_sides_constrain() {
+    for format in FORMATS {
+        let state = seeded_state().await;
+        state.config.write().await.default_source_lang.clear();
+        state.config.write().await.default_target_lang.clear();
+        w4_08_confirmation(state, format, &language_catalog(format, "en", "es")).await;
+        let state = seeded_state().await;
+        state.config.write().await.default_source_lang.clear();
+        state.config.write().await.default_target_lang = "fr".into();
+        w4_08_refused(state, format, &language_catalog(format, "en", "es")).await;
+    }
+}
+
+#[tokio::test]
+async fn w4_08_script_and_unknown_pair_changes_stale_http_and_native_plans() {
+    for format in FORMATS {
+        for unknown in [false, true] {
+            let state = seeded_state().await;
+            state.config.write().await.default_target_lang =
+                if unknown { "" } else { "zh-Hans" }.into();
+            if unknown {
+                state.config.write().await.default_source_lang.clear();
+            }
+            let (base, server) = start_test_server(state.clone()).await;
+            let client = client();
+            let content = language_catalog(format, "en", "zh-Hans");
+            let plan = preview(&client, &base, format, &content, true).await;
+            state.config.write().await.default_target_lang =
+                if unknown { "zh-Hans" } else { "zh-Hant" }.into();
+            if unknown {
+                state.config.write().await.default_source_lang = "en".into();
+            }
+            let before = snapshot(&state);
+            let error = locust_server::apply_catalog_preview(
+                state.clone(),
+                format.into(),
+                content.clone(),
+                true,
+                plan["plan_token"].as_str().unwrap().into(),
+                true,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.0.as_u16(), 409);
+            assert_stale(
+                apply(
+                    &client,
+                    &base,
+                    format,
+                    &content,
+                    true,
+                    plan["plan_token"].as_str().unwrap(),
+                )
+                .await,
+                &state,
+                before,
+            )
+            .await;
+            server.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn w4_08_fresh_pivot_uses_config_before_first_run_despite_copied_metadata() {
+    use locust_core::database::Database;
+    let state = seeded_state().await;
+    let original = row("fill", "日本語", Some("Empty"), StringStatus::Translated);
+    state.db.save_entries(&[original]).unwrap();
+    state
+        .db
+        .set_project_metadata("source_lang", &json!("ja"))
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("pivot.db");
+    state.db.pivot_to(&path).unwrap();
+    assert!(Database::open(&path)
+        .unwrap()
+        .get_translation_runs()
+        .unwrap()
+        .is_empty());
+    let (base, server) = start_test_server(state.clone()).await;
+    let client = client();
+    let response = client.post(format!("{base}/api/project/open-db"))
+        .json(&json!({"database_path": path, "game_path": directory.path().join("game"), "format_id": "renpy"}))
+        .send().await.unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    for format in FORMATS {
+        let content = language_catalog(format, "en", "es");
+        let plan = preview(&client, &base, format, &content, true).await;
+        let native =
+            locust_server::preview_catalog(state.clone(), format.into(), content.clone(), true)
+                .await
+                .unwrap();
+        assert_eq!(serde_json::to_value(&native).unwrap(), plan);
+        assert_eq!(
+            plan["languages"]["project"],
+            json!({"source": "en", "target": "es"})
+        );
+        assert_eq!(plan["languages"]["requires_confirmation"], false);
+        assert_eq!(
+            apply(
+                &client,
+                &base,
+                format,
+                &content,
+                true,
+                plan["plan_token"].as_str().unwrap()
+            )
+            .await
+            .status(),
+            200
+        );
+    }
+    assert_eq!(
+        state
+            .db
+            .get_entry("fill")
+            .unwrap()
+            .unwrap()
+            .injection_source()
+            .unwrap(),
+        "日本語"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn w4_08_tmx_orientation_uses_known_target_and_scripts_before_variant_order() {
+    for scripts in [false, true] {
+        let (source, target, configured_source, configured_target) = if scripts {
+            ("zh-Hans-CN", "zh-Hant-TW", "zh-Hans", "zh-Hant")
+        } else {
+            ("en", "es", "", "es")
+        };
+        let state = seeded_state().await;
+        state.config.write().await.default_source_lang = configured_source.into();
+        state.config.write().await.default_target_lang = configured_target.into();
+        let content = language_catalog("tmx", source, target)
+            .replace(&format!("srclang=\"{source}\""), "srclang=\"*all*\"")
+            .replace(
+                &format!("<tuv xml:lang=\"{source}\"><seg>Empty</seg></tuv><tuv xml:lang=\"{target}\"><seg>Imported</seg></tuv>"),
+                &format!("<tuv xml:lang=\"{target}\"><seg>Imported</seg></tuv><tuv xml:lang=\"{source}\"><seg>Empty</seg></tuv>"),
+            );
+        let native =
+            locust_server::preview_catalog(state.clone(), "tmx".into(), content.clone(), true)
+                .await
+                .unwrap();
+        assert_eq!(native.fill, 1);
+        w4_08_confirmation(state.clone(), "tmx", &content).await;
+        assert_eq!(
+            state
+                .db
+                .get_entry("fill")
+                .unwrap()
+                .unwrap()
+                .translation
+                .as_deref(),
+            Some("Imported")
+        );
+    }
 }

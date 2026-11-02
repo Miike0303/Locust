@@ -289,3 +289,165 @@ fn cli_pivot_import_uses_semantic_run_after_reopen() {
     assert_eq!(row.translation.as_deref(), Some("Imported"));
     assert_eq!(row.injection_source().unwrap(), "日本語");
 }
+
+#[test]
+fn w4_08_cli_script_conflicts_cannot_be_overridden() {
+    for (expected, conflicting) in [("zh-Hans", "zh-Hant"), ("sr-Latn", "sr-Cyrl")] {
+        for format in ["po", "xliff", "tmx"] {
+            let fixture = Fixture::new();
+            fixture.record_pair("en", expected);
+            fixture.write(format, "en", conflicting);
+            let before = fixture.snapshot();
+            for flags in [
+                vec![],
+                vec!["--dry-run"],
+                vec!["--allow-undeclared-language"],
+            ] {
+                let output = fixture.run(format, expected, &flags);
+                assert!(!output.status.success(), "{format}/{expected}: {output:?}");
+                assert!(String::from_utf8_lossy(&output.stderr).contains("does not match project"));
+                assert_eq!(fixture.snapshot(), before);
+            }
+            // CLI arguments themselves cannot override the ledger's script.
+            fixture.write(format, "en", expected);
+            let output = fixture.run(format, conflicting, &["--allow-undeclared-language"]);
+            assert!(!output.status.success(), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stderr).contains("does not match project"));
+            assert_eq!(fixture.snapshot(), before);
+        }
+        for format in ["xliff", "tmx"] {
+            let fixture = Fixture::new();
+            fixture.record_pair(expected, "es");
+            fixture.write(format, conflicting, "es");
+            let before = fixture.snapshot();
+            let output = fixture
+                .command()
+                .arg("import")
+                .arg(&fixture.project)
+                .args(["-f", format, "--source-lang", expected, "-l", "es", "-i"])
+                .arg(&fixture.catalog)
+                .arg("--allow-undeclared-language")
+                .output()
+                .unwrap();
+            assert!(!output.status.success(), "{format}/{expected}: {output:?}");
+            assert!(String::from_utf8_lossy(&output.stderr).contains("source language"));
+            assert_eq!(fixture.snapshot(), before);
+        }
+    }
+}
+
+#[test]
+fn w4_08_cli_partial_duplicate_and_script_declarations_require_confirmation() {
+    for (format, case) in [
+        ("xliff", "partial"),
+        ("xliff", "files"),
+        ("po", "empty"),
+        ("po", "duplicate"),
+        ("tmx", "orientation"),
+        ("po", "script"),
+        ("xliff", "script"),
+        ("tmx", "script"),
+    ] {
+        let fixture = Fixture::new();
+        let expected = if case == "script" { "zh-Hans" } else { "es" };
+        fixture.record_pair("en", expected);
+        let complete = fixture.write(format, "en", if case == "script" { "zh" } else { "es" });
+        let content = match case {
+            "partial" => complete.replace(" target-language=\"es\"", ""),
+            "files" => complete.replace(
+                "</xliff>",
+                "<file source-language=\"en\" target-language=\"es-MX\"><body/></file></xliff>",
+            ),
+            "empty" => complete.replace("Language: es\\n", "Language: \\n"),
+            "duplicate" => complete.replace("Language: es\\n", "Language: es\\nLanguage: es-MX\\n"),
+            "orientation" => complete.replace("srclang=\"en\"", "srclang=\"*all*\""),
+            "script" => complete,
+            _ => unreachable!(),
+        };
+        std::fs::write(&fixture.catalog, content).unwrap();
+        let before = fixture.snapshot();
+        let output = fixture.run(format, expected, &["--dry-run"]);
+        assert!(output.status.success(), "{format}/{case}: {output:?}");
+        assert_eq!(fixture.snapshot(), before);
+        let output = fixture.run(format, expected, &[]);
+        assert!(!output.status.success(), "{format}/{case}: {output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("--allow-undeclared-language"));
+        assert_eq!(fixture.snapshot(), before);
+        let output = fixture.run(format, expected, &["--allow-undeclared-language"]);
+        assert!(output.status.success(), "{format}/{case}: {output:?}");
+    }
+}
+
+#[test]
+fn w4_08_cli_mixed_conflicts_and_structural_tmx_errors_refuse_without_writes() {
+    for (format, case) in [
+        ("po", "duplicate"),
+        ("xliff", "files"),
+        ("tmx", "missing"),
+        ("tmx", "third"),
+    ] {
+        let fixture = Fixture::new();
+        fixture.record_pair("en", "es");
+        let complete = fixture.write(format, "en", "es");
+        let content = match case {
+            "duplicate" => complete.replace("Language: es\\n", "Language: es\\nLanguage: fr\\n"),
+            "files" => complete.replace(
+                "</xliff>",
+                "<file source-language=\"fr\"><body/></file></xliff>",
+            ),
+            "missing" => complete.replace(" xml:lang=\"es\"", ""),
+            "third" => {
+                complete.replace("</tu>", "<tuv xml:lang=\"fr\"><seg>Third</seg></tuv></tu>")
+            }
+            _ => unreachable!(),
+        };
+        std::fs::write(&fixture.catalog, content).unwrap();
+        let before = fixture.snapshot();
+        for flags in [
+            vec![],
+            vec!["--dry-run"],
+            vec!["--allow-undeclared-language"],
+        ] {
+            let output = fixture.run(format, "es", &flags);
+            assert!(!output.status.success(), "{format}/{case}: {output:?}");
+            assert_eq!(fixture.snapshot(), before);
+        }
+    }
+}
+
+#[test]
+fn w4_08_cli_fresh_pivot_uses_explicit_pair_without_run_or_config() {
+    let mut fixture = Fixture::new();
+    let db = Database::open(&fixture.project).unwrap();
+    let mut row = StringEntry::new("id", "日本語", "story.rpy".into());
+    row.translation = Some("Source".into());
+    row.status = StringStatus::Translated;
+    db.save_entries(&[row]).unwrap();
+    db.set_project_metadata("source_lang", &json!("ja"))
+        .unwrap();
+    let path = fixture.directory.path().join("pivot.db");
+    db.pivot_to(&path).unwrap();
+    fixture.project = path;
+    assert!(Database::open(&fixture.project)
+        .unwrap()
+        .get_translation_runs()
+        .unwrap()
+        .is_empty());
+    // CLI always supplies a concrete --lang; --source-lang establishes the other
+    // side before a run. An entirely unknown pair is only possible in HTTP/native.
+    for format in ["po", "xliff", "tmx"] {
+        fixture.write(format, "en", "es");
+        let output = fixture.run(format, "es", &[]);
+        assert!(output.status.success(), "{format}: {output:?}");
+    }
+    assert_eq!(
+        Database::open(&fixture.project)
+            .unwrap()
+            .get_entry("id")
+            .unwrap()
+            .unwrap()
+            .injection_source()
+            .unwrap(),
+        "日本語"
+    );
+}

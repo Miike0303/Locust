@@ -41,17 +41,23 @@ and copied `source_lang` metadata may still describe Japanese.
 
 | Declaration | Import policy |
 |---|---|
-| Matching primary source/target tags | Accept; preserve existing exact-ID/source and review checks. PO checks only the target. |
-| Wrong primary target, wrong primary source, or reversed pair | Refuse with a clear error and zero imported-row/history/counter writes. No confirmation flag overrides a known mismatch. |
+| Matching primary source/target tags and compatible explicit scripts | Accept; preserve existing exact-ID/source and review checks. PO checks only the target. |
+| Wrong primary target, wrong primary source, conflicting explicit script, or reversed pair | Refuse with a clear error and zero imported-row/history/counter writes. No confirmation flag overrides a known mismatch. |
 | `es`, `es-ES`, `es_ES`, or case differences | Trim language tags, fold ASCII case and map `_` to `-`; the same primary subtag matches. Catalog text/IDs are unchanged. |
+| Different explicit scripts, such as `zh-Hans` / `zh-Hant` or `sr-Latn` / `sr-Cyrl` | Refuse on either declared side, including with confirmation. Scripts identify different written languages; they are not regions. |
+| Script present on only one side of the project/catalog comparison, such as `zh` / `zh-Hans` | Ambiguous: require explicit undeclared-language confirmation. Do not infer scripts from regions, text, or likely-subtag defaults. |
 | Two explicit conflicting regions, such as `es-MX` / `es-ES` | Show a regional warning; allow import without extra confirmation. A bare `es` does not imply a conflicting region. |
-| Missing, invalid/nonconcrete (`und`, `auto`, `*all*`), or ambiguous required declaration | Read-only preview shows a warning. Apply requires explicit **Language not declared — import anyway** confirmation. Distinct declarations within a catalog are ambiguous; any known primary mismatch still refuses. |
+| Missing, invalid/nonconcrete (`und`, `auto`, `*all*`), or ambiguous required declaration | Read-only preview shows a warning. Apply requires explicit **Language not declared — import anyway** confirmation. Distinct declarations within a catalog are ambiguous; any known primary/script mismatch still refuses. |
 | Unknown project language | Warn and require the same explicit confirmation; known sides still constrain the catalog. |
 
 For an omitted/nonconcrete TMX `srclang`, the adapter orients the two declared
-variants using the project's source (matching primary subtags, preferring an
-exact tag). The missing-header warning and confirmation still apply. Empty TMX
-catalogs have no declared target and also warn. The strict bilingual parser still
+variants using the project's source (preferring an exact tag, then matching
+scripts within the same primary subtag). If the project source is unknown but
+the target is known, the matching target identifies the other variant as the
+source. If both sides are unknown, orientation follows variant order and remains
+explicitly unconfirmed; Locust cannot infer a semantic pair. The missing-header
+warning and confirmation still apply. Empty TMX catalogs have no declared target
+and also warn. The strict bilingual parser still
 validates the entire document: extra variants, incomplete units, malformed XML,
 inline markup and exceeded limits remain errors. Language normalization rewrites
 only language attribute values before that validation; segment bytes stay exact.
@@ -523,3 +529,53 @@ whitespace around equals and before tag closure, literal opposite quotes inside
 values, mixed attribute quote styles, and empty-header syntax. S1/S2 boundaries
 remain unchanged; all three reported S3 blockers are addressed. Parent full gates
 and independent re-verification remain outstanding; job-1 is not evidence of a pass.
+
+
+## Edge cases (W4-08)
+
+Audit decision: before a pivot's first run, the configured HTTP/native pair or
+explicit CLI pair is authoritative even when copied `source_lang` says `ja`.
+Without those defaults the pair remains unknown; neither physical provenance
+nor catalog text establishes it. CLI requires a concrete `--lang`, and TMX also
+requires `--source-lang`, so a wholly unknown CLI pair is not representable.
+
+Script comparison uses normalized explicit script subtags, including after
+extlangs, and does not interpret extension/private-use values as scripts. A
+missing script on one side uses the existing `undeclared` warning/confirmation;
+conflicting explicit scripts use the existing mismatch error. The regional
+warning policy and standalone exact-tag `import_tmx` codec are unchanged. Only
+the project-catalog TMX adapter's undeclared orientation is corrected: variant
+order must not defeat available project language/script evidence.
+
+Tests below are in `crates/core/tests/w4_08_import_languages.rs`; the
+`w4_08_*` tests in server `import_preview` exercise HTTP plus the same
+`preview_catalog` / `apply_catalog_preview` functions called by the Tauri
+commands. CLI `import_languages` covers script assertions, mixed declarations,
+strict TMX refusals and a fresh pivot. Refusal/staleness snapshots include rows,
+history, counters, validation issues and project memory. Ambiguous apply requires
+confirmation in both shared native functions and HTTP; changing even whitespace
+in catalog bytes stales its preview. Script and unknown-to-known pair changes
+also return HTTP/native 409 with no writes. No route or frontend change is needed.
+
+RED evidence before the fixes: the two script regressions failed at core and
+in the HTTP/native shared-function tests; both TMX orientation regressions also
+failed at core with source/target reversed. These four core regressions now pass.
+
+Local verification (2026-11-01): `cargo fmt --all` and strict Clippy for core,
+server and CLI (all targets) passed. The new core suite passed 9/9, standalone
+`tmx_catalog_tests` 16/16, server `import_preview` 24/24 and CLI `import_languages`
+11/11. The requested core `--lib export` run passed 57/58; its sole failure was
+`export_destination_refuses_hard_links`, whose hard-link setup returned Windows
+`PermissionDenied` / `Acceso denegado` (code 5) in this sandbox. That gate needs
+an outside-sandbox rerun; it is not reported as fully passing.
+
+| Case | Policy / bug | Test name | Fix |
+|---|---|---|---|
+| Fresh pivot, copied `source_lang=ja`, EN→ES before a run | Intended: accept configured/explicit EN→ES; ignore copied/physical provenance. | `fresh_pivot_import_uses_explicit_pair_before_first_run`; server `w4_08_fresh_pivot_uses_config_before_first_run_despite_copied_metadata`; CLI `w4_08_cli_fresh_pivot_uses_explicit_pair_without_run_or_config` | Tests only. |
+| Partial XLIFF or disagreeing files | Intended: every file contributes both sides, including missing values; ambiguity requires confirmation; any known mismatch refuses. | `partial_xliff_files_cannot_borrow_another_files_language`; existing `ambiguous_headers_warn_but_known_conflicts_cannot_be_overridden`; server `w4_08_partial_and_disagreeing_xliff_files_keep_all_evidence` | Tests only. |
+| Empty TMX, empty/missing/`*all*` source orientation | Intended: warn and confirm; an empty catalog has no target evidence. | `tmx_empty_orientation_warns_but_missing_or_extra_variants_remain_strict_errors`; existing `missing_declarations_require_confirmation_including_tmx_orientation`; server `w4_08_tmx_undeclared_orientation_and_strict_structure_agree` | Tests only; strict standalone codec still refuses nonconcrete orientation. |
+| TMX variant missing `xml:lang`, or third variant | Intended: structural profile error, never overridable. | `tmx_empty_orientation_warns_but_missing_or_extra_variants_remain_strict_errors`; CLI `w4_08_cli_mixed_conflicts_and_structural_tmx_errors_refuse_without_writes` | Tests only; no guessing or profile widening. |
+| Duplicate or empty PO `Language:` | Intended: equivalent normalized duplicates accept; blank or distinct compatible declarations require confirmation; any known mismatch refuses, even in a separate header entry. | `equivalent_duplicate_po_headers_are_concrete_but_blank_duplicates_are_ambiguous`; existing `ambiguous_headers_warn_but_known_conflicts_cannot_be_overridden`; server `w4_08_po_duplicate_and_empty_headers_do_not_hide_conflicts` | Tests only. |
+| `zh-Hans`/`zh-Hant`, `sr-Latn`/`sr-Cyrl`; one omitted script | Bug: explicit conflicts were silently accepted; one-sided scripts were unconfirmed. | `explicit_script_conflicts_refuse_on_both_sides_in_all_formats`; `one_sided_script_declarations_require_confirmation_without_region_inference`; server/CLI `w4_08_*script*` | Shared validator refuses conflicting scripts on either side and requires confirmation for one-sided scripts; regions still only warn. |
+| Undeclared TMX source with reversed variant order and same-primary scripts or only a known target | Bug: adapter could reverse source/target or refuse a valid orientation. | `tmx_undeclared_orientation_prefers_matching_script_before_matching_primary`; `tmx_unknown_source_orients_from_known_target_instead_of_variant_order`; server `w4_08_tmx_orientation_uses_known_target_and_scripts_before_variant_order` | Prefer matching script after exact tag; when source is unknown, orient from known target. Confirmation remains mandatory. |
+| Unknown project pair (no run/default) | Intended: confirm, preserve known-side constraints, stale preview if the pair becomes known. | `unknown_project_pair_requires_confirmation_and_known_sides_still_constrain`; server `w4_08_unknown_project_pair_requires_confirmation_and_known_sides_constrain` and `w4_08_script_and_unknown_pair_changes_stale_http_and_native_plans` | Tests only; explicit CLI arguments supply the initial pair. |

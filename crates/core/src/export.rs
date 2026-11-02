@@ -691,8 +691,8 @@ pub struct ImportedTranslation {
     pub translation: String,
 }
 
-/// Concrete tags use ASCII case folding and hyphens. Matching uses the primary
-/// subtag; two explicitly different regions warn rather than rejecting a pair.
+/// Concrete tags use ASCII case folding and hyphens. Primary subtags and
+/// explicit scripts must match; conflicting regions warn rather than rejecting.
 pub fn normalize_import_language(value: &str) -> Option<String> {
     let tag = value.trim().replace('_', "-").to_ascii_lowercase();
     let mut parts = tag.split('-');
@@ -775,6 +775,25 @@ impl ImportLanguageValidation {
     }
 }
 
+fn language_script(tag: &str) -> Option<&str> {
+    // A BCP-47 script follows the primary and up to three extlangs. Do not
+    // mistake four-letter values inside extensions/private use for scripts.
+    let mut parts = tag.split('-').skip(1).peekable();
+    for _ in 0..3 {
+        if parts
+            .peek()
+            .is_some_and(|p| p.len() == 3 && p.bytes().all(|b| b.is_ascii_alphabetic()))
+        {
+            parts.next();
+        } else {
+            break;
+        }
+    }
+    parts
+        .next()
+        .filter(|p| p.len() == 4 && p.bytes().all(|b| b.is_ascii_alphabetic()))
+}
+
 fn language_region(tag: &str) -> Option<&str> {
     tag.split('-').skip(1).find(|part| {
         (part.len() == 2 && part.bytes().all(|b| b.is_ascii_alphabetic()))
@@ -807,9 +826,15 @@ pub fn validate_import_languages(
             .collect();
         tags.sort();
         tags.dedup();
+        let script_undeclared = expected.as_ref().is_some_and(|expected| {
+            tags.iter()
+                .any(|tag| language_script(tag).is_some() != language_script(expected).is_some())
+        });
         if let Some(expected) = expected {
             for tag in &tags {
-                if tag.split('-').next() != expected.split('-').next() {
+                if tag.split('-').next() != expected.split('-').next()
+                    || matches!((language_script(tag), language_script(expected)), (Some(a), Some(b)) if a != b)
+                {
                     return Err(LocustError::Other(anyhow::anyhow!(
                         "catalog {side} language '{tag}' does not match project {side} language '{expected}'; import refused"
                     )));
@@ -831,11 +856,12 @@ pub fn validate_import_languages(
                 expected: None,
             });
         }
-        if required
-            && (tags.len() != 1
-                || values
-                    .iter()
-                    .any(|v| normalize_import_language(v).is_none()))
+        if script_undeclared
+            || (required
+                && (tags.len() != 1
+                    || values
+                        .iter()
+                        .any(|v| normalize_import_language(v).is_none())))
         {
             validation.requires_confirmation = true;
             validation.warnings.push(ImportLanguageWarning {
@@ -980,24 +1006,42 @@ fn parse_import_tmx(content: &str, project: &ImportLanguagePair) -> Result<Parse
         }
     }
     let declared_source = sources.first().and_then(|v| normalize_import_language(v));
+    let variant_tags: Vec<_> = variants
+        .iter()
+        .filter_map(|v| normalize_import_language(v))
+        .collect();
+    let matching_variant = |expected: &str| {
+        let same_primary = |tag: &&String| tag.split('-').next() == expected.split('-').next();
+        variant_tags
+            .iter()
+            .find(|tag| tag.as_str() == expected)
+            .or_else(|| {
+                variant_tags.iter().find(|tag| {
+                    same_primary(tag) && language_script(tag) == language_script(expected)
+                })
+            })
+            .or_else(|| {
+                variant_tags.iter().find(|tag| {
+                    same_primary(tag)
+                        && (language_script(tag).is_none() || language_script(expected).is_none())
+                })
+            })
+            .or_else(|| variant_tags.iter().find(same_primary))
+            .cloned()
+    };
     let source = declared_source
         .clone()
+        .or_else(|| project.source.as_deref().and_then(&matching_variant))
         .or_else(|| {
-            project.source.as_ref().and_then(|expected| {
-                let tags: Vec<_> = variants
-                    .iter()
-                    .filter_map(|v| normalize_import_language(v))
-                    .collect();
-                tags.iter()
-                    .find(|tag| *tag == expected)
-                    .cloned()
-                    .or_else(|| {
-                        tags.into_iter()
-                            .find(|tag| tag.split('-').next() == expected.split('-').next())
-                    })
-            })
+            // With no known source, the known target orients the other variant.
+            // Declaration/project warnings still require explicit confirmation.
+            if project.source.is_some() {
+                return None;
+            }
+            let target = project.target.as_deref().and_then(&matching_variant)?;
+            variant_tags.iter().find(|tag| **tag != target).cloned()
         })
-        .or_else(|| variants.first().and_then(|v| normalize_import_language(v)))
+        .or_else(|| variant_tags.first().cloned())
         .or_else(|| project.source.clone())
         .unwrap_or_else(|| "en".into());
     if declared_source.is_none() && !variants.is_empty() {
