@@ -29,7 +29,12 @@ impl WolfRpgPlugin {
         let mut entries = Vec::new();
         let regions = find_sjis_string_regions(bytes);
 
-        for (idx, (offset, text)) in regions.into_iter().enumerate() {
+        for SjisStringRegion {
+            offset,
+            text,
+            legacy_index,
+        } in regions
+        {
             if text.chars().count() < MIN_STRING_LEN {
                 continue;
             }
@@ -41,7 +46,9 @@ impl WolfRpgPlugin {
                 continue;
             }
 
-            let id = format!("{}#offset_{}#{}", filename, offset, idx);
+            // New kana-only rows never consume or collide with numeric legacy indices.
+            let suffix = legacy_index.map_or_else(|| "k".to_string(), |idx| idx.to_string());
+            let id = format!("{}#offset_{}#{}", filename, offset, suffix);
             let mut entry =
                 StringEntry::new(id, &text, file_path.to_path_buf()).with_format_id("wolf-rpg");
             entry.tags = vec!["unknown".to_string()];
@@ -65,16 +72,180 @@ impl WolfRpgPlugin {
     }
 }
 
-/// Find contiguous regions of valid Shift-JIS text in raw bytes.
-/// Returns (byte_offset, decoded_string) pairs.
-fn find_sjis_string_regions(bytes: &[u8]) -> Vec<(usize, String)> {
+struct SjisStringRegion {
+    offset: usize,
+    text: String,
+    legacy_index: Option<usize>,
+}
+
+/// Recover complete text runs without changing the enumeration of legacy rows.
+/// Keep the old scan as the source of numeric indices: scanning only with the new
+/// boundaries would renumber later rows when a kana-only string becomes visible.
+fn find_sjis_string_regions(bytes: &[u8]) -> Vec<SjisStringRegion> {
+    let mut results: Vec<_> = find_legacy_sjis_string_regions(bytes)
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (offset, text))| SjisStringRegion {
+            offset,
+            text,
+            legacy_index: Some(idx),
+        })
+        .collect();
+    let legacy_count = results.len();
+    let mut legacy_pos = 0;
+    let mut pos = 0;
+
+    while pos < bytes.len() {
+        let start = pos;
+        // Scan forward from boundaries so ASCII/kana-valued trail bytes are
+        // always consumed with their lead, never mistaken for a new start.
+        while let Some(width) = sjis_text_char_len(bytes, pos) {
+            pos += width;
+        }
+        if pos == start {
+            pos += 1;
+            continue;
+        }
+
+        let mut has_legacy_row = false;
+        while legacy_pos < legacy_count && results[legacy_pos].offset < pos {
+            let region = &mut results[legacy_pos];
+            if region.offset >= start {
+                has_legacy_row = true;
+                let (prefix, _, had_errors) =
+                    encoding_rs::SHIFT_JIS.decode(&bytes[start..region.offset]);
+                if !had_errors {
+                    region.text.insert_str(0, &prefix);
+                    // A recovered prefix intentionally replaces the old, truncated
+                    // row's offset/id on reopen, but retains its numeric index.
+                    region.offset = start;
+                }
+            }
+            legacy_pos += 1;
+        }
+
+        if !has_legacy_row {
+            let (text, _, had_errors) = encoding_rs::SHIFT_JIS.decode(&bytes[start..pos]);
+            if !had_errors
+                && text.chars().count() >= MIN_STRING_LEN
+                && has_meaningful_content(&text)
+                && is_plausible_halfwidth_word(&text)
+            {
+                results.push(SjisStringRegion {
+                    offset: start,
+                    text: text.into_owned(),
+                    legacy_index: None,
+                });
+            }
+        }
+    }
+
+    results.sort_unstable_by_key(|region| region.offset);
+    results
+}
+
+/// Width of a printable token, respecting Shift-JIS lead/trail boundaries.
+fn sjis_text_char_len(bytes: &[u8], pos: usize) -> Option<usize> {
+    let b = *bytes.get(pos)?;
+    if is_sjis_lead_byte(b) {
+        let trail = *bytes.get(pos + 1)?;
+        return ((0x40..=0x7E).contains(&trail) || (0x80..=0xFC).contains(&trail)).then_some(2);
+    }
+    ((0x20..=0x7E).contains(&b) || (0xA1..=0xDF).contains(&b)).then_some(1)
+}
+
+/// Conservative structural heuristic, not a dictionary: after stripping ASCII
+/// digits, punctuation and spaces at the edges, require at least three kana or
+/// long-vowel characters and two distinct full-size kana letters. Start with a
+/// full-size kana; reject halfwidth punctuation, incompatible small kana/voicing
+/// marks, repeated long-vowel marks and final sokuon. This rejects short/repetitive
+/// noise and malformed random 0xA1..=0xDF runs without tightening legacy filters.
+fn is_plausible_halfwidth_word(text: &str) -> bool {
+    let word =
+        text.trim_matches(|c: char| c.is_ascii_digit() || c.is_ascii_punctuation() || c == ' ');
+    if !word.starts_with(|c: char| matches!(c, 'ｦ' | 'ｱ'..='ﾝ')) {
+        return false;
+    }
+
+    let mut previous = None;
+    let mut base = None;
+    let mut kana_count = 0;
+    let mut distinct_kana = 0u64;
+    let mut chars = word.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            'ｧ'..='ｮ' => {
+                let preceding = if matches!(previous, Some('ﾞ' | 'ﾟ')) {
+                    base
+                } else {
+                    previous
+                };
+                if !is_compatible_small_kana(preceding, c) {
+                    return false;
+                }
+                kana_count += 1;
+            }
+            'ｯ' if chars
+                .peek()
+                .is_some_and(|next| matches!(next, 'ｶ'..='ﾄ' | 'ﾊ'..='ﾎ')) =>
+            {
+                kana_count += 1;
+            }
+            'ｰ' if previous.is_some_and(|p| p != 'ｰ') => kana_count += 1,
+            'ｦ' | 'ｱ'..='ﾝ' => {
+                kana_count += 1;
+                distinct_kana |= 1 << (c as u32 - 'ｦ' as u32);
+                base = Some(c);
+            }
+            'ﾞ' if previous.is_some_and(|p| matches!(p, 'ｳ' | 'ｶ'..='ﾄ' | 'ﾊ'..='ﾎ')) =>
+                {}
+            'ﾟ' if previous.is_some_and(|p| ('ﾊ'..='ﾎ').contains(&p)) => {}
+            _ => return false,
+        }
+        previous = Some(c);
+    }
+    kana_count >= MIN_STRING_LEN.max(3) && distinct_kana.count_ones() >= 2
+}
+
+/// Common small-vowel and contracted-sound combinations, including loanwords.
+fn is_compatible_small_kana(preceding: Option<char>, small: char) -> bool {
+    matches!(
+        (preceding, small),
+        (Some('ｳ' | 'ｸ' | 'ﾂ' | 'ﾌ'), 'ｧ' | 'ｫ')
+            | (Some('ｳ' | 'ｽ' | 'ﾂ' | 'ﾃ' | 'ﾌ'), 'ｨ')
+            | (Some('ﾄ' | 'ﾌ'), 'ｩ')
+            | (
+                Some(
+                    'ｲ' | 'ｳ'
+                        | 'ｷ'
+                        | 'ｼ'
+                        | 'ﾁ'
+                        | 'ﾆ'
+                        | 'ﾋ'
+                        | 'ﾐ'
+                        | 'ﾘ'
+                        | 'ﾂ'
+                        | 'ﾃ'
+                        | 'ﾌ'
+                ),
+                'ｪ'
+            )
+            | (
+                Some('ｷ' | 'ｼ' | 'ﾁ' | 'ﾆ' | 'ﾋ' | 'ﾐ' | 'ﾘ' | 'ﾃ' | 'ﾌ'),
+                'ｬ'..='ｮ'
+            )
+    )
+}
+
+/// Original scan, deliberately unchanged to preserve every legacy numeric index.
+fn find_legacy_sjis_string_regions(bytes: &[u8]) -> Vec<(usize, String)> {
     let mut results = Vec::new();
     let len = bytes.len();
     let mut i = 0;
 
     while i < len {
         // Look for start of a Shift-JIS string region
-        if is_sjis_printable_start(bytes, i) {
+        if is_legacy_sjis_start(bytes, i) {
             let start = i;
             let mut end = i;
 
@@ -123,7 +294,7 @@ fn is_sjis_lead_byte(b: u8) -> bool {
     (0x81..=0x9F).contains(&b) || (0xE0..=0xFC).contains(&b)
 }
 
-fn is_sjis_printable_start(bytes: &[u8], pos: usize) -> bool {
+fn is_legacy_sjis_start(bytes: &[u8], pos: usize) -> bool {
     let b = bytes[pos];
     // Start with a Japanese double-byte char or ASCII letter
     if is_sjis_lead_byte(b) && pos + 1 < bytes.len() {
@@ -440,6 +611,269 @@ mod tests {
             bytes.push(0);
         }
         bytes
+    }
+
+    #[test]
+    fn w6_wolf_extracts_complete_text_prefixes() {
+        for source in [
+            "123 apples",
+            "!? 42 apples",
+            "  (7) apples",
+            "123 \"apples\"",
+            "123 勇者ｺﾝ",
+        ] {
+            let bytes = build_null_separated_sjis_fixture(&[source, "Magic"]);
+            let entries = WolfRpgPlugin::extract_strings_heuristic(
+                &bytes,
+                "BasicData.wolf",
+                Path::new("BasicData.wolf"),
+            );
+            assert_eq!(entries.len(), 2, "{source}");
+            assert_eq!(entries[0].source, source);
+            assert_eq!(entries[0].metadata["byte_offset"].as_u64(), Some(16));
+            assert_eq!(entries[0].id, "BasicData.wolf#offset_16#0");
+            assert!(entries[1].id.ends_with("#1"));
+        }
+    }
+
+    #[test]
+    fn w6_wolf_extracts_halfwidth_katakana_bytes_in_full() {
+        let bytes = [0, 0xBA, 0xDD, 0xC6, 0xC1, 0xCA, 0];
+        let entries = WolfRpgPlugin::extract_strings_heuristic(
+            &bytes,
+            "BasicData.wolf",
+            Path::new("BasicData.wolf"),
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source, "ｺﾝﾆﾁﾊ");
+        assert_eq!(entries[0].id, "BasicData.wolf#offset_1#k");
+        assert_eq!(entries[0].metadata["byte_offset"].as_u64(), Some(1));
+        assert_eq!(entries[0].metadata["binary_slot"], "sjis");
+    }
+
+    #[test]
+    fn w6_wolf_accepts_plausible_halfwidth_words() {
+        let sources = [
+            "ﾃｽﾄ",
+            "ｶﾞｲﾄﾞ",
+            "ﾊﾟｰﾃｨｰ",
+            "ｺｰﾋｰ",
+            "123 ｺﾝﾆﾁﾊ",
+            "!? ﾃｽﾄ",
+            "ｼｬﾝﾌﾟｰ",
+            "ﾌｧﾝﾀｼﾞｰ",
+            "ｼﾞｬﾝﾌﾟ",
+            "ﾎｯﾄｺｰﾋｰ",
+        ];
+        let bytes = build_null_separated_sjis_fixture(&sources);
+        let entries = WolfRpgPlugin::extract_strings_heuristic(
+            &bytes,
+            "BasicData.wolf",
+            Path::new("BasicData.wolf"),
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.source.as_str())
+                .collect::<Vec<_>>(),
+            sources
+        );
+        assert!(entries.iter().all(|entry| entry.id.ends_with("#k")));
+    }
+
+    #[test]
+    fn w6_wolf_excludes_numeric_crumbs_and_halfwidth_noise() {
+        let mut bytes = build_null_separated_sjis_fixture(&[
+            "123456",
+            "!? 123",
+            "A",
+            "123 A",
+            "あ",
+            "1あ",
+            "ｶ",
+            "ｶﾅ",
+            "ｱｱｱｱ",
+            "ﾞｺﾝﾆﾁﾊ",
+            "ｺﾟﾝﾆﾁﾊ",
+            "ｰﾃｽﾄ",
+            "ｧﾃｽﾄ",
+            "ｦｧｨｩｪｫ",
+            "ﾐｺｨﾑｯ",
+            "ｺｨﾃｽﾄ",
+        ]);
+        // All bytes decode as halfwidth characters, but these are not plausible words.
+        bytes.extend_from_slice(&[0, 0xA1, 0xDF, 0xA8, 0xDE, 0xB6, 0]);
+        bytes.extend_from_slice(&[0, 0xD0, 0xBA, 0xA8, 0xD1, 0xAF, 0xDF, 0]);
+        bytes.extend_from_slice(&[0, 0xD0, 0xBA, 0xA8, 0xD1, 0xAF, 0]);
+        let entries = WolfRpgPlugin::extract_strings_heuristic(
+            &bytes,
+            "BasicData.wolf",
+            Path::new("BasicData.wolf"),
+        );
+        assert!(entries.is_empty(), "unexpected noise rows: {entries:?}");
+    }
+
+    #[test]
+    fn w6_wolf_mixed_regions_keep_working() {
+        let sources = ["Hello ｺﾝﾆﾁﾊ 勇者", "勇者123ｶﾀｶﾅ", "ｺﾝHello"];
+        let bytes = build_null_separated_sjis_fixture(&sources);
+        let entries = WolfRpgPlugin::extract_strings_heuristic(
+            &bytes,
+            "BasicData.wolf",
+            Path::new("BasicData.wolf"),
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.source.as_str())
+                .collect::<Vec<_>>(),
+            sources
+        );
+        assert!(entries
+            .iter()
+            .enumerate()
+            .all(|(idx, entry)| entry.id.ends_with(&format!("#{idx}"))));
+    }
+
+    #[test]
+    fn w6_wolf_new_katakana_rows_do_not_renumber_legacy_ids() {
+        let bytes = build_null_separated_sjis_fixture(&[
+            "ﾃｽﾄ",
+            "あ",
+            "Hello",
+            "ｺﾝﾆﾁﾊ",
+            "はい",
+            "123!",
+            "ｶﾞｲﾄﾞ",
+            "Magic",
+        ]);
+        let entries = WolfRpgPlugin::extract_strings_heuristic(
+            &bytes,
+            "BasicData.wolf",
+            Path::new("BasicData.wolf"),
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| !entry.id.ends_with("#k"))
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "BasicData.wolf#offset_23#0",
+                "BasicData.wolf#offset_35#1",
+                "BasicData.wolf#offset_51#2",
+            ]
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.id.ends_with("#k"))
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "BasicData.wolf#offset_16#k",
+                "BasicData.wolf#offset_29#k",
+                "BasicData.wolf#offset_45#k",
+            ]
+        );
+    }
+
+    #[test]
+    fn w6_wolf_does_not_start_inside_sjis_pairs_or_cross_binary_boundaries() {
+        for source in [
+            "Ａ123 apples",
+            "ア123 apples",
+            "亜123 apples",
+            "者123 apples",
+        ] {
+            let (encoded, _, had_errors) = encoding_rs::SHIFT_JIS.encode(source);
+            assert!(!had_errors);
+            let mut bytes = vec![0xFF, 0x01, 0];
+            bytes.extend_from_slice(&encoded);
+            bytes.extend_from_slice(&[0, 0x02, 0xFF]);
+            let entries = WolfRpgPlugin::extract_strings_heuristic(
+                &bytes,
+                "BasicData.wolf",
+                Path::new("BasicData.wolf"),
+            );
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].source, source);
+            assert_eq!(entries[0].id, "BasicData.wolf#offset_3#0");
+        }
+        // Non-text bytes delimit prefixes even without an intervening NUL.
+        let bytes = b"\xff\x01123 apples\x02\xffNext\0";
+        let entries = WolfRpgPlugin::extract_strings_heuristic(
+            bytes,
+            "BasicData.wolf",
+            Path::new("BasicData.wolf"),
+        );
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].source, "123 apples");
+        assert_eq!(entries[0].metadata["byte_offset"].as_u64(), Some(2));
+        assert_eq!(entries[1].source, "Next");
+    }
+
+    #[test]
+    fn w6_wolf_injects_complete_prefix_and_katakana_slots() {
+        for translations in [["7 pears", "やあ"], ["987 grapes", "HELLO"]] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("BasicData.wolf");
+            let mut bytes = vec![0xFF, 0x01];
+            let mut slots = Vec::new();
+            for source in ["123 apples", "ｺﾝﾆﾁﾊ"] {
+                let (encoded, _, had_errors) = encoding_rs::SHIFT_JIS.encode(source);
+                assert!(!had_errors);
+                slots.push((bytes.len(), encoded.len()));
+                bytes.extend_from_slice(&encoded);
+                bytes.extend_from_slice(&[0, 0x02, 0xFF]);
+            }
+            // These excluded regions and binary sentinels must survive byte-for-byte.
+            bytes.extend_from_slice(b"12345\0A\0");
+            bytes.extend_from_slice(&[0xA1, 0xDF, 0xA8, 0xDE, 0xB6, 0]);
+            fs::write(&path, &bytes).unwrap();
+            let plugin = WolfRpgPlugin::new();
+            let mut entries = plugin.extract(&path).unwrap();
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].source, "123 apples");
+            assert_eq!(entries[1].source, "ｺﾝﾆﾁﾊ");
+            let mut expected = bytes.clone();
+            for ((entry, translation), (offset, length)) in
+                entries.iter_mut().zip(translations).zip(slots)
+            {
+                assert_eq!(entry.metadata["byte_offset"].as_u64(), Some(offset as u64));
+                entry.translation = Some(translation.to_string());
+                let (encoded, _, had_errors) = encoding_rs::SHIFT_JIS.encode(translation);
+                assert!(!had_errors);
+                expected[offset..offset + length].fill(0);
+                expected[offset..offset + encoded.len()].copy_from_slice(&encoded);
+            }
+            entries.reverse();
+            let report = plugin.inject(&path, &entries).unwrap();
+            assert_eq!(report.strings_written, 2);
+            assert_eq!(report.strings_skipped, 0);
+            assert_eq!(report.files_modified, 1);
+            assert_eq!(fs::read(&path).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn w6_wolf_oversize_prefix_and_katakana_translations_leave_slots_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("BasicData.wolf");
+        let bytes = build_null_separated_sjis_fixture(&["123 apples", "ｺﾝﾆﾁﾊ"]);
+        fs::write(&path, &bytes).unwrap();
+        let plugin = WolfRpgPlugin::new();
+        let mut entries = plugin.extract(&path).unwrap();
+        assert_eq!(entries.len(), 2);
+        for entry in &mut entries {
+            entry.translation = Some("This translation exceeds either slot".to_string());
+        }
+        let report = plugin.inject(&path, &entries).unwrap();
+        assert_eq!(report.strings_written, 0);
+        assert_eq!(report.strings_skipped, 2);
+        assert_eq!(report.skip_reasons, [("too_long".into(), 2)].into());
+        assert_eq!(report.files_modified, 0);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
     }
 
     #[test]
