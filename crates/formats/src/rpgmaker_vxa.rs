@@ -985,6 +985,16 @@ const SYSTEM_TEXT_FIELDS: &[&str] = &[
 
 pub struct RpgMakerVxaPlugin;
 
+fn marshal_has_class(value: &MarshalValue, expected: &str) -> bool {
+    match value.value() {
+        MarshalValue::Object { class, .. } => class == expected,
+        MarshalValue::OrderedObject {
+            kind: b'o', class, ..
+        } => class.symbol_bytes() == Some(expected.as_bytes()),
+        _ => false,
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Message101Role {
     FirstLine,
@@ -1029,7 +1039,14 @@ impl RpgMakerVxaPlugin {
     /// splices change command indices or wrapping widths.
     fn extract_root(filename: &str, root: &MarshalValue, path: &Path) -> Extraction {
         let stem = strip_marshal_ext(filename).to_lowercase();
-        if stem == "system" && filename.ends_with(".rvdata2") {
+        // Only a real RPG::System root carries UI terms. Any other root (for
+        // example a placeholder or a non-VX Ace file with this name) keeps the
+        // pre-System behaviour: no rows and a complete extraction, so it never
+        // switches the whole project refresh to the non-deleting partial merge.
+        if stem == "system"
+            && filename.ends_with(".rvdata2")
+            && marshal_has_class(root, "RPG::System")
+        {
             return match Self::system_text_fields(root) {
                 Ok(fields) => Extraction {
                     complete: true,
@@ -1075,13 +1092,7 @@ impl RpgMakerVxaPlugin {
     /// Validate the whole layout before publishing any rows. An incomplete
     /// System extraction must not authorize removing previously saved entries.
     fn system_text_fields(root: &MarshalValue) -> std::result::Result<Vec<(String, &str)>, String> {
-        let has_class = |value: &MarshalValue, expected: &str| match value.value() {
-            MarshalValue::Object { class, .. } => class == expected,
-            MarshalValue::OrderedObject {
-                kind: b'o', class, ..
-            } => class.symbol_bytes() == Some(expected.as_bytes()),
-            _ => false,
-        };
+        let has_class = marshal_has_class;
         if !has_class(root, "RPG::System") {
             return Err("root: expected RPG::System object".into());
         }
@@ -2377,13 +2388,22 @@ mod tests {
 
     #[test]
     fn test_system_vxa_diagnoses_unexpected_objects() {
-        assert_invalid_system(&MarshalValue::Nil, "RPG::System");
-        assert_invalid_system(&MarshalValue::Array(vec![]), "RPG::System");
+        // A root that is not RPG::System is not a VX Ace System file: it keeps
+        // the pre-System behaviour (no rows, complete, no warning).
         let mut wrong_class = system_fixture();
         if let MarshalValue::Object { class, .. } = &mut wrong_class {
             *class = "Custom::System".into();
         }
-        assert_invalid_system(&wrong_class, "RPG::System");
+        for root in [MarshalValue::Nil, MarshalValue::Array(vec![]), wrong_class] {
+            let dir = write_system_fixture("System.rvdata2", &root);
+            let extraction = RpgMakerVxaPlugin::new()
+                .extract_with_diagnostics(dir.path())
+                .unwrap();
+            assert!(extraction.complete, "{:?}", extraction.warnings);
+            assert!(extraction.warnings.is_empty());
+            assert!(extraction.entries.is_empty());
+        }
+        // A real RPG::System with a malformed @terms still reports a diagnostic.
         for invalid in [
             MarshalValue::Nil,
             MarshalValue::Array(vec![]),
@@ -2421,6 +2441,22 @@ mod tests {
         assert_eq!(report.strings_written, 0);
         assert_eq!(report.strings_skipped, 1);
         assert_eq!(fs::read(path).unwrap(), original);
+    }
+
+    #[test]
+    fn test_system_vxa_non_system_root_stays_complete_without_rows() {
+        // The RGSS oracle ships a placeholder System.rvdata2 (["SYSTEM", 17]).
+        let root = MarshalValue::Array(vec![
+            MarshalValue::Str("SYSTEM".into()),
+            MarshalValue::Int(17),
+        ]);
+        let dir = write_system_fixture("System.rvdata2", &root);
+        let extraction = RpgMakerVxaPlugin::new()
+            .extract_with_diagnostics(dir.path())
+            .unwrap();
+        assert!(extraction.complete, "{:?}", extraction.warnings);
+        assert!(extraction.warnings.is_empty());
+        assert!(extraction.entries.is_empty());
     }
 
     #[test]
