@@ -37,6 +37,15 @@ pub enum LocustError {
     #[error("provider error: {0}")]
     ProviderError(String),
 
+    /// A rejected provider answer can still carry a billable batch receipt.
+    /// Display delegates to the original error so diagnostics stay unchanged.
+    #[error("{error}")]
+    ProviderErrorWithUsage {
+        #[source]
+        error: Box<LocustError>,
+        usage: Box<crate::models::TranslationResult>,
+    },
+
     #[error("provider not configured: {0}")]
     ProviderNotConfigured(String),
 
@@ -96,6 +105,37 @@ pub enum LocustError {
 
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+impl LocustError {
+    /// Attach usage independently of whether any translation can be accepted.
+    pub fn with_usage(self, usage: crate::models::TranslationResult) -> Self {
+        Self::ProviderErrorWithUsage {
+            error: Box::new(self),
+            usage: Box::new(usage),
+        }
+    }
+
+    pub fn usage(&self) -> Option<&crate::models::TranslationResult> {
+        match self {
+            Self::ProviderErrorWithUsage { usage, .. } => Some(usage),
+            _ => None,
+        }
+    }
+
+    pub fn usage_mut(&mut self) -> Option<&mut crate::models::TranslationResult> {
+        match self {
+            Self::ProviderErrorWithUsage { usage, .. } => Some(usage),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn without_usage(self) -> Self {
+        match self {
+            Self::ProviderErrorWithUsage { error, .. } => *error,
+            other => other,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, LocustError>;

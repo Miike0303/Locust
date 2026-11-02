@@ -194,6 +194,7 @@ pub fn is_retryable(e: &LocustError) -> bool {
                 || lower.contains("network")
                 || lower.contains("dns")
         }
+        LocustError::ProviderErrorWithUsage { error, .. } => is_retryable(error),
         LocustError::IoError(_) => true,
         _ => false,
     }

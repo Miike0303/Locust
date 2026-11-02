@@ -284,34 +284,6 @@ impl TranslationProvider for OpenAiProvider {
             ))
         })?;
 
-        let content = chat_resp
-            .choices
-            .first()
-            .map(|c| c.message.content.as_str())
-            .unwrap_or("[]");
-
-        let translations = parse_json_array(content).map_err(|error| {
-            LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
-                &error,
-                &[&self.api_key],
-            ))
-        })?;
-
-        // A count mismatch would silently shift every translation onto the
-        // wrong entry via zip; discard the whole batch instead.
-        if translations.len() != requests.len() {
-            return Err(LocustError::ProviderError(
-                crate::error_sanitizer::sanitize_provider_error(
-                    &format!(
-                        "translation count mismatch: sent {} strings, got {} back",
-                        requests.len(),
-                        translations.len()
-                    ),
-                    &[&self.api_key],
-                ),
-            ));
-        }
-
         let usage = chat_resp.usage.as_ref();
         let tokens_used = usage.map(|u| u.total_tokens);
         let input_tokens = usage.map(|u| u.prompt_tokens);
@@ -322,6 +294,48 @@ impl TranslationProvider for OpenAiProvider {
                     / 1000.0
             })
         });
+
+        let rejected_usage = usage.map(|_| TranslationResult {
+            entry_id: String::new(),
+            translation: String::new(),
+            detected_source_lang: None,
+            provider: self.id.clone(),
+            tokens_used,
+            input_tokens,
+            output_tokens,
+            cost_usd,
+        });
+        let rejection = |error: LocustError| match &rejected_usage {
+            Some(usage) => error.with_usage(usage.clone()),
+            None => error,
+        };
+
+        let content = chat_resp
+            .choices
+            .first()
+            .map(|c| c.message.content.as_str())
+            .unwrap_or("[]");
+
+        let translations = parse_json_array(content).map_err(|error| {
+            rejection(LocustError::ProviderError(
+                crate::error_sanitizer::sanitize_provider_error(&error, &[&self.api_key]),
+            ))
+        })?;
+
+        // A count mismatch would silently shift every translation onto the
+        // wrong entry via zip; discard the whole batch instead.
+        if translations.len() != requests.len() {
+            return Err(rejection(LocustError::ProviderError(
+                crate::error_sanitizer::sanitize_provider_error(
+                    &format!(
+                        "translation count mismatch: sent {} strings, got {} back",
+                        requests.len(),
+                        translations.len()
+                    ),
+                    &[&self.api_key],
+                ),
+            )));
+        }
 
         // Usage is batch-level; attach it to the first result only so that
         // summing across results yields the true totals.
@@ -700,5 +714,49 @@ mod tests {
 
         let provider = make_provider(&server);
         assert!(provider.health_check().await.is_err());
+    }
+    #[tokio::test]
+    async fn w8_rejected_answers_carry_usage() {
+        for (content, message) in [
+            (
+                "[\"Hola\"]",
+                "translation count mismatch: sent 2 strings, got 1 back",
+            ),
+            (
+                "not a JSON array",
+                "could not parse JSON array from response: not a JSON array",
+            ),
+            (
+                "[\"Hola\", 7]",
+                "could not parse JSON array from response: [\"Hola\", 7]",
+            ),
+        ] {
+            let server = MockServer::start();
+            let wire = server.mock(|when, then| {
+                when.method(POST).path("/v1/chat/completions");
+                then.status(200).json_body(serde_json::json!({
+                    "choices": [{"message": {"content": content}}], "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120}
+                }));
+            });
+            let request = make_request(None, None);
+            let error = make_provider(&server)
+                .translate(&[request.clone(), request])
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), format!("provider error: {message}"));
+            let receipt = error
+                .usage()
+                .expect("rejected answer must retain its usage");
+            assert_eq!(
+                (
+                    receipt.input_tokens,
+                    receipt.output_tokens,
+                    receipt.tokens_used
+                ),
+                (Some(100), Some(20), Some(120))
+            );
+            assert!((receipt.cost_usd.unwrap() - 0.000027).abs() < 1e-12);
+            wire.assert_hits(1);
+        }
     }
 }

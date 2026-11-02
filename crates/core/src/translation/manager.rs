@@ -26,7 +26,146 @@ use super::protection::{
     MAX_PROTECTED_CONTROL_REPAIRS,
 };
 use super::provider::{TranslationOptions, TranslationProvider};
-use super::retry::{call_provider, ProviderCall, RetryConfig};
+use super::retry::{ProviderCall, RetryConfig};
+
+/// Receipts are collected at the attempt boundary, before retry can discard
+/// an error. They never enter the translation vector or its ID validation.
+#[derive(Default)]
+struct CallUsage {
+    cost: ObservedCost,
+    tokens: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    failed_outcomes: usize,
+    active: bool,
+}
+
+impl CallUsage {
+    fn observe<'a>(&mut self, receipts: impl Iterator<Item = &'a TranslationResult>, free: bool) {
+        let mut cost = ObservedCost::default();
+        cost.observe_batch(
+            receipts.map(|receipt| {
+                self.tokens += u64::from(receipt.tokens_used.unwrap_or(0));
+                self.input_tokens += u64::from(receipt.input_tokens.unwrap_or(0));
+                self.output_tokens += u64::from(receipt.output_tokens.unwrap_or(0));
+                receipt.cost_usd
+            }),
+            free,
+        );
+        self.cost.add(cost);
+    }
+
+    fn reject(&mut self, error: LocustError, free: bool) -> LocustError {
+        self.failed_outcomes += 1;
+        match error.usage() {
+            Some(receipt) => self.observe(std::iter::once(receipt), free),
+            None => self.cost.complete &= free,
+        }
+        // Preserve the retry classifier's original error type and message.
+        error.without_usage()
+    }
+
+    fn record(&self, cost: &mut ObservedCost, tokens: &mut u64, input: &mut u64, output: &mut u64) {
+        cost.add(self.cost);
+        *tokens += self.tokens;
+        *input += self.input_tokens;
+        *output += self.output_tokens;
+    }
+}
+
+/// Private to dispatch: retry only uses identity, translate and partial translate.
+/// Keeping the observer here also covers every manager repair and drain path.
+struct UsageProvider {
+    provider: Arc<dyn TranslationProvider>,
+    usage: Arc<std::sync::Mutex<CallUsage>>,
+}
+
+#[async_trait::async_trait]
+impl TranslationProvider for UsageProvider {
+    fn id(&self) -> &str {
+        self.provider.id()
+    }
+    fn name(&self) -> &str {
+        self.provider.name()
+    }
+    fn is_free(&self) -> bool {
+        self.provider.is_free()
+    }
+    fn requires_api_key(&self) -> bool {
+        self.provider.requires_api_key()
+    }
+
+    async fn translate(&self, requests: &[TranslationRequest]) -> Result<Vec<TranslationResult>> {
+        self.usage.lock().unwrap().active = true;
+        let outcome = self.provider.translate(requests).await;
+        let mut usage = self.usage.lock().unwrap();
+        usage.active = false;
+        outcome.map_err(|error| usage.reject(error, self.is_free()))
+    }
+
+    async fn translate_partial(
+        &self,
+        requests: &[TranslationRequest],
+        successes: &mut Vec<TranslationResult>,
+    ) -> Option<Vec<(String, LocustError)>> {
+        self.usage.lock().unwrap().active = true;
+        let outcome = self.provider.translate_partial(requests, successes).await;
+        let mut usage = self.usage.lock().unwrap();
+        usage.active = false;
+        outcome.map(|failures| {
+            failures
+                .into_iter()
+                .map(|(id, error)| (id, usage.reject(error, self.is_free())))
+                .collect()
+        })
+    }
+
+    async fn estimate_cost(&self, chars: usize, target: &str) -> Option<f64> {
+        self.provider.estimate_cost(chars, target).await
+    }
+    async fn health_check(&self) -> Result<()> {
+        self.provider.health_check().await
+    }
+}
+
+async fn call_provider(
+    provider: Arc<dyn TranslationProvider>,
+    requests: &[TranslationRequest],
+    retry: &RetryConfig,
+    cancel: &CancellationToken,
+) -> std::result::Result<(ProviderCall, CallUsage), (LocustError, CallUsage)> {
+    let free = provider.is_free();
+    let usage = Arc::new(std::sync::Mutex::new(CallUsage::default()));
+    let observed = Arc::new(UsageProvider {
+        provider,
+        usage: usage.clone(),
+    });
+    let outcome = super::retry::call_provider(observed, requests, retry, cancel).await;
+    let mut usage = std::mem::take(&mut *usage.lock().unwrap());
+    // A dropped in-flight future can have an unreported server-side charge.
+    if usage.active {
+        usage.cost.complete &= free;
+    }
+    match outcome {
+        Ok(call) => {
+            tracing::debug!(attempts = call.attempts, "collected provider call usage");
+            // An invalid partial partition can omit additional billable work.
+            if call.error.is_some() {
+                usage.cost.complete &= free;
+            }
+            if call.reported_usage().next().is_some() || usage.failed_outcomes == 0 {
+                usage.observe(call.reported_usage(), free);
+            }
+            Ok((call, usage))
+        }
+        Err(error) => {
+            if usage.failed_outcomes == 0 {
+                usage.cost.complete &= free;
+            }
+            Err((error, usage))
+        }
+    }
+}
 
 /// One immutable snapshot per job, also shared by all fallback passes.
 struct CharacterNotes(SpeakerNotes);
@@ -646,37 +785,25 @@ impl TranslationManager {
                             )
                             .await
                             {
-                                Ok(retry_call) => {
+                                Ok((retry_call, usage)) => {
                                     let ProviderCall {
                                         mut results,
-                                        attempts: transport_attempts,
-                                        rejected_results,
                                         failed_ids,
                                         partial,
                                         ..
                                     } = retry_call;
                                     acc.retain_on_cancel |= partial;
-                                    observed_cost.observe_batch(
-                                        results.iter().chain(&rejected_results).map(|r| r.cost_usd),
-                                        self.provider.is_free(),
+                                    usage.record(
+                                        observed_cost,
+                                        total_tokens,
+                                        total_input_tokens,
+                                        total_output_tokens,
                                     );
-                                    if (transport_attempts > 1 || !failed_ids.is_empty())
-                                        && !self.provider.is_free()
-                                    {
-                                        observed_cost.complete = false;
-                                    }
                                     if budget_error.is_none() {
                                         *budget_error = observed_budget_error(
                                             *observed_cost,
                                             opts.cost_limit_usd,
                                         );
-                                    }
-                                    for usage in results.iter().chain(&rejected_results) {
-                                        *total_tokens += usage.tokens_used.unwrap_or(0) as u64;
-                                        *total_input_tokens +=
-                                            usage.input_tokens.unwrap_or(0) as u64;
-                                        *total_output_tokens +=
-                                            usage.output_tokens.unwrap_or(0) as u64;
                                     }
                                     let expected: HashSet<_> =
                                         retry_reqs.iter().map(|r| r.entry_id.as_str()).collect();
@@ -721,8 +848,13 @@ impl TranslationManager {
                                         acc.results.insert(result.entry_id.clone(), result.clone());
                                     }
                                 }
-                                Err(_) => {
-                                    observed_cost.complete &= self.provider.is_free();
+                                Err((_, usage)) => {
+                                    usage.record(
+                                        observed_cost,
+                                        total_tokens,
+                                        total_input_tokens,
+                                        total_output_tokens,
+                                    );
                                     if budget_error.is_none() {
                                         *budget_error = observed_budget_error(
                                             *observed_cost,
@@ -1134,7 +1266,7 @@ impl TranslationManager {
             Vec<TranslationRequest>,
             std::collections::HashMap<String, RecordProtection>,
             std::collections::HashMap<String, SlotBudget>,
-            Result<ProviderCall>,
+            std::result::Result<(ProviderCall, CallUsage), (LocustError, CallUsage)>,
         );
         let mut in_flight: tokio::task::JoinSet<BatchOutcome> = tokio::task::JoinSet::new();
         // Group across the entire pending run, before batching/concurrency.
@@ -1347,33 +1479,25 @@ impl TranslationManager {
             };
 
             match batch_result {
-                Ok(call) => {
+                Ok((call, usage)) => {
                     let ProviderCall {
                         mut results,
-                        attempts,
                         failed_ids,
                         partial,
-                        rejected_results,
                         error,
+                        ..
                     } = call;
-                    observed_cost.observe_batch(
-                        results.iter().chain(&rejected_results).map(|r| r.cost_usd),
-                        self.provider.is_free(),
+                    usage.record(
+                        &mut observed_cost,
+                        &mut total_tokens,
+                        &mut total_input_tokens,
+                        &mut total_output_tokens,
                     );
-                    if (attempts > 1 || !failed_ids.is_empty()) && !self.provider.is_free() {
-                        // Failed paid attempts may have unreported remote charges.
-                        observed_cost.complete = false;
-                    }
                     if budget_error.is_none() {
                         budget_error = observed_budget_error(observed_cost, opts.cost_limit_usd);
                     }
                     // Account provider work before validation or fan-out,
                     // including malformed/partial responses that cannot save.
-                    for result in results.iter().chain(&rejected_results) {
-                        total_tokens += result.tokens_used.unwrap_or(0) as u64;
-                        total_input_tokens += result.input_tokens.unwrap_or(0) as u64;
-                        total_output_tokens += result.output_tokens.unwrap_or(0) as u64;
-                    }
                     if let Some(error) = error {
                         let _ = tx
                             .send(ProgressEvent::BatchFailed {
@@ -1490,27 +1614,17 @@ impl TranslationManager {
                             )
                             .await
                             {
-                                Ok(call) => {
+                                Ok((call, usage)) => {
                                     // Billing precedes ID/content acceptance, even for a
                                     // malformed retry or a response cancelled before saving.
-                                    observed_cost.observe_batch(
-                                        call.reported_usage().map(|r| r.cost_usd),
-                                        self.provider.is_free(),
+                                    usage.record(
+                                        &mut observed_cost,
+                                        &mut total_tokens,
+                                        &mut total_input_tokens,
+                                        &mut total_output_tokens,
                                     );
-                                    if (call.attempts > 1 || !call.failed_ids.is_empty())
-                                        && !self.provider.is_free()
-                                    {
-                                        observed_cost.complete = false;
-                                    }
                                     budget_error =
                                         observed_budget_error(observed_cost, opts.cost_limit_usd);
-                                    for usage in call.reported_usage() {
-                                        total_tokens += usage.tokens_used.unwrap_or(0) as u64;
-                                        total_input_tokens +=
-                                            usage.input_tokens.unwrap_or(0) as u64;
-                                        total_output_tokens +=
-                                            usage.output_tokens.unwrap_or(0) as u64;
-                                    }
                                     if cancel.is_cancelled() {
                                         break;
                                     }
@@ -1552,8 +1666,13 @@ impl TranslationManager {
                                     invalid_controls.remove(&result.entry_id);
                                     break;
                                 }
-                                Err(error) => {
-                                    observed_cost.complete &= self.provider.is_free();
+                                Err((error, usage)) => {
+                                    usage.record(
+                                        &mut observed_cost,
+                                        &mut total_tokens,
+                                        &mut total_input_tokens,
+                                        &mut total_output_tokens,
+                                    );
                                     budget_error =
                                         observed_budget_error(observed_cost, opts.cost_limit_usd);
                                     tracing::warn!(entry_id = %result.entry_id, %error, "protected-control repair failed; entry remains pending");
@@ -1644,26 +1763,17 @@ impl TranslationManager {
                             )
                             .await
                             {
-                                Ok(retry_call) => {
+                                Ok((retry_call, usage)) => {
                                     let ProviderCall {
                                         results: mut retry_batch,
-                                        attempts,
-                                        rejected_results,
-                                        failed_ids,
                                         ..
                                     } = retry_call;
-                                    observed_cost.observe_batch(
-                                        retry_batch
-                                            .iter()
-                                            .chain(&rejected_results)
-                                            .map(|r| r.cost_usd),
-                                        self.provider.is_free(),
+                                    usage.record(
+                                        &mut observed_cost,
+                                        &mut total_tokens,
+                                        &mut total_input_tokens,
+                                        &mut total_output_tokens,
                                     );
-                                    if (attempts > 1 || !failed_ids.is_empty())
-                                        && !self.provider.is_free()
-                                    {
-                                        observed_cost.complete = false;
-                                    }
                                     if budget_error.is_none() {
                                         budget_error = observed_budget_error(
                                             observed_cost,
@@ -1672,13 +1782,6 @@ impl TranslationManager {
                                     }
                                     // Account every returned retry result, even when its IDs
                                     // are invalid. The original result retains original usage.
-                                    for usage in retry_batch.iter().chain(&rejected_results) {
-                                        total_tokens += usage.tokens_used.unwrap_or(0) as u64;
-                                        total_input_tokens +=
-                                            usage.input_tokens.unwrap_or(0) as u64;
-                                        total_output_tokens +=
-                                            usage.output_tokens.unwrap_or(0) as u64;
-                                    }
                                     if retry_batch.len() != 1
                                         || retry_batch[0].entry_id != result.entry_id
                                     {
@@ -1749,8 +1852,13 @@ impl TranslationManager {
                                         "length-aware retry still oversize"
                                     );
                                 }
-                                Err(e) => {
-                                    observed_cost.complete &= self.provider.is_free();
+                                Err((e, usage)) => {
+                                    usage.record(
+                                        &mut observed_cost,
+                                        &mut total_tokens,
+                                        &mut total_input_tokens,
+                                        &mut total_output_tokens,
+                                    );
                                     if budget_error.is_none() {
                                         budget_error = observed_budget_error(
                                             observed_cost,
@@ -1958,14 +2066,19 @@ impl TranslationManager {
                         break;
                     }
                 }
-                Err(e) => {
+                Err((e, usage)) => {
                     let _ = tx
                         .send(ProgressEvent::BatchFailed {
                             entry_id: None,
                             error: e.to_string(),
                         })
                         .await;
-                    observed_cost.complete &= self.provider.is_free();
+                    usage.record(
+                        &mut observed_cost,
+                        &mut total_tokens,
+                        &mut total_input_tokens,
+                        &mut total_output_tokens,
+                    );
                     if budget_error.is_none() {
                         budget_error = observed_budget_error(observed_cost, opts.cost_limit_usd);
                     }
@@ -1998,21 +2111,21 @@ impl TranslationManager {
         if model_allowance.is_some() {
             while let Some(joined) = in_flight.join_next().await {
                 match joined {
-                    Ok((_, _, _, Ok(call))) => {
-                        observed_cost.observe_batch(
-                            call.reported_usage().map(|r| r.cost_usd),
-                            self.provider.is_free(),
+                    Ok((_, _, _, Ok((_, usage)))) => {
+                        usage.record(
+                            &mut observed_cost,
+                            &mut total_tokens,
+                            &mut total_input_tokens,
+                            &mut total_output_tokens,
                         );
-                        if (call.attempts > 1 || !call.failed_ids.is_empty())
-                            && !self.provider.is_free()
-                        {
-                            observed_cost.complete = false;
-                        }
-                        for result in call.reported_usage() {
-                            total_tokens += result.tokens_used.unwrap_or(0) as u64;
-                            total_input_tokens += result.input_tokens.unwrap_or(0) as u64;
-                            total_output_tokens += result.output_tokens.unwrap_or(0) as u64;
-                        }
+                    }
+                    Ok((_, _, _, Err((_, usage)))) => {
+                        usage.record(
+                            &mut observed_cost,
+                            &mut total_tokens,
+                            &mut total_input_tokens,
+                            &mut total_output_tokens,
+                        );
                     }
                     _ => observed_cost.complete &= self.provider.is_free(),
                 }

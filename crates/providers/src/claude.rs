@@ -139,6 +139,28 @@ impl TranslationProvider for ClaudeProvider {
             ))
         })?;
 
+        let usage = claude_resp.usage.as_ref();
+        let tokens_used = usage.map(|u| u.input_tokens + u.output_tokens);
+        let input_tokens = usage.map(|u| u.input_tokens);
+        let output_tokens = usage.map(|u| u.output_tokens);
+        let cost_usd = usage
+            .map(|u| (u.input_tokens as f64 * 0.00025 + u.output_tokens as f64 * 0.00125) / 1000.0);
+
+        let rejected_usage = usage.map(|_| TranslationResult {
+            entry_id: String::new(),
+            translation: String::new(),
+            detected_source_lang: None,
+            provider: "claude".to_string(),
+            tokens_used,
+            input_tokens,
+            output_tokens,
+            cost_usd,
+        });
+        let rejection = |error: LocustError| match &rejected_usage {
+            Some(usage) => error.with_usage(usage.clone()),
+            None => error,
+        };
+
         let content = claude_resp
             .content
             .first()
@@ -146,16 +168,15 @@ impl TranslationProvider for ClaudeProvider {
             .unwrap_or("[]");
 
         let translations = parse_json_array(content).map_err(|error| {
-            LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
-                &error,
-                &[&self.api_key],
+            rejection(LocustError::ProviderError(
+                crate::error_sanitizer::sanitize_provider_error(&error, &[&self.api_key]),
             ))
         })?;
 
         // A count mismatch would silently shift every translation onto the
         // wrong entry via zip; discard the whole batch instead.
         if translations.len() != requests.len() {
-            return Err(LocustError::ProviderError(
+            return Err(rejection(LocustError::ProviderError(
                 crate::error_sanitizer::sanitize_provider_error(
                     &format!(
                         "translation count mismatch: sent {} strings, got {} back",
@@ -164,15 +185,8 @@ impl TranslationProvider for ClaudeProvider {
                     ),
                     &[&self.api_key],
                 ),
-            ));
+            )));
         }
-
-        let usage = claude_resp.usage.as_ref();
-        let tokens_used = usage.map(|u| u.input_tokens + u.output_tokens);
-        let input_tokens = usage.map(|u| u.input_tokens);
-        let output_tokens = usage.map(|u| u.output_tokens);
-        let cost_usd = usage
-            .map(|u| (u.input_tokens as f64 * 0.00025 + u.output_tokens as f64 * 0.00125) / 1000.0);
 
         // Usage is batch-level; attach it to the first result only so that
         // summing across results yields the true totals.
@@ -346,5 +360,56 @@ mod tests {
             c,
             expected
         );
+    }
+    #[tokio::test]
+    async fn w8_rejected_answers_carry_usage() {
+        for (content, message) in [
+            (
+                "[\"Hola\"]",
+                "translation count mismatch: sent 2 strings, got 1 back",
+            ),
+            (
+                "not a JSON array",
+                "could not parse JSON array from response: not a JSON array",
+            ),
+            (
+                "[\"Hola\", 7]",
+                "could not parse JSON array from response: [\"Hola\", 7]",
+            ),
+        ] {
+            let server = MockServer::start();
+            let wire = server.mock(|when, then| {
+                when.method(POST).path("/v1/messages");
+                then.status(200).json_body(serde_json::json!({
+                    "content": [{"text": content}], "usage": {"input_tokens": 100, "output_tokens": 20}
+                }));
+            });
+            let request = TranslationRequest {
+                entry_id: "one".into(),
+                source: "Hello".into(),
+                source_lang: "en".into(),
+                target_lang: "es".into(),
+                context: None,
+                glossary_hint: None,
+            };
+            let error = make_provider(&server)
+                .translate(&[request.clone(), request])
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), format!("provider error: {message}"));
+            let receipt = error
+                .usage()
+                .expect("rejected answer must retain its usage");
+            assert_eq!(
+                (
+                    receipt.input_tokens,
+                    receipt.output_tokens,
+                    receipt.tokens_used
+                ),
+                (Some(100), Some(20), Some(120))
+            );
+            assert!((receipt.cost_usd.unwrap() - 0.00005).abs() < 1e-12);
+            wire.assert_hits(1);
+        }
     }
 }

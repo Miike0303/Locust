@@ -65,7 +65,19 @@ impl TranslationProvider for ConfiguredProvider {
         self.provider.supported_languages()
     }
     async fn translate(&self, requests: &[TranslationRequest]) -> Result<Vec<TranslationResult>> {
-        let mut results = self.provider.translate(requests).await?;
+        let mut results = self
+            .provider
+            .translate(requests)
+            .await
+            .map_err(|mut error| {
+                if let (Some((input, output)), Some(usage)) = (self.prices(), error.usage_mut()) {
+                    usage.cost_usd = usage
+                        .input_tokens
+                        .zip(usage.output_tokens)
+                        .map(|(i, o)| (f64::from(i) * input + f64::from(o) * output) / 1_000_000.0);
+                }
+                error
+            })?;
         if let Some((input, output)) = self.prices() {
             // Do not infer usage from text or total_tokens. Preserve the adapter's
             // attribution (batch usage is carried only on its first result).
@@ -393,6 +405,58 @@ mod tests {
                     assert_eq!(provider.estimate_cost(100, "es").await, Some(0.0));
                 }
                 wire.assert();
+            }
+        }
+    }
+    #[tokio::test]
+    async fn w8_model_policy_prices_rejected_usage() {
+        for (policy, expected) in [
+            (prices(), 0.00032),
+            (
+                serde_json::json!({"input_usd_per_million": 0, "output_usd_per_million": 0}),
+                0.0,
+            ),
+        ] {
+            for usage in [
+                serde_json::json!(null),
+                serde_json::json!({
+                    "prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120
+                }),
+            ] {
+                let server = MockServer::start();
+                let wire = server.mock(|when, then| {
+                    when.method(POST).path("/v1/chat/completions");
+                    then.status(200).json_body(serde_json::json!({
+                        "choices": [{"message": {"content": "[\"Hola\"]"}}], "usage": usage
+                    }));
+                });
+                let error = configure(openai(&server), &overrides(policy.clone()))
+                    .translate(&requests(2))
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "provider error: translation count mismatch: sent 2 strings, got 1 back"
+                );
+                match error.usage() {
+                    Some(receipt) => {
+                        assert!(!usage.is_null());
+                        assert_eq!(
+                            (
+                                receipt.input_tokens,
+                                receipt.output_tokens,
+                                receipt.tokens_used
+                            ),
+                            (Some(100), Some(20), Some(120))
+                        );
+                        assert!((receipt.cost_usd.unwrap() - expected).abs() < 1e-12);
+                    }
+                    None => assert!(
+                        usage.is_null(),
+                        "rejected usage must reach configured pricing"
+                    ),
+                }
+                wire.assert_hits(1);
             }
         }
     }
