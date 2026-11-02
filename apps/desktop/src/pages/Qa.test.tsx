@@ -8,6 +8,8 @@ import { MemoryRouter } from "react-router-dom";
 import { MutationObserver, QueryClient, QueryClientProvider, type MutationObserverOptions } from "@tanstack/react-query";
 import type { ProjectInfo, StoredValidationIssue, ValidationResponse, ValidationSummary } from "../lib/api.ts";
 import { ApiError } from "../lib/apiError.ts";
+import { useProjectStore } from "../stores/projectStore.ts";
+import { draftProjectKey } from "../lib/projectScope.ts";
 import { setLocale, t } from "../lib/i18n/index.ts";
 
 const fixture: ProjectInfo = { path: "C:\\Games\\Demo", database_path: "C:\\Projects\\demo.db", format_id: "html", name: "Demo" };
@@ -39,11 +41,11 @@ const hooks = registerHooks({
 const { default: Qa } = await import("./Qa.tsx");
 const { getValidationIssues, getValidationSummary, setValidationIssueIgnored } = await import("../lib/api.ts");
 const client = new QueryClient({ defaultOptions: { queries: { retry: false, retryOnMount: false, staleTime: Infinity, gcTime: Infinity } } });
-beforeEach(() => { client.clear(); h.project = null; setLocale("en"); h.runOptions = undefined; h.runObserver = undefined; h.validate = async () => clean; });
-after(() => { client.clear(); hooks.deregister(); Reflect.deleteProperty(globalThis, "__qaTest"); setLocale("en"); });
+beforeEach(() => { useProjectStore.getState().clearProject(); client.clear(); h.project = null; setLocale("en"); h.runOptions = undefined; h.runObserver = undefined; h.validate = async () => clean; });
+after(() => { useProjectStore.getState().clearProject(); client.clear(); hooks.deregister(); Reflect.deleteProperty(globalThis, "__qaTest"); setLocale("en"); });
 
-function render() {
-  return renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(MemoryRouter, {}, createElement(Qa))));
+function render(path = "/qa") {
+  return renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(MemoryRouter, { initialEntries: [path] }, createElement(Qa))));
 }
 function seed(issues: StoredValidationIssue[] = [issue], total = issues.length, summary: ValidationSummary = issues.length ? { EmptyTranslation: { open: 2, ignored: 1 } } : {}) {
   h.project ??= fixture;
@@ -229,4 +231,49 @@ test("QA nonempty summary never gives a clean all-clear for an empty filtered pa
   const html = render();
   assert.ok(html.includes(t("qa.noMatchingIssues")));
   assert.doesNotMatch(html, /text-success/);
+});
+
+
+test("QA kind query initialises the oversized filter and sends it to the issues API", async () => {
+  h.project = fixture;
+  useProjectStore.getState().setProject(fixture);
+  const html = render("/qa?kind=ExceedsBinarySlot");
+  assert.ok(html.includes(`aria-pressed="true">${t("validate.kind.binarySlotLabel")} (0)</button>`));
+  const query = client.getQueryCache().getAll().find(q => q.queryKey[0] === "validation-issues")!;
+  assert.equal(query.queryKey[2], "ExceedsBinarySlot");
+  const originalFetch = globalThis.fetch;
+  const calls: string[] = [];
+  globalThis.fetch = async input => {
+    calls.push(String(input));
+    return new Response(JSON.stringify({ issues: [], total: 0, offset: 0, limit: 50 }));
+  };
+  try {
+    await query.fetch();
+    assert.equal(new URL(calls[0]).searchParams.get("kind"), "ExceedsBinarySlot");
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test("QA ignores unknown and prototype kind query values", () => {
+  h.project = fixture;
+  for (const kind of ["FutureUnknownKind", "toString", "__proto__", ""]) {
+    client.clear();
+    const html = render(`/qa?kind=${kind}`);
+    const query = client.getQueryCache().getAll().find(q => q.queryKey[0] === "validation-issues")!;
+    assert.equal(query.queryKey[2], undefined);
+    assert.ok(html.includes(`aria-pressed="true">${t("qa.all")} (0)</button>`));
+  }
+});
+
+test("QA accepts the current project's filter link and rejects a stale link for another database", () => {
+  h.project = fixture;
+  const path = `/qa?kind=ExceedsBinarySlot&project=${encodeURIComponent(draftProjectKey(fixture))}`;
+  render(path);
+  let queries = client.getQueryCache().getAll().filter(q => q.queryKey[0] === "validation-issues");
+  assert.equal(queries[0].queryKey[2], "ExceedsBinarySlot");
+  h.project = { ...fixture, database_path: "C:\\Projects\\other.db" };
+  render(path);
+  queries = client.getQueryCache().getAll().filter(q => q.queryKey[0] === "validation-issues");
+  assert.equal(queries.length, 2);
+  assert.equal(queries[1].queryKey[1], draftProjectKey(h.project));
+  assert.equal(queries[1].queryKey[2], undefined, "a stale project-scoped link must not filter the current database");
 });

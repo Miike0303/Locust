@@ -251,9 +251,13 @@ function mapProviderFailure(body: string): string | null {
 	return null;
 }
 
+// Owned count-only InjectionError for a refused Replace. Shared with ApiError.key
+// so callers can offer recovery without matching localized prose.
+const BINARY_SLOT_CAPACITY = /^injection error: ([1-9][0-9]*) translation\(s\) exceed known binary slot capacity; Replace is refused before backup or output; run validation and resolve the capacity issues$/;
+
 function mapBody(body: string, originalBody: string): string | null {
 	// Owned count-only InjectionError; do not trim away added lines or accept prose.
-	const capacity = /^injection error: ([1-9][0-9]*) translation\(s\) exceed known binary slot capacity; Replace is refused before backup or output; run validation and resolve the capacity issues$/.exec(originalBody);
+	const capacity = BINARY_SLOT_CAPACITY.exec(originalBody);
 	if (capacity?.[0] === originalBody) {
 		return t("api.error.binarySlotCapacity", { count: capacity[1] });
 	}
@@ -326,6 +330,7 @@ export class ApiError extends Error {
 		const originalBody = raw.replace(/^\d{3}: /, "");
 		this.key = SINGLE_LINE_EXACT[originalBody]
 			?? SPANISH_ONLY_EXACT[originalBody]
-			?? EXACT[parseApiError(raw.trim()).body];
+			?? EXACT[parseApiError(raw.trim()).body]
+			?? (BINARY_SLOT_CAPACITY.test(originalBody) ? "api.error.binarySlotCapacity" : undefined);
 	}
 }

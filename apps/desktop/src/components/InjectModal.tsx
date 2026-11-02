@@ -51,7 +51,7 @@ import {
 	modalPanelClass,
 } from "../lib/modalA11y";
 import { operationalShortcutTarget } from "../lib/settingsNav";
-import { useT } from "../lib/i18n";
+import { useT, type TranslateKey } from "../lib/i18n";
 
 const INJECT_LANG_KEY = "locust.inject.langs";
 
@@ -114,6 +114,7 @@ export default function InjectModal({
 	const [outputDir, setOutputDir] = useState("");
 	const [loading, setLoading] = useState(false);
 	const [result, setResult] = useState<NativeInjectReport | null>(null);
+	const [capacityRecovery, setCapacityRecovery] = useState<{ projectKey: string; message: string } | null>(null);
 	const [regLoading, setRegLoading] = useState(false);
 	const [regReports, setRegReports] = useState<
 		{ lang: string; label: string; report: RegisterLangReport }[]
@@ -123,6 +124,7 @@ export default function InjectModal({
 	useEffect(() => {
 		if (!open && !loading && !regLoading) {
 			setResult(null);
+			setCapacityRecovery(null);
 			setRegReports([]);
 		}
 	}, [open, loading, regLoading]);
@@ -272,11 +274,13 @@ export default function InjectModal({
 
 		setLoading(true);
 		setResult(null);
+		setCapacityRecovery(null);
 		try {
 			try {
 				const pre = await validate();
 				const binary = pre.validation.by_kind?.ExceedsBinarySlot ?? 0;
 				if (binary > 0) {
+					setCapacityRecovery({ projectKey: draftProjectKey(project), message: t("inject.toast.binarySlots", { count: binary }) });
 					addToast(
 						"warning",
 						t("inject.toast.binarySlots", { count: binary }),
@@ -371,6 +375,9 @@ export default function InjectModal({
 			}
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : String(err);
+			if (err instanceof ApiError && err.key === "api.error.binarySlotCapacity") {
+				setCapacityRecovery({ projectKey: draftProjectKey(project), message: msg });
+			}
 			// Keep this newly localized refusal's diagnostic raw without changing other families.
 			const detail = err instanceof ApiError && err.key === "api.error.yurisEncodingRefused"
 				? err.raw : msg;
@@ -379,6 +386,14 @@ export default function InjectModal({
 		} finally {
 			setLoading(false);
 		}
+	};
+
+	const reviewOversized = () => {
+		const currentProject = useProjectStore.getState().project;
+		if (!capacityRecovery || !currentProject || draftProjectKey(currentProject) !== capacityRecovery.projectKey) return;
+		const search = new URLSearchParams({ kind: "ExceedsBinarySlot", project: capacityRecovery.projectKey });
+		onClose();
+		navigate(`/qa?${search}`);
 	};
 
 	const gameName =
@@ -848,6 +863,18 @@ export default function InjectModal({
 							</div>
 						)}
 
+					</div>
+				)}
+				{capacityRecovery?.projectKey === draftProjectKey(project) && (
+					<div role="status" className="mx-6 mb-4 shrink-0 rounded border border-warning bg-warning-muted p-3 text-body text-warning space-y-2">
+						<p>{capacityRecovery.message}</p>
+						<button
+							type="button"
+							onClick={reviewOversized}
+							className="font-medium underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg"
+						>
+							{t("inject.reviewOversized" as TranslateKey)}
+						</button>
 					</div>
 				)}
 				<footer className={MODAL_FOOTER_CLASS}>

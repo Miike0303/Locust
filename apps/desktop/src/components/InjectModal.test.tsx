@@ -14,6 +14,7 @@ const h = {
   setTauri: (_value: boolean) => {},
   effects: [] as (() => void)[], changed: false,
   toasts: [] as unknown[][], logs: [] as unknown[][],
+  navigations: [] as string[], closeCalls: 0,
   effect(callback: () => void, deps: unknown[]) {
     const index = this.cursor++;
     const previous = this.values[index] as unknown[] | undefined;
@@ -48,9 +49,9 @@ const hooks = registerHooks({
     if (context.parentURL?.endsWith("/components/InjectModal.tsx")) {
       const stubs: Record<string, string> = {
         react: `const h=globalThis.__injectModal;export const useState=initial=>h.state(initial);export const useMemo=fn=>fn();export const useEffect=(fn,deps)=>h.effect(fn,deps);export const useSyncExternalStore=(_subscribe,read)=>read();`,
-        "react-router-dom": `export const useNavigate=()=>()=>{};`,
+        "react-router-dom": `export const useNavigate=()=>path=>globalThis.__injectModal.navigations.push(path);`,
         "../lib/i18n": `export const useT=()=>globalThis.__injectModal.t;`,
-        "../stores/projectStore": `export const useProjectStore=()=>({project:globalThis.__injectModal.project});`,
+        "../stores/projectStore": `export const useProjectStore=Object.assign(()=>({project:globalThis.__injectModal.project}),{getState:()=>({project:globalThis.__injectModal.project})});`,
         "../stores/toastStore": `export const addToast=(...args)=>globalThis.__injectModal.toasts.push(args);`,
         "../stores/logStore": `export const addLog=(...args)=>globalThis.__injectModal.logs.push(args);`,
         "../lib/modalA11y": `const h=globalThis.__injectModal;
@@ -71,13 +72,16 @@ const storage = new Map<string, string>();
 const windowDescriptor = Object.getOwnPropertyDescriptor(globalThis, "window");
 const storageDescriptor = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
 let stringsWritten = 3;
+let binaryCount = 0;
+let injectGate: Promise<void> | undefined;
 let injectFailure: string | Error | undefined;
 const originalFetch = globalThis.fetch;
 Object.defineProperty(globalThis, "window", { configurable: true, value: {
   addEventListener() {},
   __TAURI_INTERNALS__: { invoke: async (command: string, args: any) => {
     calls.push({ command, params: args?.params });
-    if (command === "run_validation") return { validation: { by_kind: {} } };
+    if (command === "run_validation") return { validation: { by_kind: { ExceedsBinarySlot: binaryCount } } };
+    if (command === "run_inject") await injectGate;
     if (command === "get_server_port") return 7842;
     if (command === "run_inject" && injectFailure !== undefined) throw injectFailure;
     if (command === "run_inject") return {
@@ -124,10 +128,10 @@ function text(node: any): string {
   if (Array.isArray(node)) return node.map(text).join("");
   return node && typeof node === "object" ? text(node.props?.children) : "";
 }
-function render() {
+function render(open = true) {
   for (let attempt = 0; attempt < 10; attempt++) {
     h.cursor = 0; h.effects = []; h.changed = false;
-    const tree = InjectModal({ open: true, onClose() {} });
+    const tree = InjectModal({ open, onClose() { h.closeCalls++; } });
     h.effects.forEach(effect => effect());
     if (!h.changed) return tree;
   }
@@ -152,7 +156,8 @@ function selectMode(mode: "add" | "direct" | "replace") {
 }
 function reset(locale: "en" | "es", mode: "add" | "direct" | "replace", autoRegister = true) {
   storage.clear();
-  injectFailure = undefined;
+  injectFailure = undefined; binaryCount = 0; injectGate = undefined;
+  h.navigations = []; h.closeCalls = 0;
   globalThis.fetch = originalFetch;
   h.setTauri(true);
   storage.set("locust.inject.autoRegister", autoRegister ? "1" : "0");
@@ -296,6 +301,68 @@ for (const locale of ["en", "es"] as const) {
   });
 }
 
+const reviewOversizedLabel = () => t("inject.reviewOversized" as Parameters<typeof t>[0]);
+function capacityPanel() {
+  const dialog = nodes(render()).find(node => node.props?.role === "dialog");
+  return nodes(dialog).find(node => node.props?.role === "status" && nodes(node).some(child => child.type === "button" && text(child) === reviewOversizedLabel()));
+}
+function reviewOversized() {
+  const panel = capacityPanel();
+  assert.ok(panel, "oversized strings need persistent inline recovery");
+  assert.ok(nodes(render()).find(node => node.props?.role === "dialog"), "recovery belongs inside the modal");
+  return nodes(panel).find(node => node.type === "button" && text(node) === reviewOversizedLabel());
+}
+
+for (const locale of ["en", "es"] as const) {
+  test(`${locale} oversized preflight persists inline during injection and after success, then navigates to scoped QA`, async () => {
+    reset(locale, "replace");
+    binaryCount = 3;
+    let release!: () => void;
+    injectGate = new Promise<void>(resolve => { release = resolve; });
+    setOutput("/output");
+    const pending = button(t("inject.copyAction")).props.onClick();
+    try {
+      await new Promise(resolve => setImmediate(resolve));
+      assert.ok(capacityPanel(), "preflight recovery must appear while injection is still pending");
+      assert.ok(text(capacityPanel()).includes(t("inject.toast.binarySlots", { count: 3 })));
+    } finally { release(); await pending; }
+    assert.ok(text(capacityPanel()).includes(t("inject.toast.binarySlots", { count: 3 })), "success must not hide capacity recovery");
+    reviewOversized().props.onClick();
+    assert.equal(h.closeCalls, 1);
+    assert.equal(h.navigations.length, 1);
+    const target = new URL(h.navigations[0], "http://locust");
+    assert.equal(target.pathname, "/qa");
+    assert.equal(target.searchParams.get("kind"), "ExceedsBinarySlot");
+    assert.equal(target.searchParams.get("project"), JSON.stringify([null, h.project.path, h.project.format_id]));
+  });
+
+  test(`${locale} unrelated injection errors retain their toast/log and do not offer capacity recovery`, async () => {
+    reset(locale, "replace");
+    injectFailure = new Error("unrelated failure");
+    setOutput("/output");
+    await button(t("inject.copyAction")).props.onClick();
+    assert.equal(capacityPanel(), undefined);
+    assert.deepEqual(h.toasts, [["error", t("inject.toast.failed", { error: "unrelated failure" })]]);
+    assert.deepEqual(h.logs, [["error", t("activity.inject.failed"), "unrelated failure", "inject"]]);
+    assert.deepEqual(h.navigations, []);
+  });
+}
+
+test("capacity recovery clears on close and stays scoped when the project changes", async () => {
+  reset("en", "replace");
+  binaryCount = 2;
+  await inject("replace");
+  const staleAction = reviewOversized();
+  h.project = { ...h.project, path: "/other-game" };
+  assert.equal(capacityPanel(), undefined);
+  staleAction.props.onClick();
+  assert.deepEqual(h.navigations, [], "a retained handler must not navigate for another project");
+  assert.equal(h.closeCalls, 0);
+  h.project = { ...h.project, path: "/game" };
+  render(false);
+  assert.equal(capacityPanel(), undefined, "reopening must not show the previous visit's recovery");
+});
+
 for (const locale of ["en", "es"] as const) {
   for (const shape of ["string", "Error", "HTTP"] as const) {
     test(`${locale} capacity refusal (${shape}) shows count-only guidance, not success`, async () => {
@@ -320,6 +387,8 @@ for (const locale of ["en", "es"] as const) {
       assert.deepEqual(h.toasts, [["error", t("inject.toast.failed", { error: expected })]]);
       assert.deepEqual(h.logs, [["error", t("activity.inject.failed"), expected, "inject"]], "existing capacity family keeps localized activity detail");
       assert.ok(!text(render()).includes(t("inject.injectionComplete")));
+      assert.ok(text(capacityPanel()).includes(expected), "typed capacity refusal must show its count inline");
+      reviewOversized();
       assert.equal(calls.find(call => call.command === "run_inject")?.params.require_binary_slot_fit, true);
       assert.ok(!JSON.stringify(h.toasts).includes("injection error:"));
     });

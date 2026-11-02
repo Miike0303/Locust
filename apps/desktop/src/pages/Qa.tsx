@@ -1,6 +1,6 @@
 import { projectScopedQueryFn, useProjectScopedQueryEnabled } from "../lib/projectScope";
 import { useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronLeft, ChevronRight, ShieldCheck, ShieldQuestion } from "lucide-react";
 import { getValidationIssues, getValidationSummary, setValidationIssueIgnored, validate, type ProjectInfo } from "../lib/api";
@@ -12,6 +12,12 @@ import { draftProjectKey } from "../stores/draftStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useEditorStore } from "../stores/editorStore";
 import EmptyState from "../components/EmptyState";
+
+const FILTER_KINDS: readonly string[] = [
+  "MissingPlaceholder", "ExtraPlaceholder", "ExceedsCharLimit", "ExceedsBinarySlot",
+  "UnencodableTranslation", "EmptyTranslation", "IdenticalToSource",
+  "InconsistentTranslation", "NumberMismatch", "StaleTranslation", "InvalidInjectionProvenance",
+];
 
 const ACTION_BASE = "inline-flex items-center justify-center gap-1 rounded-md px-3 py-2 text-body font-medium disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg";
 const ACTION = `${ACTION_BASE} bg-accent-muted text-accent-fg hover:bg-accent-muted/80`;
@@ -29,7 +35,16 @@ function ProjectQa({ project, projectKey }: { project: ProjectInfo | null; proje
   const navigate = useNavigate();
   const qc = useQueryClient();
   const startValidationWorklist = useEditorStore(s => s.startValidationWorklist);
-  const [kind, setKind] = useState<string | undefined>();
+  const { search } = useLocation();
+  const [kind, setKind] = useState<string | undefined>(() => {
+    const params = new URLSearchParams(search);
+    const linkedProject = params.get("project");
+    // ProjectQa remounts on project changes: an old recovery link must not
+    // preselect a filter in a different database, even for the same game path.
+    if (!project || (linkedProject !== null && linkedProject !== projectKey)) return undefined;
+    const requestedKind = params.get("kind");
+    return requestedKind && FILTER_KINDS.includes(requestedKind) ? requestedKind : undefined;
+  });
   const [includeIgnored, setIncludeIgnored] = useState(false);
   const [offset, setOffset] = useState(0);
   const scopedEnabled = useProjectScopedQueryEnabled(projectKey);
