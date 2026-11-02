@@ -3,7 +3,7 @@ import { registerHooks } from "node:module";
 import { after, beforeEach, test } from "node:test";
 import { QueryClient, QueryObserver } from "@tanstack/react-query";
 import { ApiError } from "../lib/apiError.ts";
-import type { StringEntry } from "../lib/api.ts";
+import type { FileStats, StringEntry } from "../lib/api.ts";
 import { draftProjectKey, projectScopedQueryFn } from "../lib/projectScope.ts";
 import { useProjectStore } from "../stores/projectStore.ts";
 import { draftEntryKey, editDraft, saveDraft, useDraftStore } from "../stores/draftStore.ts";
@@ -71,18 +71,36 @@ const h = {
   set format(format_id: string) { useProjectStore.getState().setProject({ ...project, format_id }); },
   contextFailure: false, contextWaits: {} as Record<string, Promise<void> | undefined>,
   focused: 0,
+  storage: new Map<string, string>(), storageFailure: false,
+  fileStatsFailure: false,
+  fetchWaits: {} as Record<string, Promise<void> | undefined>,
+  async getFileStats(): Promise<FileStats[]> {
+    if (this.fileStatsFailure) throw new Error("File stats unavailable");
+    const files = new Map<string, FileStats>();
+    for (const entry of Object.values(this.rows)) {
+      const stats = files.get(entry.file_path) ?? { file_path: entry.file_path, total: 0,
+        pending: 0, translated: 0, reviewed: 0, approved: 0, error: 0 };
+      stats.total++;
+      stats[entry.status]++;
+      files.set(entry.file_path, stats);
+    }
+    return [...files.values()];
+  },
   reads: [] as { status?: string; file_path?: string; limit?: number; offset?: number }[],
   async getStrings(filter: { status?: string; file_path?: string; limit?: number; offset?: number }) {
     this.reads.push(filter);
-    if (filter.file_path) {
+    if (filter.file_path && !filter.status) {
       if (this.contextWaits[filter.file_path]) await this.contextWaits[filter.file_path];
       if (this.contextFailure) throw new Error("Context unavailable");
     }
     const entries = Object.values(this.rows).filter(entry =>
       (!filter.status || entry.status === filter.status) && (!filter.file_path || entry.file_path === filter.file_path));
     const offset = filter.offset ?? 0;
-    return { entries: entries.slice(offset, offset + (filter.limit ?? entries.length)), total: entries.length,
+    const result = { entries: entries.slice(offset, offset + (filter.limit ?? entries.length)), total: entries.length,
       offset, limit: filter.limit ?? entries.length };
+    const wait = this.fetchWaits[JSON.stringify([filter.file_path ?? "", filter.status, offset])];
+    if (wait) await wait;
+    return result;
   },
   async patchString(id: string, patch: Patch) {
     this.writes.push({ id, patch });
@@ -107,13 +125,19 @@ const hooks = registerHooks({
         "@tanstack/react-query": `export const useQueryClient=()=>globalThis.__reviewTest.client;`,
         "../stores/projectStore": `const store=globalThis.__reviewTest.projectStore;export const useProjectStore=Object.assign(select=>select(store.getState()),{getState:store.getState});`,
         "../lib/i18n": `export const useT=()=>globalThis.__reviewTest.t;`,
-        "../lib/api": `const h=globalThis.__reviewTest;export const getStrings=filter=>h.getStrings(filter);export const patchString=(id,patch)=>h.patchString(id,patch);export const getSpeakers=async()=>({groups:h.speakers,unassigned_entry_ids:[]});`,
+        "../lib/api": `const h=globalThis.__reviewTest;export const getFileStats=()=>h.getFileStats();export const getStrings=filter=>h.getStrings(filter);export const patchString=(id,patch)=>h.patchString(id,patch);export const getSpeakers=async()=>({groups:h.speakers,unassigned_entry_ids:[]});`,
       };
       if (stubs[specifier]) return { url: `data:text/javascript,${encodeURIComponent(stubs[specifier])}`, shortCircuit: true };
     }
     return nextResolve(specifier, context);
   },
 });
+const previousStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+Object.defineProperty(globalThis, "localStorage", { configurable: true, value: {
+  getItem(key: string) { if (h.storageFailure) throw new Error("Storage denied"); return h.storage.get(key) ?? null; },
+  setItem(key: string, value: string) { if (h.storageFailure) throw new Error("Storage denied"); h.storage.set(key, value); },
+  removeItem(key: string) { if (h.storageFailure) throw new Error("Storage denied"); h.storage.delete(key); },
+} });
 const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
 const previousDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
 Object.defineProperty(globalThis, "window", {
@@ -138,6 +162,8 @@ after(() => {
   client.clear();
   useProjectStore.getState().clearProject();
   hooks.deregister();
+  if (previousStorage) Object.defineProperty(globalThis, "localStorage", previousStorage);
+  else Reflect.deleteProperty(globalThis, "localStorage");
   if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow);
   else Reflect.deleteProperty(globalThis, "window");
   if (previousDocument) Object.defineProperty(globalThis, "document", previousDocument);
@@ -196,6 +222,8 @@ beforeEach(async () => {
   h.failure = null; h.waitForSave = null; h.invalidations = 0;
   h.keydown = null; h.navigations = []; h.speakers = []; h.reads = [];
   h.format = "renpy"; h.contextFailure = false; h.contextWaits = {}; h.focused = 0;
+  h.storage.clear(); h.storageFailure = false; h.fetchWaits = {};
+  h.fileStatsFailure = false;
   render();
   await settle();
   assert.equal(textarea().props.value, "Translation A");
@@ -748,4 +776,191 @@ test("context never crosses archive member boundaries in the same RPA file", asy
   assert.deepEqual(contextRows().map(node => node.props["data-entry-id"]),
     [0, 1, 2, 3].map(n => `scripts.rpa#chapter2.rpyc#s${n}`));
   assert.equal(contextRows()[0].props["aria-current"], true);
+});
+
+
+function scopeSelector() {
+  const select = nodes(render()).find(node => node.type === "select");
+  assert.ok(select, "file scope selector is available");
+  assert.ok(select.props["aria-label"] || nodes(render()).some(node =>
+    node.type === "label" && node.props.htmlFor === select.props.id), "scope has an accessible label");
+  return select;
+}
+function selectScope(filePath: string) { scopeSelector().props.onChange({ target: { value: filePath } }); render(); }
+function fileRows(translated = 55) {
+  return ["A", "B"].flatMap(file => Array.from({ length: 60 }, (_, i) => ({
+    ...row(`${file}${i}`), file_path: `${file}.json`,
+    status: i < translated ? "translated" : "reviewed",
+  } as StringEntry)));
+}
+async function flushScope() {
+  // Keep rendering the new scope while an old scope's request is unresolved.
+  for (let i = 0; i < 24; i++) { await Promise.resolve(); render(); }
+}
+
+for (const translated of [55, 5]) {
+  test(`file A visits exactly its 60 rows across approval-driven pagination (${translated} translated)`, async () => {
+    await startWith([...fileRows(translated), { ...row("pending"), file_path: "pending.json", status: "pending" },
+      { ...row("approved"), file_path: "approved.json", status: "approved" },
+      { ...row("A-pending"), file_path: "A.json", status: "pending" },
+      { ...row("A-approved"), file_path: "A.json", status: "approved" }]);
+    const options = nodes(scopeSelector()).filter(node => node.type === "option");
+    assert.deepEqual(options.map(node => node.props.value), ["", "A.json", "B.json"]);
+    assert.deepEqual(options.slice(1).map(node => node.props.children.join("")), ["A.json (60)", "B.json (60)"],
+      "counts include only translated + reviewed");
+    h.reads = [];
+    selectScope("A.json");
+    await settle();
+    progress(1, 0, 60);
+    for (let i = 0; i < 60; i++) {
+      assert.equal(textarea().props.value, `Translation A${i}`);
+      await approve();
+    }
+    assert.deepEqual(h.writes.map(write => write.id), Array.from({ length: 60 }, (_, i) => `A${i}`));
+    assert.ok(h.writes.every(write => write.patch.expected_translation === `Translation ${write.id}`));
+    assert.ok(Object.values(h.rows).filter(entry => entry.file_path === "B.json").every(entry => entry.status !== "approved"));
+    assert.ok(text(render()).includes(t("review.complete")));
+    const queueReads = h.reads.filter(filter => filter.status);
+    assert.ok(queueReads.every(filter => filter.file_path === "A.json"), "bootstrap and subsequent pages stay scoped");
+    assert.ok(queueReads.some(filter => filter.offset! > 0), "approvals drive offset-adjusted pagination");
+    assert.ok(queueReads.some(filter => filter.status === "translated"));
+    assert.ok(queueReads.some(filter => filter.status === "reviewed"));
+    selectScope("B.json");
+    await settle();
+    progress(1, 0, 60);
+    assert.equal(textarea().props.value, "Translation B0");
+  });
+}
+
+test("All files keeps the original 120-row walk and unscoped queue requests", async () => {
+  await startWith(fileRows());
+  assert.equal(scopeSelector().props.value, "");
+  progress(1, 0, 120);
+  for (let i = 0; i < 120; i++) await approve();
+  assert.equal(new Set(h.writes.map(write => write.id)).size, 120);
+  assert.ok(h.reads.filter(filter => filter.status).every(filter => !filter.file_path));
+  assert.ok(text(render()).includes(t("review.complete")));
+});
+
+for (const rejected of [false, true]) {
+  test(`scope switch ignores a delayed bootstrap ${rejected ? "failure" : "response"}`, async () => {
+    await startWith(fileRows());
+    let finish!: () => void;
+    let fail!: (error: Error) => void;
+    h.fetchWaits[JSON.stringify(["A.json", "translated", 0])] = new Promise<void>((resolve, reject) => { finish = resolve; fail = reject; });
+    selectScope("A.json");
+    assert.ok(text(render()).includes(t("review.loading")));
+    selectScope("B.json");
+    await flushScope();
+    assert.equal(textarea().props.value, "Translation B0");
+    progress(1, 0, 60);
+    if (rejected) fail(new Error("Old scope failed")); else finish();
+    await settle();
+    assert.equal(textarea().props.value, "Translation B0");
+    assert.ok(!text(render()).includes("Old scope failed"));
+    await approve();
+    assert.deepEqual(h.writes.map(write => write.id), ["B0"]);
+    progress(2, 1, 60);
+  });
+}
+
+test("switching during a delayed page cannot merge the previous file or retain its cursor and draft", async () => {
+  await startWith(fileRows());
+  selectScope("A.json");
+  await settle();
+  let finish!: () => void;
+  h.fetchWaits[JSON.stringify(["A.json", "translated", 9])] = new Promise<void>(resolve => { finish = resolve; });
+  for (let i = 0; i < 40; i++) await approve();
+  button(t("review.approve")).props.onClick();
+  await flushScope();
+  button(t("review.skip")).props.onClick();
+  render();
+  assert.ok(h.reads.some(filter => filter.status === "translated" && filter.file_path === "A.json" && filter.offset === 9));
+  edit("Discard this scope's draft");
+  button(t("review.showDiff")).props.onClick();
+  selectScope("B.json");
+  await flushScope();
+  assert.equal(textarea().props.value, "Translation B0");
+  progress(1, 0, 60);
+  assert.ok(button(t("review.showDiff")));
+  finish();
+  await settle();
+  assert.equal(textarea().props.value, "Translation B0");
+  for (let i = 0; i < 60; i++) await approve();
+  assert.deepEqual(h.writes.slice(41).map(write => write.id), Array.from({ length: 60 }, (_, i) => `B${i}`));
+});
+
+test("scope changes synchronously refuse a captured approval handler and pending saves lock the selector", async () => {
+  await startWith(fileRows());
+  const staleApprove = button(t("review.approve")).props.onClick;
+  scopeSelector().props.onChange({ target: { value: "B.json" } });
+  staleApprove();
+  await settle();
+  assert.deepEqual(h.writes, []);
+  let finish!: () => void;
+  h.waitForSave = new Promise<void>(resolve => { finish = resolve; });
+  button(t("review.approve")).props.onClick();
+  assert.equal(scopeSelector().props.disabled, true);
+  scopeSelector().props.onChange({ target: { value: "A.json" } });
+  assert.equal(scopeSelector().props.value, "B.json");
+  finish();
+  await settle();
+  progress(2, 1, 60);
+});
+
+test("last scope is remembered per project using the existing project preference pattern", async () => {
+  const entries = fileRows();
+  await startWith(entries);
+  selectScope("A.json");
+  await settle();
+  await startWith(entries);
+  assert.equal(scopeSelector().props.value, "A.json");
+  progress(1, 0, 60);
+  useProjectStore.getState().setProject({ ...project, database_path: "/other.db" });
+  render();
+  await settle();
+  assert.equal(scopeSelector().props.value, "");
+  progress(1, 0, 120);
+  selectScope("B.json");
+  await settle();
+  useProjectStore.getState().setProject(project);
+  render();
+  await settle();
+  assert.equal(scopeSelector().props.value, "A.json");
+  progress(1, 0, 60);
+  selectScope("");
+  await settle();
+  await startWith(entries);
+  assert.equal(scopeSelector().props.value, "");
+});
+
+test("a remembered file with no reviewable rows falls back to All files", async () => {
+  await startWith(fileRows());
+  selectScope("A.json");
+  await settle();
+  await startWith([{ ...row("done"), file_path: "A.json", status: "approved" }, { ...row("next"), file_path: "B.json" }]);
+  assert.equal(scopeSelector().props.value, "");
+  assert.equal(textarea().props.value, "Translation next");
+  progress(1, 0, 1);
+});
+
+test("file scope works when browser storage is unavailable", async () => {
+  h.storageFailure = true;
+  await startWith(fileRows());
+  selectScope("B.json");
+  await settle();
+  assert.equal(textarea().props.value, "Translation B0");
+  progress(1, 0, 60);
+});
+
+test("file stats failure keeps All files review usable and exposes a retry", async () => {
+  h.fileStatsFailure = true;
+  await startWith(fileRows());
+  progress(1, 0, 120);
+  assert.equal(scopeSelector().props.value, "");
+  assert.ok(nodes(render()).some(node => node.props?.role === "alert"));
+  h.fileStatsFailure = false;
+  button(t("common.retry")).props.onClick();
+  await settle();
+  assert.deepEqual(nodes(scopeSelector()).filter(node => node.type === "option").map(node => node.props.value), ["", "A.json", "B.json"]);
 });

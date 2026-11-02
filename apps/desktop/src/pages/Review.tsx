@@ -3,7 +3,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, Check, SkipForward, X } from "lucide-react";
-import { getSpeakers, getStrings, patchString, type StringEntry } from "../lib/api";
+import { getFileStats, getSpeakers, getStrings, patchString, type FileStats, type StringEntry } from "../lib/api";
 import { speakerOwner } from "../lib/speakers";
 import { pathBasename } from "../lib/path";
 import { placeholderParts, placeholderCheck } from "../lib/placeholders";
@@ -15,6 +15,7 @@ import { useProjectStore } from "../stores/projectStore";
 import { draftProjectKey, isProjectScopedQueryEnabled } from "../lib/projectScope";
 import { invalidateProjectData } from "../lib/queryClient";
 import { useT } from "../lib/i18n";
+import { browserStorage } from "../lib/storage";
 import {
   applyBootstrap,
   applyFetchedPage,
@@ -30,6 +31,21 @@ import {
   skipCurrent,
   type ReviewQueueState,
 } from "../lib/reviewQueue";
+
+// Same per-project preference identity as TextFitPreview's saved profile.
+const reviewScopeKey = (projectKey: string) => `locust.review.scope.v1:${projectKey}`;
+
+function readReviewScope(projectKey: string): string {
+  if (!projectKey) return "";
+  try { return browserStorage()?.getItem(reviewScopeKey(projectKey)) ?? ""; }
+  catch { return ""; }
+}
+
+function rememberReviewScope(projectKey: string, filePath: string): void {
+  if (!projectKey) return;
+  try { browserStorage()?.setItem(reviewScopeKey(projectKey), filePath); }
+  catch { /* File selection still works when storage is unavailable. */ }
+}
 
 export function reviewApprovalPatch(
   current: Pick<StringEntry, "translation" | "status">,
@@ -47,6 +63,15 @@ export default function Review() {
   const navigate = useNavigate();
   const qc = useQueryClient();
   const project = useProjectStore((s) => s.project);
+  const projectPath = project?.path ?? null;
+  const projectKey = project ? draftProjectKey(project) : "";
+  const databasePath = project?.database_path ?? null;
+  const format = project?.format_id ?? "";
+  const [savedScope, setSavedScope] = useState(() => ({ projectKey, filePath: readReviewScope(projectKey) }));
+  const filePath = savedScope.projectKey === projectKey ? savedScope.filePath : readReviewScope(projectKey);
+  const [files, setFiles] = useState<FileStats[] | null>(null);
+  const [fileStatsError, setFileStatsError] = useState(false);
+  const [fileStatsRevision, setFileStatsRevision] = useState(0);
   const [queue, setQueue] = useState<ReviewQueueState>(createReviewQueue);
   const [byId, setById] = useState<Record<string, StringEntry>>({});
   const [showDiff, setShowDiff] = useState(false);
@@ -62,10 +87,28 @@ export default function Review() {
   const queueRef = useRef(queue);
   const loadGenRef = useRef(0);
 
-  const projectPath = project?.path ?? null;
-  const projectKey = project ? draftProjectKey(project) : "";
-  const databasePath = project?.database_path ?? null;
-  const format = project?.format_id ?? "";
+  useEffect(() => {
+    let active = true;
+    setFiles(null);
+    setFileStatsError(false);
+    if (projectPath) {
+      void getFileStats().then(result => {
+        if (!active) return;
+        const reviewable = result.filter(file => file.translated + file.reviewed > 0);
+        setFiles(reviewable);
+        setSavedScope(previous => {
+          const selected = previous.projectKey === projectKey ? previous.filePath : readReviewScope(projectKey);
+          // A finished, removed or renamed file must not strand a remembered session.
+          if (selected && !reviewable.some(file => file.file_path === selected)) {
+            rememberReviewScope(projectKey, "");
+            return { projectKey, filePath: "" };
+          }
+          return previous;
+        });
+      }).catch(() => { if (active) setFileStatsError(true); });
+    }
+    return () => { active = false; };
+  }, [projectKey, fileStatsRevision]);
 
   useEffect(() => {
     let active = true;
@@ -82,7 +125,7 @@ export default function Review() {
     return () => { active = false; };
   }, [projectPath, databasePath, format]);
 
-  useEffect(() => {
+  const resetSession = useCallback(() => {
     loadGenRef.current += 1;
     queueRef.current = createReviewQueue();
     setQueue(queueRef.current);
@@ -92,7 +135,23 @@ export default function Review() {
     setLoadError(null);
     setInitialLoading(true);
     fetchingRef.current = false;
-  }, [projectKey]);
+    setContext(null);
+    contextPages.current.clear();
+  }, []);
+
+  useEffect(() => {
+    resetSession();
+    // Unmounting also invalidates requests that outlive this Review page.
+    return () => { loadGenRef.current += 1; };
+  }, [projectKey, filePath]);
+
+  const changeScope = (nextFilePath: string) => {
+    if (approvingRef.current || nextFilePath === filePath) return;
+    // Invalidate synchronously, before React renders or an old request resolves.
+    resetSession();
+    setSavedScope({ projectKey, filePath: nextFilePath });
+    rememberReviewScope(projectKey, nextFilePath);
+  };
 
   const loadMore = useCallback(async () => {
     if (!projectPath || fetchingRef.current) return;
@@ -102,13 +161,14 @@ export default function Review() {
     if (plan.type === "none") return;
 
     const gen = loadGenRef.current;
+    const scope = filePath ? { file_path: filePath } : {};
     fetchingRef.current = true;
     let failed = false;
     try {
       if (plan.type === "bootstrap") {
         const [translated, reviewed] = await Promise.all([
-          getStrings({ status: "translated", limit: REVIEW_PAGE_SIZE, offset: 0 }),
-          getStrings({ status: "reviewed", limit: REVIEW_PAGE_SIZE, offset: 0 }),
+          getStrings({ ...scope, status: "translated", limit: REVIEW_PAGE_SIZE, offset: 0 }),
+          getStrings({ ...scope, status: "reviewed", limit: REVIEW_PAGE_SIZE, offset: 0 }),
         ]);
         if (gen !== loadGenRef.current) return;
         const next = applyBootstrap(
@@ -126,6 +186,7 @@ export default function Review() {
         setInitialLoading(false);
       } else {
         const res = await getStrings({
+          ...scope,
           status: plan.type,
           limit: plan.limit,
           offset: plan.offset,
@@ -161,7 +222,7 @@ export default function Review() {
     ) {
       void loadMore();
     }
-  }, [projectPath, projectKey]);
+  }, [projectPath, projectKey, filePath]);
 
   useEffect(() => {
     void loadMore();
@@ -216,7 +277,9 @@ export default function Review() {
     if (entry) setTranslation(entry.translation || "");
   }, [entry?.id]);
 
+  const renderedGen = loadGenRef.current;
   const handleApprove = useCallback(async () => {
+    if (renderedGen !== loadGenRef.current) return;
     if (approvingRef.current || !projectKey || !isProjectScopedQueryEnabled(projectKey)) return;
     const state = queueRef.current;
     const id = state.items[state.index]?.id;
@@ -248,7 +311,7 @@ export default function Review() {
       approvingRef.current = false;
       setApproving(false);
     }
-  }, [byId, translation, qc, projectKey]);
+  }, [byId, translation, qc, projectKey, renderedGen]);
 
   const handleSkip = useCallback(() => {
     if (approvingRef.current) return;
@@ -291,6 +354,33 @@ export default function Review() {
     return () => window.removeEventListener("keydown", handler);
   }, [handleApprove, handleSkip, handlePrev, navigate]);
 
+  const scopePicker = (
+    <div className="flex flex-wrap items-center gap-2 text-body">
+      <label htmlFor="review-file-scope" className="font-medium">{t("review.scope.label")}</label>
+      <select
+        id="review-file-scope"
+        value={filePath}
+        disabled={approving}
+        onChange={event => changeScope(event.target.value)}
+        className="min-w-0 max-w-full rounded border border-border bg-surface px-2 py-1 text-text disabled:opacity-50"
+      >
+        <option value="">{t("review.scope.all")}</option>
+        {filePath && files === null && <option value={filePath}>{filePath}</option>}
+        {files?.map(file => (
+          <option key={file.file_path} value={file.file_path}>
+            {file.file_path} ({file.translated + file.reviewed})
+          </option>
+        ))}
+      </select>
+      {fileStatsError && <>
+        <span role="alert" className="text-danger">{t("review.scope.loadError")}</span>
+        <button onClick={() => setFileStatsRevision(value => value + 1)} className="text-accent-fg hover:underline">
+          {t("common.retry")}
+        </button>
+      </>}
+    </div>
+  );
+
   if (!project) {
     return (
       <div className="flex h-full flex-col bg-surface text-text">
@@ -309,33 +399,32 @@ export default function Review() {
 
   if (initialLoading) {
     return (
-      <div className="flex h-full items-center justify-center text-text-muted">
-        {t("review.loading")}
+      <div className="flex h-full flex-col bg-surface text-text">
+        <div className="border-b border-border p-4">{scopePicker}</div>
+        <div className="flex flex-1 items-center justify-center text-text-muted">{t("review.loading")}</div>
       </div>
     );
   }
 
   if (loadError && !queue.bootstrapped) {
     return (
-      <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
-        <h1 className="text-page font-semibold text-danger">{t("review.loadError")}</h1>
-        <p className="text-body text-text-muted">
-          {loadError || t("common.tryAgain")}
-        </p>
-        <button
-          onClick={() => {
-            setLoadError(null);
-            setInitialLoading(true);
-            fetchingRef.current = false;
-            const fresh = createReviewQueue();
-            queueRef.current = fresh;
-            setQueue(fresh);
-            void loadMore();
-          }}
-          className="rounded bg-accent px-4 py-2 font-medium text-white hover:bg-accent-hover"
-        >
-          {t("common.retry")}
-        </button>
+      <div className="flex h-full flex-col bg-surface text-text">
+        <div className="border-b border-border p-4">{scopePicker}</div>
+        <div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center">
+          <h1 className="text-page font-semibold text-danger">{t("review.loadError")}</h1>
+          <p className="text-body text-text-muted">
+            {loadError || t("common.tryAgain")}
+          </p>
+          <button
+            onClick={() => {
+              resetSession();
+              void loadMore();
+            }}
+            className="rounded bg-accent px-4 py-2 font-medium text-white hover:bg-accent-hover"
+          >
+            {t("common.retry")}
+          </button>
+        </div>
       </div>
     );
   }
@@ -345,21 +434,24 @@ export default function Review() {
 
   if (showComplete || showNothing) {
     return (
-      <div className="flex h-full flex-col items-center justify-center px-6 text-center">
-        <h1 className="text-page font-semibold text-text">
-          {showComplete ? t("review.complete") : t("review.nothing")}
-        </h1>
-        <p className="mt-2 mb-4 text-text-muted">
-          {showComplete
-            ? t("review.completeHint")
-            : t("review.nothingHint")}
-        </p>
-        <button
-          onClick={() => navigate("/editor")}
-          className="rounded bg-accent px-4 py-2 font-medium text-white hover:bg-accent-hover"
-        >
-          {t("review.returnToEditor")}
-        </button>
+      <div className="flex h-full flex-col bg-surface text-text">
+        <div className="border-b border-border p-4">{scopePicker}</div>
+        <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
+          <h1 className="text-page font-semibold text-text">
+            {showComplete ? t("review.complete") : t("review.nothing")}
+          </h1>
+          <p className="mt-2 mb-4 text-text-muted">
+            {showComplete
+              ? t("review.completeHint")
+              : t("review.nothingHint")}
+          </p>
+          <button
+            onClick={() => navigate("/editor")}
+            className="rounded bg-accent px-4 py-2 font-medium text-white hover:bg-accent-hover"
+          >
+            {t("review.returnToEditor")}
+          </button>
+        </div>
       </div>
     );
   }
@@ -388,6 +480,7 @@ export default function Review() {
             <X size={14} /> {t("common.exit")}
           </button>
         </div>
+        {scopePicker}
         <div className="w-full bg-border rounded-full h-2">
           <div className={`${statusStyles.approved.bar} h-2 rounded-full transition-all`} style={{ width: `${bar}%` }} />
         </div>
