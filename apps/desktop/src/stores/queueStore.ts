@@ -3,17 +3,17 @@ import { startTranslation, cancelTranslation, validate, type TranslationStartPar
 import { completeOpenProject, projectFromOpenResponse } from "../lib/openProjectFlow";
 import { invalidateProjectData, queryClient } from "../lib/queryClient";
 import { draftProjectKey } from "../lib/projectScope";
-import { waitForJob, type JobWait } from "../lib/ws";
+import { waitForJob, subscribeToJob, type JobWait } from "../lib/ws";
 import { useProjectStore } from "./projectStore";
 import { useEditorStore } from "./editorStore";
 import { canStartQueue } from "../lib/translationJob";
-import { hasUnresolvedBatchFailures } from "../lib/translationJobSession";
+import { createTranslationJobConnection, hasUnresolvedBatchFailures } from "../lib/translationJobSession";
 import { addLog } from "./logStore";
 import { addToast } from "./toastStore";
 import { t } from "../lib/i18n";
 import { ApiError, localizeApiError, parseApiError } from "../lib/apiError";
 import { JOB_STREAM_LOST_MESSAGE } from "../lib/ws";
-import { MAX_QUEUE_HISTORY, readQueue, writeQueue, type QueueHistoryEntry } from "../lib/queuePersistence";
+import { MAX_QUEUE_HISTORY, readQueue, writeQueue, type QueueHistoryEntry, type QueueJobOwner } from "../lib/queuePersistence";
 import {
   queueItemPatchAfterValidation,
   validationIssueCount,
@@ -63,6 +63,10 @@ interface QueueStore {
   cancelRequested: boolean;
   activeJobId: string | null;
   disconnected: boolean;
+  activeJob: QueueJobOwner | null;
+  persistenceError: boolean;
+  recoveryAvailable: boolean;
+  retrySave: () => void;
 
   addItem: (path: string) => void;
   removeItem: (id: string) => void;
@@ -85,13 +89,22 @@ const resetForRetry = (item: QueueItem): QueueItem => ({
   progress: { completed: 0, total: 0, costSoFar: 0, costIsComplete: false, startedAt: null },
 });
 
+const restoredQueue = readQueue();
+const restoredOwner = restoredQueue.activeJob ?? null;
+const restoredItem = restoredQueue.items.find(i => i.id === restoredOwner?.itemId);
+
 export const useQueueStore = create<QueueStore>((set, get) => ({
-  ...readQueue(),
-  isRunning: false,
+  ...restoredQueue,
+  activeJob: restoredOwner,
+  persistenceError: false,
+  recoveryAvailable: restoredQueue.recoveryAvailable === true,
+  retrySave: () => saveQueue(),
+  isRunning: restoredOwner !== null,
   isPanelOpen: false,
-  globalProgress: null,
+  globalProgress: restoredItem ? { owner: { kind: "queue", itemId: restoredItem.id },
+    projectName: restoredItem.projectName, ...restoredItem.progress } : null,
   cancelRequested: false,
-  activeJobId: null,
+  activeJobId: restoredOwner?.jobId ?? null,
   disconnected: false,
 
   addItem: (path) => {
@@ -151,8 +164,7 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
     }).catch((err: unknown) => {
       const message = err instanceof Error ? err.message : String(err);
       addLog("error", t("activity.queue.cancelFailed"), message, "queue");
-      const { status, body } = parseApiError(err instanceof ApiError ? err.raw : message);
-      if (get().activeJobId === jobId && (status === 404 || (status === null && body.trim() === "job not found"))) {
+      if (get().activeJobId === jobId && jobIsMissing(err)) {
         activeJobWait?.abandon(new QueueJobUnavailableError(t("queue.jobOutcomeUnknown")));
       }
     });
@@ -179,24 +191,7 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
       if (get().cancelRequested) break;
 
       const item = pending[idx];
-      const updateItem = (patch: Partial<QueueItem>) =>
-        set((s) => {
-          const current = s.items.find(i => i.id === item.id);
-          if (!current) return s;
-          const updated = { ...current, ...patch };
-          const status = updated.status;
-          const terminal = status === "done" || status === "error" || status === "cancelled";
-          const entry: QueueHistoryEntry | null = s.isRunning && terminal && current.status !== status ? {
-            id: crypto.randomUUID(), projectName: updated.projectName, projectPath: updated.projectPath,
-            status, finishedAt: new Date().toISOString(), completed: updated.progress.completed,
-            total: updated.progress.total, costSoFar: updated.progress.costSoFar,
-            costIsComplete: updated.progress.costIsComplete === true, validationIssues: updated.validationIssues,
-          } : null;
-          return {
-            items: s.items.map(i => i.id === item.id ? updated : i),
-            history: entry ? [entry, ...s.history].slice(0, MAX_QUEUE_HISTORY) : s.history,
-          };
-        });
+      const updateItem = (patch: Partial<QueueItem>) => patchQueueItem(item.id, patch);
       const markCancelled = () => {
         const name = get().items.find((i) => i.id === item.id)?.projectName ?? item.projectName;
         updateItem({ status: "cancelled", error: null });
@@ -258,8 +253,8 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
         }));
 
         const job = await startTranslation(translationParams);
-        set({ activeJobId: job.job_id });
         jobProjectKey = draftProjectKey(projectFromOpenResponse(result));
+        set({ activeJobId: job.job_id, activeJob: { jobId: job.job_id, itemId: item.id, projectKey: jobProjectKey } });
         let failedBatches = 0;
         let lastBatchReason = "";
         let translated = 0;
@@ -296,7 +291,7 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
           await waiting;
         } finally {
           activeJobWait = null;
-          set({ activeJobId: null, disconnected: false });
+          set({ activeJobId: null, activeJob: null, disconnected: false });
         }
 
         if (get().cancelRequested) {
@@ -356,13 +351,13 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
           addToast("warning", t("queue.toast.validationFailed", { name: result.project_name }));
         }
       } catch (err: any) {
-        if (get().cancelRequested && !(err instanceof QueueJobUnavailableError)) {
+        if (get().cancelRequested && !(err instanceof QueueJobUnavailableError) && !jobIsMissing(err)) {
           markCancelled();
         } else {
           const raw = err.message ?? String(err);
           updateItem({
             status: "error",
-            error: raw === JOB_STREAM_LOST_MESSAGE ? t(JOB_STREAM_LOST_MESSAGE) : localizeApiError(raw),
+            error: jobIsMissing(err) ? t("queue.jobOutcomeUnknown") : raw === JOB_STREAM_LOST_MESSAGE ? t(JOB_STREAM_LOST_MESSAGE) : localizeApiError(raw),
           });
           addLog("error", t("activity.queue.itemFailed", { name: item.projectName }), raw, "queue");
           addToast("error", t("queue.toast.itemFailed", { name: item.projectName }));
@@ -418,8 +413,107 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
   },
 }));
 
+function saveQueue(): void {
+  const result = writeQueue(useQueueStore.getState());
+  useQueueStore.setState({ persistenceError: !result.saved, recoveryAvailable: result.recoveryAvailable });
+}
+
 useQueueStore.subscribe((state, previous) => {
-  if (state.items !== previous.items || state.translationParams !== previous.translationParams || state.history !== previous.history) {
-    writeQueue(state);
-  }
+  if (state.items !== previous.items || state.translationParams !== previous.translationParams ||
+    state.history !== previous.history || state.activeJob !== previous.activeJob) saveQueue();
 });
+
+// Defer until circular store/session imports and the persistence subscription are ready.
+if (restoredOwner) queueMicrotask(() => { void resumeOwnedJob(restoredOwner); });
+
+function jobIsMissing(error: unknown): boolean {
+  const raw = error instanceof ApiError ? error.raw : error instanceof Error ? error.message : String(error);
+  const { status, body } = parseApiError(raw);
+  return status === 404 || (status === null && body.trim() === "job not found");
+}
+
+function patchQueueItem(itemId: string, patch: Partial<QueueItem>): void {
+  useQueueStore.setState(s => {
+    const current = s.items.find(i => i.id === itemId);
+    if (!current) return s;
+    const updated = { ...current, ...patch };
+    const status = updated.status;
+    const terminal = status === "done" || status === "error" || status === "cancelled";
+    const entry: QueueHistoryEntry | null = s.isRunning && terminal && current.status !== status ? {
+      id: crypto.randomUUID(), projectName: updated.projectName, projectPath: updated.projectPath,
+      status, finishedAt: new Date().toISOString(), completed: updated.progress.completed,
+      total: updated.progress.total, costSoFar: updated.progress.costSoFar,
+      costIsComplete: updated.progress.costIsComplete === true, validationIssues: updated.validationIssues,
+    } : null;
+    return { items: s.items.map(i => i.id === itemId ? updated : i),
+      ...(terminal && s.activeJob?.itemId === itemId ? { activeJob: null, activeJobId: null } : {}),
+      history: entry ? [entry, ...s.history].slice(0, MAX_QUEUE_HISTORY) : s.history };
+  });
+}
+
+/** Reuse W9's replay/reconnect transport with the persisted owner, never the current UI project. */
+async function resumeOwnedJob(owner: QueueJobOwner): Promise<void> {
+  const item = useQueueStore.getState().items.find(i => i.id === owner.itemId);
+  if (!item) return;
+  let failedBatches = 0;
+  let lastBatchReason = "";
+  let translated = 0;
+  const updateProgress = (completed: number, total: number, costSoFar: number, costIsComplete: boolean) => {
+    const current = useQueueStore.getState().items.find(i => i.id === item.id);
+    if (!current) return;
+    patchQueueItem(item.id, { progress: { ...current.progress, completed, total, costSoFar, costIsComplete } });
+    useQueueStore.setState(s => ({ globalProgress: s.globalProgress
+      ? { ...s.globalProgress, completed, total, costSoFar, costIsComplete } : null }));
+  };
+  let resolve!: () => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<void>((res, rej) => { resolve = res; reject = rej; });
+  const connection = createTranslationJobConnection({
+    subscribe: handlers => subscribeToJob(owner.jobId, handlers, "translate", owner.projectKey),
+    onConnectionChange: disconnected => useQueueStore.setState({ disconnected }),
+    handlers: {
+      onBatchCompleted: e => updateProgress(e.completed, e.total, e.cost_so_far, e.cost_is_complete === true),
+      onBatchFailed: e => { failedBatches++; lastBatchReason = localizeApiError(e.error); },
+      onCompleted: e => {
+        translated = e.total_translated;
+        updateProgress(translated, useQueueStore.getState().items.find(i => i.id === item.id)?.progress.total ?? item.progress.total,
+          e.total_cost, e.cost_is_complete === true);
+        resolve();
+      },
+      onFailed: e => reject(jobIsMissing(e.error)
+        ? new QueueJobUnavailableError(t("queue.jobOutcomeUnknown")) : new Error(e.error)),
+    },
+  });
+  activeJobWait = Object.assign(promise, { reconnect: connection.reconnect,
+    abandon: (error: Error) => { connection.stop(); reject(error); } });
+  connection.connect();
+  try {
+    await activeJobWait;
+    if (useQueueStore.getState().cancelRequested) patchQueueItem(item.id, { status: "cancelled", error: null });
+    else {
+      const total = useQueueStore.getState().items.find(i => i.id === item.id)?.progress.total ?? 0;
+      if (hasUnresolvedBatchFailures(failedBatches, translated, total)) {
+        const summary = t(translated > 0 ? "queue.completedWithErrors" : "queue.translationFailed", {
+          name: item.projectName, translated, count: failedBatches,
+        });
+        patchQueueItem(item.id, { status: "error", error: `${summary}. ${lastBatchReason} ${t("translate.pendingRetryHint")}` });
+      } else {
+        // Validation uses the backend's currently open project. After reload we
+        // only have ownership of this job, so do not validate another project.
+        patchQueueItem(item.id, { status: "done", error: null });
+      }
+    }
+  } catch (err) {
+    const cancelled = useQueueStore.getState().cancelRequested && !(err instanceof QueueJobUnavailableError) && !jobIsMissing(err);
+    const raw = err instanceof Error ? err.message : String(err);
+    patchQueueItem(item.id, { status: cancelled ? "cancelled" : "error", error: cancelled ? null
+      : err instanceof QueueJobUnavailableError || jobIsMissing(err) ? t("queue.jobOutcomeUnknown") : localizeApiError(raw) });
+  } finally {
+    connection.stop(); activeJobWait = null;
+    useQueueStore.setState({ activeJob: null, activeJobId: null, disconnected: false });
+    const project = useProjectStore.getState().project;
+    await invalidateProjectData(queryClient, owner.projectKey, project && draftProjectKey(project) === owner.projectKey ? "active" : "none");
+    // Pending items require an explicit start after reconciliation, including a missing job.
+    useQueueStore.setState({ isRunning: false, globalProgress: null });
+  }
+}

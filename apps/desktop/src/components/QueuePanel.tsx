@@ -125,6 +125,9 @@ export default function QueuePanel() {
 		cancelQueue,
 		disconnected,
 		reconnectJob,
+		persistenceError,
+		recoveryAvailable,
+		retrySave,
 	} = useQueueStore();
 	const { data: formats } = useQuery({ queryKey: ["formats"], queryFn: getFormats, enabled: isPanelOpen });
 	const { data: providers } = useQuery({
@@ -345,6 +348,19 @@ export default function QueuePanel() {
 				</header>
 
 				<div className={MODAL_BODY_CLASS}>
+					{persistenceError && (
+						<div role="alert" className="m-4 p-3 rounded border border-warning bg-warning-muted text-body text-warning">
+							<p className="font-medium">{t("queue.notSaved")}</p>
+							<p>{t("queue.notSavedHint")}</p>
+							<button type="button" onClick={retrySave}
+								className="mt-2 px-3 py-1.5 border border-warning rounded font-medium focus:outline-none focus:ring-2 focus:ring-accent-fg">
+								{t("queue.retrySave")}
+							</button>
+						</div>
+					)}
+					{recoveryAvailable && (
+						<p role="status" className="m-4 text-body text-warning">{t("queue.recoveryAvailable")}</p>
+					)}
 					{isRunning && disconnected && (
 						<div role="status" className="m-4 p-3 rounded border border-warning bg-warning-muted text-body text-warning">
 							<p className="font-medium">{t("queue.connectionLost")}</p>

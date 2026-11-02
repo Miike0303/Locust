@@ -906,6 +906,10 @@ export const en = {
 
   // ── queue ───────────────────────────────────────────────────────────────
   "queue.title": "Project Queue",
+  "queue.notSaved": "Queue not saved",
+  "queue.notSavedHint": "Queue changes may be lost if you close or reload the app. Keep it open and retry saving.",
+  "queue.retrySave": "Retry saving",
+  "queue.recoveryAvailable": "A damaged queue snapshot has been preserved for recovery. Valid entries remain available.",
   "queue.interrupted": "Interrupted when the app closed. Retry to continue.",
   "queue.retry": "Retry",
   "queue.retryItem": "Retry {name}",

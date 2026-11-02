@@ -889,6 +889,10 @@ export const es: Record<keyof typeof en, string> = {
   "log.timeHours": "hace {count}h",
 
   "queue.title": "Cola de proyectos",
+  "queue.notSaved": "Cola sin guardar",
+  "queue.notSavedHint": "Los cambios de la cola pueden perderse si cierra o recarga la aplicación. Manténgala abierta y vuelva a guardar.",
+  "queue.retrySave": "Volver a guardar",
+  "queue.recoveryAvailable": "Se ha conservado una copia dañada de la cola para su recuperación. Las entradas válidas siguen disponibles.",
   "queue.interrupted": "Se interrumpió al cerrar la aplicación. Reintente para continuar.",
   "queue.retry": "Reintentar",
   "queue.retryItem": "Reintentar {name}",

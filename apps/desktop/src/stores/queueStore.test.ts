@@ -14,7 +14,7 @@ import type { ProjectOpenPreflight, TranslationStartParams } from "../lib/api.ts
 const h = {
   calls: [] as string[], toasts: [] as unknown[][],
   logs: [] as unknown[][], jobError: null as string | null,
-  manualSockets: false, cancelledIds: [] as string[], cancelError: null as Error | null,
+  connectedIds: [] as string[], manualSockets: false, cancelledIds: [] as string[], cancelError: null as Error | null,
   batchErrors: [] as string[], translated: 1, progressTotal: 100, onJob: () => {},
   openedPaths: [] as string[], onOpen: async (_path: string) => {},
   preflight: { kind: "resume_available", database_path: "/fixture/game.locust.db", project_path: "/fixture/game", format_id: "renpy" } as ProjectOpenPreflight,
@@ -30,7 +30,7 @@ registerHooks({
         export async function resumeProject(){h.calls.push('resume');return result;}
         export async function startTranslation(){h.calls.push('translate');return {job_id:'job'};}
         export async function cancelTranslation(id){h.calls.push('cancelTranslation');h.cancelledIds.push(id);if(h.cancelError)throw h.cancelError;}
-        export async function getWsUrl(){return 'ws://fixture/translation';}
+        export async function getWsUrl(id){h.connectedIds.push(id);return 'ws://fixture/translation';}
         export async function validate(){h.calls.push('validate');return {validation:{issues_found:0}};}`,
       "/src/stores/logStore.ts": `export function addLog(...args){globalThis.__resumeQueue.logs.push(args);}`,
       "/src/stores/toastStore.ts": `export function addToast(...args){globalThis.__resumeQueue.toasts.push(args);}`,
@@ -97,7 +97,7 @@ beforeEach(() => {
   queue.setState({ items: [], history: [], isRunning: false, cancelRequested: false, globalProgress: null, translationParams: params });
   editor.setState({ isTranslating: false });
   project.getState().setProject(originalProject);
-  h.manualSockets = false; h.cancelledIds = []; h.cancelError = null; JobSocket.instances = [];
+  h.connectedIds = []; h.manualSockets = false; h.cancelledIds = []; h.cancelError = null; JobSocket.instances = [];
   h.calls = []; h.toasts = []; h.logs = []; h.jobError = null; h.openedPaths = [];
   h.batchErrors = []; h.translated = 1; h.progressTotal = 100; h.onJob = () => {};
   h.onOpen = async () => {};
@@ -858,4 +858,122 @@ for (const locale of ["en", "es"] as const) {
     }
     assert.deepEqual(queue.getState().items.map(i => i.status), ["cancelled", "pending"]);
   });
+}
+
+
+async function withQueueStorage(run: (values: Map<string, string>, block: (value: boolean) => void) => Promise<void>) {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  const values = new Map<string, string>();
+  let blocked = false;
+  Object.defineProperty(globalThis, "localStorage", { configurable: true, value: {
+    getItem: (key: string) => values.get(key) ?? null, removeItem: (key: string) => { values.delete(key); },
+    setItem(key: string, value: string) { if (blocked) throw new Error("quota"); values.set(key, value); },
+  } });
+  try { await run(values, value => { blocked = value; }); }
+  finally {
+    if (descriptor) Object.defineProperty(globalThis, "localStorage", descriptor);
+    else Reflect.deleteProperty(globalThis, "localStorage");
+  }
+}
+
+test("save failure stays visible through runtime changes, queue execution works and retry saves the current queue", async () => {
+  await withQueueStorage(async (values, block) => {
+    block(true); h.preflight = { kind: "extract" };
+    queue.getState().addItem("/fixture/game");
+    assert.equal(queue.getState().persistenceError, true);
+    queue.getState().setPanelOpen(false); queue.getState().setPanelOpen(true);
+    assert.equal(queue.getState().persistenceError, true);
+    await queue.getState().startQueue();
+    assert.equal(queue.getState().items[0].status, "done");
+    assert.equal(queue.getState().persistenceError, true);
+    block(false); queue.getState().retrySave();
+    assert.equal(queue.getState().persistenceError, false);
+    assert.equal(JSON.parse(values.get("locust.queue.v1")!).items[0].status, "done");
+  });
+});
+
+test("adding work salvages valid entries and preserves damaged original bytes", async () => {
+  await withQueueStorage(async values => {
+    const raw = JSON.stringify({ version: 1, items: [{ ...startupItem, status: "pending" }, null], translationParams: params, history: [] });
+    values.set("locust.queue.v1", raw);
+    const { useQueueStore: reloaded } = await import(`./queueStore.ts?damaged=${1}`);
+    assert.equal(reloaded.getState().items.length, 1);
+    reloaded.getState().addItem("/fixture/new");
+    assert.equal(reloaded.getState().items.length, 2);
+    assert.ok([...values.entries()].some(([key, value]) => key !== "locust.queue.v1" && value === raw));
+    assert.equal(reloaded.getState().recoveryAvailable, true);
+  });
+});
+
+test("received job id and database identity are saved together before any progress frame", async () => {
+  await withQueueStorage(async values => {
+    const running = startSocketQueue(); await flushQueue();
+    try {
+      const saved = JSON.parse(values.get("locust.queue.v1")!);
+      assert.deepEqual(saved.activeJob, { jobId: "job", itemId: queue.getState().items[0].id, projectKey: draftProjectKey(jobProject) });
+    } finally { queue.getState().cancelQueue(); JobSocket.instances[0].emit(terminal); await running; }
+    assert.equal(JSON.parse(values.get("locust.queue.v1")!).activeJob ?? null, null);
+  });
+});
+
+for (const locale of ["en", "es"] as const) {
+  for (const outcome of ["cancel", "complete", "missing-cancel", "missing-connect"] as const) {
+    test(`reload reconciles owned job with ${outcome}, preserves project scope and never starts work in ${locale}`, async () => {
+      setLocale(locale); h.manualSockets = true;
+      await withQueueStorage(async values => {
+        const owned = { ...startupItem, projectPath: jobProject.path, formatId: "renpy" };
+        const next = { ...owned, id: "next", projectPath: "/next", status: "pending" };
+        values.set("locust.queue.v1", JSON.stringify({ version: 1, items: [owned, next], translationParams: params, history: [],
+          activeJob: { jobId: "surviving-job", itemId: owned.id, projectKey: draftProjectKey(jobProject) } }));
+        const ownKey = ["stats", draftProjectKey(jobProject)];
+        const otherKey = ["stats", draftProjectKey(originalProject)];
+        queryClient.setQueryData(ownKey, "own"); queryClient.setQueryData(otherKey, "other");
+        const { useQueueStore: reloaded } = await import(`./queueStore.ts?reload=${locale}-${outcome}`);
+        await flushQueue();
+        try {
+          assert.equal(reloaded.getState().activeJobId, "surviving-job");
+          assert.equal(reloaded.getState().isRunning, true);
+          assert.deepEqual(h.connectedIds, ["surviving-job"]);
+          assert.equal(h.calls.length, 0);
+          JobSocket.instances[0].emit({ type: "string_translated", seq: 1 });
+          assert.ok(queryClient.getQueryData(["workflow-last-edit", draftProjectKey(jobProject)]));
+          assert.equal(queryClient.getQueryData(["workflow-last-edit", draftProjectKey(originalProject)]), undefined);
+          reloaded.getState().retryFailed(); await reloaded.getState().startQueue();
+          assert.ok(!h.calls.includes("translate"));
+          if (outcome.includes("missing")) {
+            if (outcome === "missing-cancel") {
+              h.cancelError = new ApiError('404: {"error":"job not found"}');
+              reloaded.getState().cancelQueue();
+            } else JobSocket.instances[0].emit({ type: "failed", error: "404: job not found" });
+            await flushQueue();
+            assert.equal(reloaded.getState().items[0].error, t("queue.jobOutcomeUnknown"));
+            assert.equal(reloaded.getState().items[0].status, "error");
+          } else {
+            if (outcome === "cancel") {
+              JobSocket.instances[0].emit(firstBatch); JobSocket.instances[0].close(); await flushQueue();
+              assert.equal(reloaded.getState().disconnected, true);
+              reloaded.getState().reconnectJob(); await flushQueue();
+              assert.deepEqual(h.connectedIds, ["surviving-job", "surviving-job"]);
+              reloaded.getState().cancelQueue(); await flushQueue();
+              assert.deepEqual(h.cancelledIds, ["surviving-job"]);
+            }
+            JobSocket.instances[JobSocket.instances.length - 1].emit(terminal); await flushQueue();
+            assert.equal(reloaded.getState().items[0].status, outcome === "cancel" ? "cancelled" : "done");
+            assert.equal(reloaded.getState().items[0].error, null);
+          }
+          assert.equal(reloaded.getState().activeJobId, null);
+          assert.equal(reloaded.getState().isRunning, false);
+          assert.equal(reloaded.getState().items[1].status, "pending");
+          assert.equal(reloaded.getState().history.length, 1);
+          assert.ok(![...values.keys()].some(key => key.startsWith("locust.queue.v1.recovery")), "normal terminal transitions must not create damaged backups");
+          assert.equal(queryClient.getQueryState(ownKey)?.isInvalidated, true);
+          assert.equal(queryClient.getQueryState(otherKey)?.isInvalidated, false);
+          assert.ok(!h.calls.includes("translate")); assert.ok(!h.calls.includes("validate"));
+          assert.deepEqual(h.openedPaths, []);
+        } finally {
+          if (reloaded.getState().activeJobId) { h.cancelError = null; reloaded.getState().cancelQueue(); JobSocket.instances[JobSocket.instances.length - 1]?.emit(terminal); await flushQueue(); }
+        }
+      });
+    });
+  }
 }

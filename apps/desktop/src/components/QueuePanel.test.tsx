@@ -14,6 +14,7 @@ const item: QueueItem = { id: "error", projectName: "Game", projectPath: "/game"
 const state = {
   items: [item, { ...item, id: "cancelled", status: "cancelled", error: null }], isPanelOpen: true, isRunning: false,
   disconnected: false, reconnectJob() {}, cancelQueue() {},
+  persistenceError: false, recoveryAvailable: false, retrySave() {},
   translationParams: null,
   history: [{ id: "history", projectName: "Previous game", projectPath: "/previous", status: "done",
     finishedAt: "2026-10-19T12:00:00.000Z", completed: 3, total: 5, costSoFar: 9, costIsComplete: false, validationIssues: 2 }],
@@ -82,5 +83,24 @@ for (const locale of ["en", "es"] as const) {
       state.disconnected = false;
       assert.ok(!render().includes(t("queue.connectionLostHint")));
     } finally { state.isRunning = false; state.disconnected = false; }
+  });
+}
+
+
+for (const locale of ["en", "es"] as const) {
+  test(`QueuePanel keeps a localized unsaved warning and save retry available during execution in ${locale}`, () => {
+    setLocale(locale); state.persistenceError = true; state.isRunning = true;
+    try {
+      const html = render();
+      assert.match(html, /role="alert"/);
+      assert.ok(html.includes(locale === "en" ? "Queue not saved" : "Cola sin guardar"));
+      assert.ok(html.includes(t("queue.notSavedHint")));
+      const button = (html.match(/<button\b[^>]*>[\s\S]*?<\/button>/g) ?? []).find(b => b.includes(t("queue.retrySave")));
+      assert.ok(button); assert.ok(!button.includes('disabled=""'));
+      state.persistenceError = false;
+      assert.ok(!render().includes(t("queue.notSavedHint")));
+      state.recoveryAvailable = true;
+      assert.ok(render().includes(t("queue.recoveryAvailable")));
+    } finally { state.persistenceError = false; state.recoveryAvailable = false; state.isRunning = false; }
   });
 }

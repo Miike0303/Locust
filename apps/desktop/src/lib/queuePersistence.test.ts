@@ -44,11 +44,8 @@ test("queue restore converts only in-flight items to interrupted errors and pres
   }
 });
 
-test("queue restore ignores malformed, wrong-version and invalid-shaped data", () => {
-  for (const raw of [null, "{", "null", "[]", JSON.stringify({ ...snapshot, version: 2 }),
-    JSON.stringify({ ...snapshot, version: 1, items: [{ ...item, progress: null }] }),
-    JSON.stringify({ ...snapshot, version: 1, translationParams: { provider_id: "mock" } }),
-    JSON.stringify({ ...snapshot, version: 1, history: [{ ...history[0], finishedAt: "invalid" }] })]) {
+test("queue restore ignores malformed and unsupported snapshots", () => {
+  for (const raw of [null, "{", "null", "[]", JSON.stringify({ ...snapshot, version: 2 })]) {
     assert.deepEqual(restoreQueue(raw), empty);
   }
 });
@@ -67,10 +64,79 @@ test("queue storage uses the versioned key and caps newest-first history at 20",
   const many = Array.from({ length: 25 }, (_, i) => ({ ...history[0], id: String(i) }));
   let raw = "";
   const storage = {
-    getItem(key: string) { assert.equal(key, QUEUE_STORAGE_KEY); return raw; },
+    getItem(key: string) { return key === QUEUE_STORAGE_KEY ? raw || null : null; },
     setItem(key: string, value: string) { assert.equal(key, "locust.queue.v1"); raw = value; }, removeItem() {},
   };
   writeQueue({ ...snapshot, history: many }, storage);
   assert.deepEqual(readQueue(storage).history, many.slice(0, 20));
   assert.deepEqual(restoreQueue(JSON.stringify({ ...snapshot, version: 1, history: many })).history, many.slice(0, 20));
+});
+
+
+test("queue writes report quota, security and unavailable-storage failures and allow retry", () => {
+  for (const reason of ["QuotaExceededError", "SecurityError"]) {
+    let blocked = true;
+    const values = new Map<string, string>();
+    const storage = { getItem: (key: string) => values.get(key) ?? null, removeItem() {},
+      setItem(key: string, value: string) { if (blocked) throw new Error(reason); values.set(key, value); } };
+    assert.equal(writeQueue(snapshot, storage)?.saved, false);
+    assert.equal(values.size, 0);
+    blocked = false;
+    assert.equal(writeQueue(snapshot, storage)?.saved, true);
+    assert.deepEqual(readQueue(storage).items, [item]);
+  }
+  assert.equal(writeQueue(snapshot, null)?.saved, false);
+});
+
+test("partly invalid snapshots salvage valid items, settings and history independently", () => {
+  const restored = restoreQueue(JSON.stringify({ ...snapshot, version: 1,
+    items: [item, { ...item, id: "bad", progress: null }], history: [null, ...history] }));
+  assert.deepEqual(restored, snapshot);
+  assert.deepEqual(restoreQueue(JSON.stringify({ ...snapshot, version: 1,
+    translationParams: {}, history: [null, ...history] })), { ...snapshot, translationParams: null });
+  assert.deepEqual(restoreQueue(JSON.stringify({ ...snapshot, version: 1, history: null })), { ...snapshot, history: [] });
+});
+
+test("damaged original bytes survive subsequent writes, including repeated damage", () => {
+  const originals = ["{broken", JSON.stringify({ ...snapshot, version: 1, items: [item, null] })];
+  const values = new Map<string, string>();
+  const storage = { getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => { values.set(key, value); }, removeItem() {} };
+  for (const raw of originals) {
+    values.set(QUEUE_STORAGE_KEY, raw);
+    readQueue(storage);
+    assert.equal(writeQueue({ ...snapshot, items: [...snapshot.items, { ...item, id: "added" }] }, storage)?.saved, true);
+    assert.ok([...values.entries()].some(([key, value]) => key !== QUEUE_STORAGE_KEY && value === raw));
+  }
+  for (const raw of originals) assert.ok([...values.values()].includes(raw));
+});
+
+test("a failed recovery copy leaves the original untouched until a successful retry", () => {
+  const original = "{unreadable";
+  const values = new Map([[QUEUE_STORAGE_KEY, original]]);
+  let blocked = true;
+  const storage = { getItem: (key: string) => values.get(key) ?? null, removeItem() {},
+    setItem(key: string, value: string) { if (blocked && key !== QUEUE_STORAGE_KEY) throw new Error("quota"); values.set(key, value); } };
+  assert.equal(writeQueue(snapshot, storage)?.saved, false);
+  assert.equal(values.get(QUEUE_STORAGE_KEY), original);
+  blocked = false;
+  assert.equal(writeQueue(snapshot, storage)?.saved, true);
+  assert.ok([...values.entries()].some(([key, value]) => key !== QUEUE_STORAGE_KEY && value === original));
+});
+
+const owner = { jobId: "owned-job", itemId: item.id, projectKey: JSON.stringify(["/game.locust.db", "/game", "renpy"]) };
+test("queue persists job ownership with its project identity and restores translation for reconciliation", () => {
+  const state = { ...snapshot, items: [{ ...item, status: "translating" as const }], activeJob: owner };
+  assert.deepEqual(restoreQueue(serializeQueue(state)), state);
+});
+
+test("invalid or mismatched job ownership cannot attach a queued project to another job", () => {
+  for (const activeJob of [{ ...owner, itemId: "missing" }, { ...owner, projectKey: "invalid" },
+    { ...owner, projectKey: JSON.stringify(["other.db", "/other", "renpy"]) }]) {
+    const restored = restoreQueue(JSON.stringify({ ...snapshot, version: 1,
+      items: [{ ...item, status: "translating" }], activeJob }));
+    assert.equal(restored.items[0].status, "error");
+    assert.equal(restored.items[0].error, "queue.interrupted");
+    assert.equal(restored.activeJob ?? null, null);
+  }
 });

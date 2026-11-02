@@ -3,6 +3,7 @@ import type { QueueItem } from "../stores/queueStore";
 import { browserStorage, type StringStorage } from "./storage";
 
 export const QUEUE_STORAGE_KEY = "locust.queue.v1";
+export const QUEUE_RECOVERY_KEY = `${QUEUE_STORAGE_KEY}.recovery`;
 export const MAX_QUEUE_HISTORY = 20;
 export interface QueueHistoryEntry {
   id: string;
@@ -16,7 +17,16 @@ export interface QueueHistoryEntry {
   costIsComplete: boolean;
   validationIssues: number | null;
 }
+export interface QueueJobOwner {
+  jobId: string;
+  itemId: string;
+  /** Canonical [database path, source path, format] identity, independent of the open UI project. */
+  projectKey: string;
+}
 export interface PersistedQueue {
+  activeJob?: QueueJobOwner | null;
+  /** Read metadata only; never serialized into the live snapshot. */
+  recoveryAvailable?: boolean;
   items: QueueItem[];
   translationParams: TranslationStartParams | null;
   history: QueueHistoryEntry[];
@@ -63,49 +73,103 @@ function copyItem(item: QueueItem): QueueItem {
     progress: { completed, total, costSoFar, ...(costIsComplete === undefined ? {} : { costIsComplete }), startedAt } };
 }
 
-/** Pure, versioned snapshot: never serialize the store or its runtime fields. */
+function validOwner(value: unknown, items: QueueItem[]): value is QueueJobOwner {
+  if (!record(value) || typeof value.jobId !== "string" || !value.jobId ||
+    typeof value.itemId !== "string" || typeof value.projectKey !== "string") return false;
+  const item = items.find(i => i.id === value.itemId && i.status === "translating");
+  if (!item) return false;
+  try {
+    const key: unknown = JSON.parse(value.projectKey);
+    return Array.isArray(key) && key.length === 3 && nullableString(key[0]) &&
+      key[1] === item.projectPath && typeof key[2] === "string" && key[2] === item.formatId;
+  } catch { return false; }
+}
+
+/** Pure, versioned snapshot: serialize only durable work and its backend owner. */
 export function serializeQueue<T extends PersistedQueue>(state: T): string | null {
   try {
     return JSON.stringify({ version: 1, items: state.items.map(copyItem),
-      translationParams: state.translationParams, history: state.history.slice(0, MAX_QUEUE_HISTORY) });
-  } catch {
-    return null;
-  }
+      translationParams: state.translationParams, history: state.history.slice(0, MAX_QUEUE_HISTORY),
+      ...(state.activeJob ? { activeJob: { jobId: state.activeJob.jobId, itemId: state.activeJob.itemId,
+        projectKey: state.activeJob.projectKey } } : {}),
+    });
+  } catch { return null; }
 }
 
-/** Pure restore; interrupted runs require an explicit retry and never auto-start. */
-export function restoreQueue(raw: string | null): PersistedQueue {
+function decodeQueue(raw: string | null): { snapshot: PersistedQueue; damaged: boolean } {
+  if (raw === null) return { snapshot: emptyQueue(), damaged: false };
   try {
-    if (raw === null) return emptyQueue();
     const value: unknown = JSON.parse(raw);
-    if (!record(value) || value.version !== 1 || !Array.isArray(value.items) || !value.items.every(validItem) ||
-      !validParams(value.translationParams) || !Array.isArray(value.history) || !value.history.every(validHistory)) return emptyQueue();
+    if (!record(value) || value.version !== 1) {
+      return { snapshot: emptyQueue(), damaged: true };
+    }
+    const items = Array.isArray(value.items) ? value.items.filter(validItem) : [];
+    const history = Array.isArray(value.history) ? value.history.filter(validHistory) : [];
+    const params = value.translationParams;
+    const paramsValid = validParams(params);
+    const owner = value.activeJob;
+    const ownerValid = validOwner(owner, items);
+    const activeJob = ownerValid ? { jobId: owner.jobId, itemId: owner.itemId, projectKey: owner.projectKey } : null;
     return {
-      items: value.items.map(item => {
-        const copy = copyItem(item);
-        return ["extracting", "translating", "validating"].includes(copy.status)
-          ? { ...copy, status: "error", error: "queue.interrupted" } : copy;
-      }),
-      translationParams: value.translationParams,
-      history: value.history.slice(0, MAX_QUEUE_HISTORY),
+      damaged: !Array.isArray(value.items) || items.length !== value.items.length ||
+        !Array.isArray(value.history) || history.length !== value.history.length || !paramsValid ||
+        (value.activeJob != null && !ownerValid),
+      snapshot: {
+        items: items.map(item => {
+          const copy = copyItem(item);
+          return ["extracting", "translating", "validating"].includes(copy.status) && copy.id !== activeJob?.itemId
+            ? { ...copy, status: "error", error: "queue.interrupted" } : copy;
+        }),
+        translationParams: paramsValid ? params : null,
+        history: history.slice(0, MAX_QUEUE_HISTORY),
+        ...(activeJob ? { activeJob } : {}),
+      },
     };
-  } catch {
-    return emptyQueue();
-  }
+  } catch { return { snapshot: emptyQueue(), damaged: true }; }
+}
+
+/** Legacy interrupted work stays idle; owned translations are reconciled by the store. */
+export function restoreQueue(raw: string | null): PersistedQueue {
+  return decodeQueue(raw).snapshot;
 }
 
 export function readQueue(storage?: StringStorage | null): PersistedQueue {
   try {
-    return restoreQueue((storage === undefined ? browserStorage() : storage)?.getItem(QUEUE_STORAGE_KEY) ?? null);
-  } catch {
-    return emptyQueue();
-  }
+    const target = storage === undefined ? browserStorage() : storage;
+    const { snapshot, damaged } = decodeQueue(target?.getItem(QUEUE_STORAGE_KEY) ?? null);
+    return damaged || target?.getItem(QUEUE_RECOVERY_KEY) != null
+      ? { ...snapshot, recoveryAvailable: true } : snapshot;
+  } catch { return emptyQueue(); }
 }
-export function writeQueue(state: PersistedQueue, storage?: StringStorage | null): void {
+
+export interface QueueSaveResult { saved: boolean; recoveryAvailable: boolean }
+
+/** Preserve damaged bytes before replacement. A failed copy must leave the live key untouched. */
+export function writeQueue(state: PersistedQueue, storage?: StringStorage | null): QueueSaveResult {
+  let recoveryAvailable = state.recoveryAvailable === true;
   try {
+    const target = storage === undefined ? browserStorage() : storage;
     const raw = serializeQueue(state);
-    if (raw !== null) (storage === undefined ? browserStorage() : storage)?.setItem(QUEUE_STORAGE_KEY, raw);
+    if (!target || raw === null) return { saved: false, recoveryAvailable };
+    const original = target.getItem(QUEUE_STORAGE_KEY);
+    recoveryAvailable = recoveryAvailable || target.getItem(QUEUE_RECOVERY_KEY) !== null;
+    if (original !== null && decodeQueue(original).damaged) {
+      recoveryAvailable = true;
+      // Keep every damaged generation, including an older recovery copy.
+      let suffix = 0;
+      let key = QUEUE_RECOVERY_KEY;
+      let previous = target.getItem(key);
+      while (previous !== null && previous !== original) {
+        key = `${QUEUE_RECOVERY_KEY}.${++suffix}`;
+        previous = target.getItem(key);
+      }
+      if (previous === null) target.setItem(key, original);
+      if (target.getItem(key) !== original) return { saved: false, recoveryAvailable };
+    }
+    target.setItem(QUEUE_STORAGE_KEY, raw);
+    return { saved: true, recoveryAvailable };
   } catch {
-    // Blocked storage and quota errors must never interrupt queue execution.
+    // Queue execution can continue, but the caller must keep the failure visible.
+    return { saved: false, recoveryAvailable };
   }
 }
