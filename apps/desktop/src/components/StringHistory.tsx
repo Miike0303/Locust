@@ -4,7 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import { getStringHistory } from "../lib/api";
 import { useLocale, useT } from "../lib/i18n";
-import { canRestoreRevision, historyStatusLabel } from "../lib/stringHistory";
+import { canRestoreBefore, canRestoreRevision, historyStatusLabel } from "../lib/stringHistory";
 import DiffView from "./DiffView";
 
 interface StringHistoryProps {
@@ -50,10 +50,17 @@ export default function StringHistory({ projectKey, entryId, translation, busy, 
           <DiffView entryId={entryId} originalText={revision.old_translation ?? ""}
             translatedText={revision.new_translation ?? ""} compact
             originalLabel={t("detail.history.before")} translatedLabel={t("detail.history.after")} />
-          {canRestoreRevision(revision.new_translation, translation) && <button type="button" disabled={busy}
-            className="text-accent-fg hover:underline disabled:opacity-50" onClick={() => onRestore(revision.new_translation!)}>
-            {t("detail.history.restore")}
-          </button>}
+          <div className="flex items-center gap-3">
+            {canRestoreBefore(revision.old_translation, translation) && revision.old_translation !== revision.new_translation &&
+              <button type="button" disabled={busy}
+                className="text-accent-fg hover:underline disabled:opacity-50" onClick={() => onRestore(revision.old_translation!)}>
+                {t("detail.history.restoreBefore")}
+              </button>}
+            {canRestoreRevision(revision.new_translation, translation) && <button type="button" disabled={busy}
+              className="text-accent-fg hover:underline disabled:opacity-50" onClick={() => onRestore(revision.new_translation!)}>
+              {t("detail.history.restore")}
+            </button>}
+          </div>
         </article>)}
       </div>}
     </section>

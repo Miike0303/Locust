@@ -18,3 +18,7 @@ export function historyStatusLabel(status: string | null, t: TranslateFn): strin
 export function canRestoreRevision(translation: string | null, current: string | null): translation is string {
   return translation !== null && translation !== current;
 }
+
+export function canRestoreBefore(old: string | null, current: string | null): old is string {
+  return canRestoreRevision(old, current);
+}
