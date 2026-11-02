@@ -1426,12 +1426,22 @@ impl FormatPlugin for TyranoPlugin {
                         continue;
                     }
                 };
-                if entry.unpacked {
-                    let normalized = locust_core::patch::zipsec::normalize_entry_name(&entry.path);
-                    let relative =
-                        locust_core::patch::zipsec::safe_entry_path(&normalized, &entry.path)?;
-                    guard_target(game_lock, &archive.unpacked_dir().join(relative))?;
-                }
+                let unpacked_disk = if entry.unpacked {
+                    let disk = match archive.unpacked_entry_path(entry) {
+                        Ok(disk) => disk,
+                        Err(e) => {
+                            report
+                                .warnings
+                                .push(format!("read {archive_rel}/{inner}: {e}"));
+                            report.skip("read_error", file_entries.len());
+                            continue;
+                        }
+                    };
+                    guard_target(game_lock, &disk)?;
+                    Some(disk)
+                } else {
+                    None
+                };
                 let bytes = match archive.read_entry(entry) {
                     Ok(b) => b,
                     Err(e) => {
@@ -1448,10 +1458,7 @@ impl FormatPlugin for TyranoPlugin {
                     Ok(Some((encoded, written, _))) => {
                         arch_written += written;
                         let key = inner.replace('\\', "/");
-                        if entry.unpacked {
-                            let disk = archive
-                                .unpacked_dir()
-                                .join(inner.replace('/', std::path::MAIN_SEPARATOR_STR));
+                        if let Some(disk) = unpacked_disk {
                             // Also update size in asar header via replacements map path
                             replacements.insert(key.clone(), encoded.clone());
                             unpacked_writes.push((key, disk, encoded));
@@ -2463,14 +2470,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn unpacked_payload_and_archive_header_are_committed_with_exact_backups() {
-        let dir = tempfile::tempdir().unwrap();
-        let arch_path = dir.path().join("app.asar");
-        let disk = dir.path().join("app.asar.unpacked/data/scenario/scene.ks");
-        fs::create_dir_all(disk.parent().unwrap()).unwrap();
-        let original = b"Original narration.\n";
-        fs::write(&disk, original).unwrap();
+    fn unpacked_scenario_asar(original: &[u8]) -> Vec<u8> {
         let json=serde_json::json!({"files":{"data":{"files":{"scenario":{"files":{"scene.ks":{"size":original.len(),"unpacked":true}}}}}}}).to_string();
         let pad = (4 - json.len() % 4) % 4;
         let mut bytes = Vec::new();
@@ -2484,6 +2484,71 @@ mod tests {
         }
         bytes.extend(json.as_bytes());
         bytes.resize(bytes.len() + pad, 0);
+        bytes
+    }
+
+    #[test]
+    fn w607_unpacked_link_cannot_extract_or_inject_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch_path = dir.path().join("app.asar");
+        let unpacked = dir.path().join("app.asar.unpacked");
+        let disk = unpacked.join("data/scenario/scene.ks");
+        let original = b"Outside narration.\n";
+        let bytes = unpacked_scenario_asar(original);
+        fs::create_dir_all(disk.parent().unwrap()).unwrap();
+        fs::write(&disk, original).unwrap();
+        fs::write(&arch_path, &bytes).unwrap();
+        let plugin = TyranoPlugin::new();
+        let mut entries = plugin.extract(dir.path()).unwrap();
+        assert_eq!(entries.len(), 1);
+        entries[0].translation = Some("Must not be written outside unpacked.".into());
+        // The destination stays inside the selected game, but outside unpacked.
+        // A game-root-only check cannot enforce the ASAR member boundary.
+        let outside = dir.path().join("app.asar.unpacked-other");
+        fs::rename(unpacked.join("data"), &outside).unwrap();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(&outside, unpacked.join("data"));
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&outside, unpacked.join("data"));
+        #[cfg(not(any(windows, unix)))]
+        let linked = Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "directory links unavailable",
+        ));
+        if let Err(error) = linked {
+            eprintln!("SKIP w607_unpacked_link_cannot_extract_or_inject_outside: cannot create directory link: {error}");
+            return;
+        }
+        let extracted = plugin.extract(dir.path());
+        let injected = plugin.inject(dir.path(), &entries);
+        assert_eq!(
+            fs::read(outside.join("scenario/scene.ks")).unwrap(),
+            original
+        );
+        assert_eq!(fs::read(&arch_path).unwrap(), bytes);
+        assert!(
+            extracted.as_ref().map_or(true, |rows| rows.is_empty()),
+            "outside rows: {extracted:?}"
+        );
+        if let Ok(report) = injected {
+            assert_eq!(report.strings_written, 0, "{report:?}");
+            assert_eq!(report.files_modified, 0, "{report:?}");
+            assert!(
+                !report.warnings.is_empty(),
+                "missing refusal warning: {report:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unpacked_payload_and_archive_header_are_committed_with_exact_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch_path = dir.path().join("app.asar");
+        let disk = dir.path().join("app.asar.unpacked/data/scenario/scene.ks");
+        fs::create_dir_all(disk.parent().unwrap()).unwrap();
+        let original = b"Original narration.\n";
+        fs::write(&disk, original).unwrap();
+        let bytes = unpacked_scenario_asar(original);
         fs::write(&arch_path, &bytes).unwrap();
         let plugin = TyranoPlugin::new();
         let mut entries = plugin.extract(dir.path()).unwrap();

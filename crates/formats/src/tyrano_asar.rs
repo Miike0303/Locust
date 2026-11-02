@@ -12,6 +12,9 @@
 //! Each file node has `"offset"` (decimal **string**, relative to base) and
 //! `"size"` (number). Directories are `{"files": { ... }}`. Nodes with
 //! `"unpacked": true` store bytes under sibling `app.asar.unpacked/<path>`.
+//! Unsafe member components reject the entire archive with `AsarError` rather
+//! than being normalized or skipped. Unpacked access also refuses linked paths
+//! and requires the resolved file to remain inside the canonical unpacked root.
 //!
 //! # Integrity
 //! Newer asar JSON may include per-file `"integrity"` hash blocks. On rebuild we
@@ -107,6 +110,22 @@ fn pickle_write_u32(v: u32) -> Vec<u8> {
 
 // ─── Reader ────────────────────────────────────────────────────────────────
 
+fn validate_member_component(name: &str, label: &str) -> Result<(), AsarError> {
+    if name.is_empty() || matches!(name, "." | "..") || name.contains(['/', '\\', ':', '\0']) {
+        return Err(err(label, format!("invalid member component {name:?}")));
+    }
+    Ok(())
+}
+
+fn member_path(prefix: &str, name: &str, label: &str) -> Result<String, AsarError> {
+    validate_member_component(name, label)?;
+    Ok(if prefix.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{prefix}/{name}")
+    })
+}
+
 fn walk_files(
     node: &Value,
     prefix: &str,
@@ -121,11 +140,7 @@ fn walk_files(
             .as_object()
             .ok_or_else(|| err(label, "\"files\" is not an object"))?;
         for (name, child) in map {
-            let path = if prefix.is_empty() {
-                name.clone()
-            } else {
-                format!("{prefix}/{name}")
-            };
+            let path = member_path(prefix, name, label)?;
             if child.get("files").is_some() {
                 walk_files(child, &path, out, label)?;
             } else {
@@ -261,12 +276,44 @@ impl AsarArchive {
         PathBuf::from(s)
     }
 
+    /// Check both lexical member spelling and filesystem confinement. Keep the
+    /// logical path for injection reports; replacement rechecks links at commit.
+    pub(crate) fn unpacked_entry_path(&self, entry: &AsarEntry) -> Result<PathBuf, AsarError> {
+        let label = self.path.display().to_string();
+        let mut relative = PathBuf::new();
+        for component in entry.path.split('/') {
+            validate_member_component(component, &label)?;
+            relative.push(component);
+        }
+        let unsafe_path = |detail: String| {
+            err(
+                &label,
+                format!("unsafe unpacked member {:?}: {detail}", entry.path),
+            )
+        };
+        let root = self.unpacked_dir();
+        // Check before canonicalizing so links/junctions cannot be concealed.
+        locust_core::patch::zipsec::ensure_no_links(&root, &relative)
+            .map_err(|e| unsafe_path(e.to_string()))?;
+        let canonical_root = root
+            .canonicalize()
+            .map_err(|e| unsafe_path(e.to_string()))?;
+        let disk = root.join(relative);
+        let resolved = disk
+            .canonicalize()
+            .map_err(|e| unsafe_path(e.to_string()))?;
+        if !resolved.starts_with(&canonical_root) {
+            return Err(unsafe_path(
+                "resolved path is outside unpacked directory".into(),
+            ));
+        }
+        Ok(disk)
+    }
+
     pub fn read_entry(&self, entry: &AsarEntry) -> Result<Vec<u8>, AsarError> {
         let label = self.path.display().to_string();
         if entry.unpacked {
-            let disk = self
-                .unpacked_dir()
-                .join(entry.path.replace('/', std::path::MAIN_SEPARATOR_STR));
+            let disk = self.unpacked_entry_path(entry)?;
             return std::fs::read(&disk)
                 .map_err(|e| err(&label, format!("unpacked read {} failed: {e}", entry.path)));
         }
@@ -283,14 +330,17 @@ impl AsarArchive {
 
     pub fn scenario_ks_entries(&self) -> impl Iterator<Item = &AsarEntry> {
         self.entries.iter().filter(|e| {
-            let p = e.path.replace('\\', "/");
-            let lower = p.to_ascii_lowercase();
-            lower.contains("data/scenario/")
-                && Path::new(&p)
-                    .extension()
-                    .and_then(|x| x.to_str())
-                    .map(|x| x.eq_ignore_ascii_case("ks"))
-                    .unwrap_or(false)
+            // Member components are validated when the header is read, so a
+            // data/scenario pair at any depth (as the old substring match
+            // allowed, e.g. app/data/scenario) cannot escape the archive.
+            let components: Vec<&str> = e.path.split('/').collect();
+            components.windows(2).any(|pair| {
+                pair[0].eq_ignore_ascii_case("data") && pair[1].eq_ignore_ascii_case("scenario")
+            }) && Path::new(&e.path)
+                .extension()
+                .and_then(|x| x.to_str())
+                .map(|x| x.eq_ignore_ascii_case("ks"))
+                .unwrap_or(false)
         })
     }
 
@@ -395,9 +445,9 @@ fn insert_file_node_map(
     size: u64,
     unpacked: bool,
 ) -> Result<(), AsarError> {
-    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
-    if parts.is_empty() {
-        return Err(err("asar", "empty path"));
+    let parts: Vec<&str> = path.split('/').collect();
+    for part in &parts {
+        validate_member_component(part, "asar")?;
     }
     fn go(
         files: &mut Map<String, Value>,
@@ -522,11 +572,7 @@ fn collect_plan(
         return Ok(());
     };
     for (name, child) in files {
-        let path = if prefix.is_empty() {
-            name.clone()
-        } else {
-            format!("{prefix}/{name}")
-        };
+        let path = member_path(prefix, name, label)?;
         if child.get("files").is_some() {
             collect_plan(child, &path, out, label)?;
         } else {
@@ -565,11 +611,7 @@ fn apply_plan(
     // Collect keys first to avoid borrow issues
     let keys: Vec<String> = files.keys().cloned().collect();
     for name in keys {
-        let path = if prefix.is_empty() {
-            name.clone()
-        } else {
-            format!("{prefix}/{name}")
-        };
+        let path = member_path(prefix, &name, label)?;
         let child = files
             .get_mut(&name)
             .ok_or_else(|| err(label, "missing child"))?;
@@ -607,6 +649,208 @@ mod tests {
             .prefix("locust_asar_")
             .tempdir()
             .unwrap()
+    }
+
+    fn header_bytes(header: &Value) -> Vec<u8> {
+        let pickle = pickle_write_string(&header.to_string());
+        let mut bytes = pickle_write_u32(pickle.len() as u32);
+        bytes.extend(pickle);
+        bytes
+    }
+
+    #[test]
+    fn w607_refuses_unsafe_header_components() {
+        let names = [
+            "..",
+            ".",
+            "",
+            "/root.ks",
+            "C:",
+            "C:relative.ks",
+            "C:/root.ks",
+            "back\\slash.ks",
+            "two/components.ks",
+            "nul\0.ks",
+        ];
+        for name in names {
+            for unpacked in [false, true] {
+                for directory in [false, true] {
+                    for nested in [false, true] {
+                        let file =
+                            serde_json::json!({"size": 0, "offset": "0", "unpacked": unpacked});
+                        let child = if directory {
+                            serde_json::json!({"files": {"scene.ks": file}})
+                        } else {
+                            file
+                        };
+                        let mut header = serde_json::json!({"files": {(name): child}});
+                        if nested {
+                            header = serde_json::json!({"files": {"data": {"files": {"scenario": header}}}});
+                        }
+                        let Err(error) =
+                            AsarArchive::from_bytes("app.asar".into(), header_bytes(&header))
+                        else {
+                            panic!("accepted {name:?}, unpacked={unpacked}, directory={directory}, nested={nested}");
+                        };
+                        assert!(
+                            error.message.contains("invalid member component"),
+                            "{error}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn w607_writer_refuses_unsafe_member_paths() {
+        for path in [
+            "",
+            "/root.ks",
+            "data//scene.ks",
+            "data/./scene.ks",
+            "data/../scene.ks",
+            "data/scenario/",
+            "C:/scene.ks",
+            "data/C:scene.ks",
+            "data\\scene.ks",
+            "nul\0.ks",
+        ] {
+            let error = write_asar(&[(path.into(), Vec::new())]).unwrap_err();
+            assert!(
+                error.message.contains("invalid member component"),
+                "{path:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn w607_rebuild_refuses_mutated_unsafe_header() {
+        let mut archive =
+            AsarArchive::from_bytes("app.asar".into(), write_asar(&[]).unwrap()).unwrap();
+        archive.header = serde_json::json!({"files": {"..": {"files": {"outside.ks": {"size": 0, "unpacked": true}}}}});
+        let error = rebuild_asar(&archive, &HashMap::new()).unwrap_err();
+        assert!(
+            error.message.contains("invalid member component"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn w607_scenario_prefix_is_structural() {
+        let paths = [
+            "data/scenario/main.ks",
+            "DATA/SCENARIO/sub/UPPER.KS",
+            "data/scenario/main.txt",
+            "extra/data/scenario/nested.ks",
+            "metadata/scenario/suffix.ks",
+            "data/scenarios/other.ks",
+        ];
+        let bytes = write_asar(&paths.map(|p| (p.into(), Vec::new()))).unwrap();
+        let archive = AsarArchive::from_bytes("app.asar".into(), bytes).unwrap();
+        let mut actual: Vec<_> = archive
+            .scenario_ks_entries()
+            .map(|e| e.path.as_str())
+            .collect();
+        actual.sort_unstable();
+        // Component pairs at any depth match (nested Electron layouts keep
+        // working); substrings such as metadata/scenario or scenarios do not.
+        assert_eq!(
+            actual,
+            [
+                "DATA/SCENARIO/sub/UPPER.KS",
+                "data/scenario/main.ks",
+                "extra/data/scenario/nested.ks"
+            ]
+        );
+    }
+
+    #[test]
+    fn w607_traversal_header_cannot_read_outside_unpacked() {
+        let dir = tempdir();
+        let outside = dir.path().join("outside.ks");
+        fs::write(&outside, b"outside sentinel").unwrap();
+        fs::create_dir_all(dir.path().join("app.asar.unpacked/data/scenario")).unwrap();
+        let mut child =
+            serde_json::json!({"files": {"outside.ks": {"size": 16, "unpacked": true}}});
+        for name in ["..", "..", "..", "scenario", "data"] {
+            child = serde_json::json!({"files": {(name): child}});
+        }
+        let result = AsarArchive::from_bytes(dir.path().join("app.asar"), header_bytes(&child));
+        if let Ok(archive) = &result {
+            for entry in archive.scenario_ks_entries() {
+                assert!(
+                    archive.read_entry(entry).is_err(),
+                    "read outside unpacked: {}",
+                    entry.path
+                );
+            }
+        }
+        let error = result.unwrap_err();
+        assert!(
+            error.message.contains("invalid member component"),
+            "{error}"
+        );
+        assert_eq!(fs::read(outside).unwrap(), b"outside sentinel");
+    }
+
+    #[test]
+    fn w607_read_entry_validates_caller_supplied_path() {
+        let dir = tempdir();
+        fs::create_dir_all(dir.path().join("app.asar.unpacked/data/scenario")).unwrap();
+        fs::write(dir.path().join("outside.ks"), b"outside").unwrap();
+        let archive =
+            AsarArchive::from_bytes(dir.path().join("app.asar"), write_asar(&[]).unwrap()).unwrap();
+        for path in [
+            "data/scenario/../../../outside.ks",
+            "../outside.ks",
+            "data//scene.ks",
+            "data\\scene.ks",
+        ] {
+            let entry = AsarEntry {
+                path: path.into(),
+                offset: 0,
+                size: 7,
+                unpacked: true,
+            };
+            let error = archive.read_entry(&entry).unwrap_err();
+            assert!(
+                error.message.contains("invalid member component"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn w607_unpacked_read_refuses_interior_directory_link() {
+        let dir = tempdir();
+        let unpacked = dir.path().join("app.asar.unpacked");
+        fs::create_dir(&unpacked).unwrap();
+        let outside = dir.path().join("app.asar.unpacked-other");
+        fs::create_dir_all(outside.join("scenario")).unwrap();
+        fs::write(outside.join("scenario/scene.ks"), b"outside").unwrap();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(&outside, unpacked.join("data"));
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&outside, unpacked.join("data"));
+        #[cfg(not(any(windows, unix)))]
+        let linked = Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "directory links unavailable",
+        ));
+        if let Err(error) = linked {
+            eprintln!("SKIP w607_unpacked_read_refuses_interior_directory_link: cannot create directory link: {error}");
+            return;
+        }
+        let header = serde_json::json!({"files": {"data": {"files": {"scenario": {"files": {"scene.ks": {"size": 7, "unpacked": true}}}}}}});
+        let archive =
+            AsarArchive::from_bytes(dir.path().join("app.asar"), header_bytes(&header)).unwrap();
+        let error = archive.read_entry(&archive.entries[0]).unwrap_err();
+        assert!(error.message.contains("unsafe unpacked member"), "{error}");
+        assert_eq!(
+            fs::read(outside.join("scenario/scene.ks")).unwrap(),
+            b"outside"
+        );
     }
 
     #[test]
