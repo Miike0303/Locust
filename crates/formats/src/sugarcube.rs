@@ -812,76 +812,9 @@ fn is_translatable_text(line: &str) -> bool {
         return false;
     }
 
-    // CSS properties
-    if s.contains(':')
-        && (s.contains("px")
-            || s.contains("em")
-            || s.contains("rem")
-            || s.contains("vh")
-            || s.contains("vw")
-            || s.contains("rgb")
-            || (s.contains("#") && s.len() < 50)
-            || s.contains("var(--")
-            || s.contains("solid")
-            || s.contains("none;")
-            || s.contains("flex")
-            || s.contains("grid")
-            || s.contains("block")
-            || s.contains("absolute")
-            || s.contains("relative")
-            || s.contains("fixed"))
-    {
-        return false;
-    }
-
-    if s.ends_with(';') && s.contains(':') {
-        return false;
-    }
-    if s.starts_with('.') && s.contains('{') {
-        return false;
-    }
-    if s.contains("background")
-        || s.contains("font-size")
-        || s.contains("margin")
-        || s.contains("padding")
-        || s.contains("border")
-        || s.contains("display:")
-        || s.contains("position:")
-        || s.contains("color:")
-        || s.contains("width:")
-        || s.contains("height:")
-        || s.contains("text-align")
-        || s.contains("box-shadow")
-        || s.contains("opacity")
-        || s.contains("z-index")
-        || s.contains("overflow")
-        || s.contains("transform")
-        || s.contains("transition")
-        || s.contains("cursor:")
-    {
-        return false;
-    }
-
-    // JavaScript patterns
-    if s.starts_with("var ")
-        || s.starts_with("let ")
-        || s.starts_with("const ")
-        || s.starts_with("function")
-        || s.starts_with("return ")
-        || s.starts_with("if (")
-        || s.starts_with("else")
-        || s.starts_with("for (")
-        || s.starts_with("while (")
-        || s.contains("document.")
-        || s.contains("window.")
-        || s.contains("console.")
-        || s.contains("addEventListener")
-        || s.contains("querySelector")
-        || s.contains("setTimeout")
-        || s.contains("=>")
-        || s.contains("===")
-        || s.contains("!==")
-    {
+    // Visible fragments have already had script/style/widget bodies removed.
+    // Reject complete code shapes, not words that also occur in dialogue.
+    if looks_like_css(s) || looks_like_javascript(s) {
         return false;
     }
 
@@ -898,6 +831,439 @@ fn is_translatable_text(line: &str) -> bool {
     }
 
     true
+}
+
+// This is deliberately a conservative recognizer, not a CSS parser. Unknown
+// properties or values stay available to translators rather than losing prose.
+fn looks_like_css(s: &str) -> bool {
+    if let Some((selector, body)) = s.split_once('{') {
+        let selector = selector.trim();
+        let selector_shape = !selector.is_empty()
+            && selector.chars().all(|ch| {
+                ch.is_ascii_alphanumeric()
+                    || ch.is_ascii_whitespace()
+                    || "-_.#:,>+~*[]=\"'()".contains(ch)
+            });
+        if !selector_shape {
+            return false;
+        }
+        let explicit_selector = selector
+            .strip_prefix(['.', '#', ':'])
+            .is_some_and(|rest| rest.starts_with(|ch: char| ch.is_ascii_alphabetic() || ch == '_'))
+            || selector.starts_with(['[', '*'])
+            || matches!(selector, "html" | "body" | "div" | "span" | "p" | "a");
+        if let Some(body) = body.trim().strip_suffix('}') {
+            return explicit_selector || looks_like_css_declarations(body.trim());
+        }
+        // Also recognize the opening line of a multiline selector block.
+        return body.trim().is_empty() && explicit_selector;
+    }
+    looks_like_css_declarations(s)
+}
+
+fn looks_like_css_declarations(s: &str) -> bool {
+    let s = s.trim().strip_suffix(';').unwrap_or(s).trim();
+    !s.is_empty()
+        && s.split(';').all(|declaration| {
+            let Some((property, value)) = declaration.split_once(':') else {
+                return false;
+            };
+            // A property is one identifier; speaker labels and phrases before a
+            // colon cannot be CSS properties. Sentence punctuation in a value
+            // also fails the token checks below.
+            let property = property.trim().to_ascii_lowercase();
+            if !is_css_property(&property) {
+                return false;
+            }
+            let value = value.trim();
+            let value = value.strip_suffix("!important").unwrap_or(value).trim();
+            if value.is_empty() {
+                return false;
+            }
+            // Keep function arguments (including spaces) in a single token.
+            let mut depth = 0usize;
+            let mut quote = None;
+            value
+                .split(|ch: char| {
+                    if let Some(delimiter) = quote {
+                        if ch == delimiter {
+                            quote = None;
+                        }
+                    } else if matches!(ch, '\'' | '"') {
+                        quote = Some(ch);
+                    } else if ch == '(' {
+                        depth += 1;
+                    } else if ch == ')' {
+                        depth = depth.saturating_sub(1);
+                    }
+                    ch.is_whitespace() && depth == 0 && quote.is_none()
+                })
+                .filter(|token| !token.is_empty())
+                .all(is_css_value_token)
+        })
+}
+
+fn is_css_property(property: &str) -> bool {
+    const PROPERTIES: &[&str] = &[
+        "color",
+        "background",
+        "background-color",
+        "background-image",
+        "background-position",
+        "background-repeat",
+        "background-size",
+        "margin",
+        "margin-top",
+        "margin-right",
+        "margin-bottom",
+        "margin-left",
+        "padding",
+        "padding-top",
+        "padding-right",
+        "padding-bottom",
+        "padding-left",
+        "border",
+        "border-top",
+        "border-right",
+        "border-bottom",
+        "border-left",
+        "border-color",
+        "border-width",
+        "border-style",
+        "border-radius",
+        "font",
+        "font-size",
+        "font-family",
+        "font-weight",
+        "font-style",
+        "line-height",
+        "letter-spacing",
+        "text-align",
+        "text-decoration",
+        "text-transform",
+        "text-shadow",
+        "white-space",
+        "word-break",
+        "display",
+        "position",
+        "top",
+        "right",
+        "bottom",
+        "left",
+        "width",
+        "height",
+        "min-width",
+        "max-width",
+        "min-height",
+        "max-height",
+        "box-shadow",
+        "box-sizing",
+        "opacity",
+        "z-index",
+        "overflow",
+        "overflow-x",
+        "overflow-y",
+        "transform",
+        "transform-origin",
+        "transition",
+        "transition-property",
+        "transition-duration",
+        "transition-timing-function",
+        "animation",
+        "animation-duration",
+        "cursor",
+        "visibility",
+        "float",
+        "clear",
+        "vertical-align",
+        "flex",
+        "flex-direction",
+        "flex-wrap",
+        "flex-grow",
+        "flex-shrink",
+        "flex-basis",
+        "align-items",
+        "align-self",
+        "align-content",
+        "justify-content",
+        "gap",
+        "row-gap",
+        "column-gap",
+        "grid",
+        "grid-template-columns",
+        "grid-template-rows",
+        "grid-column",
+        "grid-row",
+        "content",
+        "list-style",
+        "outline",
+        "outline-color",
+        "outline-width",
+        "outline-style",
+    ];
+    PROPERTIES.contains(&property)
+}
+
+fn is_css_value_token(token: &str) -> bool {
+    let token = token.trim_end_matches(',').to_ascii_lowercase();
+    let token = token.as_str();
+    if let Some(hex) = token.strip_prefix('#') {
+        return matches!(hex.len(), 3 | 4 | 6 | 8) && hex.bytes().all(|b| b.is_ascii_hexdigit());
+    }
+    if let Some((function, arguments)) = token.split_once('(') {
+        return arguments.ends_with(')')
+            && matches!(
+                function,
+                "var"
+                    | "rgb"
+                    | "rgba"
+                    | "hsl"
+                    | "hsla"
+                    | "hwb"
+                    | "color"
+                    | "color-mix"
+                    | "url"
+                    | "calc"
+                    | "min"
+                    | "max"
+                    | "clamp"
+                    | "linear-gradient"
+                    | "radial-gradient"
+                    | "repeating-linear-gradient"
+                    | "translate"
+                    | "translatex"
+                    | "translatey"
+                    | "translate3d"
+                    | "rotate"
+                    | "scale"
+                    | "skew"
+                    | "matrix"
+                    | "cubic-bezier"
+                    | "steps"
+            )
+            && (function != "var" || arguments.starts_with("--"));
+    }
+    if (token.starts_with('"') && token.ends_with('"'))
+        || (token.starts_with('\'') && token.ends_with('\''))
+    {
+        return token.len() >= 2;
+    }
+    let number = |s: &str| {
+        s.chars().any(|ch| ch.is_ascii_digit()) && s.parse::<f64>().is_ok_and(|n| n.is_finite())
+    };
+    if number(token)
+        || [
+            "px", "em", "rem", "vh", "vw", "vmin", "vmax", "dvh", "dvw", "ch", "ex", "cm", "mm",
+            "in", "pt", "pc", "%", "ms", "s", "deg", "turn", "fr",
+        ]
+        .iter()
+        .any(|unit| token.strip_suffix(unit).is_some_and(number))
+    {
+        return true;
+    }
+    const KEYWORDS: &[&str] = &[
+        "auto",
+        "none",
+        "normal",
+        "initial",
+        "inherit",
+        "unset",
+        "revert",
+        "transparent",
+        "currentcolor",
+        "black",
+        "white",
+        "red",
+        "green",
+        "blue",
+        "yellow",
+        "gray",
+        "grey",
+        "orange",
+        "purple",
+        "pink",
+        "brown",
+        "cyan",
+        "magenta",
+        "silver",
+        "navy",
+        "teal",
+        "lime",
+        "maroon",
+        "olive",
+        "aqua",
+        "fuchsia",
+        "rebeccapurple",
+        "solid",
+        "dashed",
+        "dotted",
+        "double",
+        "hidden",
+        "visible",
+        "block",
+        "inline",
+        "inline-block",
+        "flex",
+        "inline-flex",
+        "grid",
+        "inline-grid",
+        "contents",
+        "table",
+        "table-row",
+        "table-cell",
+        "list-item",
+        "static",
+        "relative",
+        "absolute",
+        "fixed",
+        "sticky",
+        "left",
+        "right",
+        "top",
+        "bottom",
+        "center",
+        "justify",
+        "bold",
+        "bolder",
+        "lighter",
+        "italic",
+        "oblique",
+        "serif",
+        "sans-serif",
+        "monospace",
+        "cursive",
+        "fantasy",
+        "system-ui",
+        "underline",
+        "overline",
+        "line-through",
+        "uppercase",
+        "lowercase",
+        "capitalize",
+        "nowrap",
+        "pre",
+        "pre-wrap",
+        "pre-line",
+        "break-word",
+        "scroll",
+        "clip",
+        "cover",
+        "contain",
+        "repeat",
+        "no-repeat",
+        "repeat-x",
+        "repeat-y",
+        "border-box",
+        "content-box",
+        "row",
+        "column",
+        "row-reverse",
+        "column-reverse",
+        "wrap",
+        "wrap-reverse",
+        "start",
+        "end",
+        "flex-start",
+        "flex-end",
+        "stretch",
+        "baseline",
+        "space-between",
+        "space-around",
+        "space-evenly",
+        "pointer",
+        "default",
+        "move",
+        "text",
+        "wait",
+        "not-allowed",
+        "all",
+        "ease",
+        "linear",
+        "ease-in",
+        "ease-out",
+        "ease-in-out",
+        "infinite",
+        "inset",
+        "thin",
+        "medium",
+        "thick",
+        "/",
+    ];
+    KEYWORDS.contains(&token) || is_css_property(token)
+}
+
+fn is_javascript_reference(s: &str) -> bool {
+    !s.is_empty()
+        && s.split('.').all(|part| {
+            let mut chars = part.chars();
+            chars
+                .next()
+                .is_some_and(|ch| ch.is_ascii_alphabetic() || matches!(ch, '_' | '$'))
+                && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$'))
+        })
+}
+
+fn looks_like_javascript(s: &str) -> bool {
+    let statement = s.strip_suffix(';').unwrap_or(s).trim();
+    for keyword in ["var ", "let ", "const "] {
+        if let Some(declaration) = statement.strip_prefix(keyword) {
+            let name = declaration
+                .split_once('=')
+                .map_or(declaration, |(name, _)| name)
+                .trim();
+            if is_javascript_reference(name) && (declaration.contains('=') || s.ends_with(';')) {
+                return true;
+            }
+        }
+    }
+    if let Some(rest) = statement.strip_prefix("return ") {
+        // A prose phrase such as "return home before dusk." is not an expression.
+        return (s.ends_with(';') && is_javascript_reference(rest))
+            || matches!(rest, "true" | "false" | "null" | "undefined")
+            || rest.parse::<f64>().is_ok()
+            || ['\'', '"', '`']
+                .iter()
+                .any(|&quote| rest.len() >= 2 && rest.starts_with(quote) && rest.ends_with(quote))
+            || rest
+                .split_once('(')
+                .is_some_and(|(callee, _)| is_javascript_reference(callee) && rest.ends_with(')'));
+    }
+    if let Some(rest) = statement.strip_prefix("function") {
+        if let Some((name, _)) = rest.split_once('(') {
+            if name.trim().is_empty() || is_javascript_reference(name.trim()) {
+                return statement.ends_with(['{', '}']);
+            }
+        }
+    }
+    if let Some(rest) = statement.strip_prefix("else ") {
+        if rest.starts_with("if ") || rest.starts_with("if(") {
+            return looks_like_javascript(rest);
+        }
+    }
+    for keyword in ["if", "for", "while", "else"] {
+        if let Some(rest) = statement.strip_prefix(keyword) {
+            let rest = rest.trim_start();
+            if (rest.starts_with('(') || (keyword == "else" && rest.starts_with('{')))
+                && (statement.ends_with(['{', '}', ')']) || s.ends_with(';'))
+            {
+                return true;
+            }
+        }
+    }
+    // A call must start with a callee, rather than merely mention a JS API.
+    if let Some((callee, _)) = statement.split_once('(') {
+        if is_javascript_reference(callee) && (statement.ends_with(')') || s.ends_with(';')) {
+            return true;
+        }
+    }
+    ["===", "!==", "=>"].iter().any(|operator| {
+        statement.split_once(operator).is_some_and(|(left, right)| {
+            (is_javascript_reference(left.trim()) || left.trim() == "()")
+                && (is_javascript_reference(right.trim())
+                    || right.trim().parse::<f64>().is_ok()
+                    || right.trim().ends_with(')'))
+        })
+    })
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -1241,6 +1607,217 @@ The adventure awaits!</tw-passagedata>
         )
         .unwrap();
         html
+    }
+
+    #[test]
+    fn prose_with_css_and_code_words_roundtrips() {
+        let prose = [
+            "Remember: stay together.",
+            "You cross the border.",
+            "Note: the system is fixed.",
+            "Status: relative calm",
+            "The background music fades as you enter.",
+            "She wrote a warning in the margin.",
+            "The padding in his coat keeps him warm.",
+            "Her font-size complaint makes the printer laugh.",
+            "The text-align setting is hard for him to read.",
+            "A box-shadow would help her see the button.",
+            "The opacity of the fog worries you.",
+            "She mentions the z-index in her design notes.",
+            "The river might overflow before dawn.",
+            "This discovery will transform the town.",
+            "The transition leaves everyone uneasy.",
+            "Warning: the next block is closed.",
+            "Remember: flex your fingers before climbing.",
+            "The grid: a solid wall of light.",
+            "Her answer: absolute silence.",
+            "A small reminder: leave a generous margin.",
+            "color: red with embarrassment.",
+            "position: fixed in her memory.",
+            "margin: a little room to breathe.",
+            "font-size: please make the lettering easier to read.",
+            "color: red; she blushes and looks away.",
+            "width: a narrow path through the trees.",
+            "height: just enough to reach the window.",
+            "cursor: move it over the map.",
+            "She points to the window.",
+            "Check the document.",
+            "He calls it a console.",
+            "elsewhere, someone laughs.",
+            "functionaries line the hall.",
+            "let us go before sunrise.",
+            "return home before dusk.",
+            "She calls it {a border} in her notes.",
+            "color: red.",
+            "margin notes: none;",
+            "let go",
+            "return home",
+        ];
+        let dir_guard = tempdir();
+        let html = create_fixture(dir_guard.path());
+        let wrap = |body: &str| {
+            format!(r#"<tw-passagedata pid="1" name="Start" tags="">{body}</tw-passagedata>"#)
+        };
+        fs::write(&html, wrap(&prose.join("\n"))).unwrap();
+        let plugin = SugarCubePlugin::new();
+        let mut entries = plugin.extract(&html).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.source.as_str())
+                .collect::<Vec<_>>(),
+            prose
+        );
+        let ids: Vec<_> = entries.iter().map(|entry| entry.id.clone()).collect();
+        let translations: Vec<_> = prose
+            .iter()
+            .map(|line| format!("She whispers: {line}"))
+            .collect();
+        for (entry, translation) in entries.iter_mut().zip(&translations) {
+            entry.translation = Some(translation.clone());
+        }
+
+        let report = plugin.inject(&html, &entries).unwrap();
+        assert_eq!(report.strings_written, prose.len());
+        assert_eq!(report.strings_skipped, 0);
+        assert_eq!(report.files_modified, 1);
+        assert_eq!(
+            fs::read_to_string(&html).unwrap(),
+            wrap(&translations.join("\n"))
+        );
+        let extracted = plugin.extract(&html).unwrap();
+        assert_eq!(
+            extracted.iter().map(|entry| &entry.id).collect::<Vec<_>>(),
+            ids.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            extracted
+                .iter()
+                .map(|entry| &entry.source)
+                .collect::<Vec<_>>(),
+            translations.iter().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn css_lines_are_not_extracted() {
+        let css = [
+            "color: red;",
+            "margin: 0 auto;",
+            "border: 1px solid #000",
+            ".cls { color: red; }",
+            ".cls {}",
+            ".cls { --accent: #000; }",
+            "color: red",
+            "POSITION: absolute",
+            "#story { display: grid; }",
+            "body { color: red; }",
+            ".cls {",
+            "}",
+            "font-size: 1.25rem",
+            "width: calc(100vw - 2rem);",
+            "display: flex;",
+            "position: fixed;",
+            "background: var(--panel-bg);",
+            "opacity: 0.8;",
+            "transition: opacity 200ms ease;",
+            "color: #aabbcc",
+            "color: rgb(10, 20, 30);",
+            "font-family: sans-serif;",
+            "margin: 0 auto; padding: 1em;",
+        ];
+        for line in css {
+            let html = format!(
+                r#"<tw-passagedata pid="1" name="Start" tags="">{line}
+Visible dialogue.</tw-passagedata>"#
+            );
+            let entries = SugarCubePlugin::extract_passages(&html, Path::new("test.html"));
+            assert_eq!(entries.len(), 1, "CSS leaked: {line}");
+            assert_eq!(entries[0].source, "Visible dialogue.");
+        }
+    }
+
+    #[test]
+    fn javascript_lines_are_not_extracted() {
+        let javascript = [
+            "var score = 1;",
+            "let ready = true;",
+            "const label = \"Hidden\";",
+            "function greet() { return \"Hidden\"; }",
+            "return \"Hidden\";",
+            "if (ready) { run(); }",
+            "else { run(); }",
+            "for (const item of items) { use(item); }",
+            "while (ready) { tick(); }",
+            "document.querySelector(\"#story\").textContent = \"Hidden\";",
+            "window.alert(\"Hidden\");",
+            "console.log(\"Hidden\");",
+            "button.addEventListener(\"click\", handleClick);",
+            "setTimeout(() => run(), 10);",
+            "items.map(item => item.name);",
+            "score === 1;",
+            "score !== 1;",
+            "querySelector(\".choice\");",
+            "return document.querySelector(\"#story\");",
+            "if (ready) run();",
+            "else if (ready) run();",
+        ];
+        for line in javascript {
+            let html = format!(
+                r#"<tw-passagedata pid="1" name="Start" tags="">{line}
+Visible dialogue.</tw-passagedata>"#
+            );
+            let entries = SugarCubePlugin::extract_passages(&html, Path::new("test.html"));
+            assert_eq!(entries.len(), 1, "JavaScript leaked: {line}");
+            assert_eq!(entries[0].source, "Visible dialogue.");
+        }
+    }
+
+    #[test]
+    fn script_style_and_widget_bodies_stay_hidden_during_injection() {
+        let hidden = [
+            "<script>Hidden ordinary dialogue.</script>",
+            "<style>Hidden ordinary dialogue.</style>",
+            "&lt;script&gt;Hidden ordinary dialogue.&lt;/script&gt;",
+            "&lt;style&gt;Hidden ordinary dialogue.&lt;/style&gt;",
+            "<<script>>Hidden ordinary dialogue.<</script>>",
+            "<<widget \"test\">>Hidden ordinary dialogue.<</widget>>",
+            "&lt;&lt;script&gt;&gt;Hidden ordinary dialogue.&lt;&lt;/script&gt;&gt;",
+            "&lt;&lt;widget \"test\"&gt;&gt;Hidden ordinary dialogue.&lt;&lt;/widget&gt;&gt;",
+        ];
+        let dir_guard = tempdir();
+        let html = create_fixture(dir_guard.path());
+        let plugin = SugarCubePlugin::new();
+        for body in hidden {
+            let original = format!(
+                r#"<tw-passagedata pid="1" name="Start" tags="">{body}
+Visible dialogue.</tw-passagedata>"#
+            );
+            fs::write(&html, &original).unwrap();
+            let mut entries = plugin.extract(&html).unwrap();
+            assert_eq!(entries.len(), 1, "hidden body leaked: {body}");
+            assert_eq!(entries[0].source, "Visible dialogue.");
+            entries[0].translation = Some("Diálogo visible.".into());
+            let report = plugin.inject(&html, &entries).unwrap();
+            assert_eq!(report.strings_written, 1);
+            assert_eq!(
+                fs::read_to_string(&html).unwrap(),
+                original.replace("Visible dialogue.", "Diálogo visible.")
+            );
+        }
+    }
+
+    #[test]
+    fn script_stylesheet_and_widget_passages_are_not_extracted() {
+        for tag in ["script", "stylesheet", "widget"] {
+            let html = format!(
+                r#"<tw-passagedata pid="1" name="Hidden" tags="{tag}">Hidden ordinary dialogue.</tw-passagedata>
+<tw-passagedata pid="2" name="Start" tags="">Visible dialogue.</tw-passagedata>"#
+            );
+            let entries = SugarCubePlugin::extract_passages(&html, Path::new("test.html"));
+            assert_eq!(entries.len(), 1, "hidden passage leaked: {tag}");
+            assert_eq!(entries[0].source, "Visible dialogue.");
+        }
     }
 
     #[test]
