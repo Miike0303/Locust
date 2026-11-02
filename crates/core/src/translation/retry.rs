@@ -133,26 +133,63 @@ fn jitter_delay(base_ms: u64) -> u64 {
     ((base_ms as f64) * factor) as u64
 }
 
+// Provider translation and health-check errors share this envelope. Read only
+// the first matching status so upstream body text cannot override the HTTP code.
+fn returned_status(message: &str) -> Option<u16> {
+    message.split("returned status ").skip(1).find_map(|tail| {
+        let code = tail.get(..3)?;
+        if code.bytes().all(|byte| byte.is_ascii_digit()) {
+            code.parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
+fn bare_status_codes(message: &str) -> impl Iterator<Item = u16> + '_ {
+    let mut after_comparison = false;
+    message.split_whitespace().filter_map(move |token| {
+        let token = token.trim_matches(|c| {
+            matches!(
+                c,
+                '(' | ')' | '[' | ']' | '{' | '}' | ':' | ',' | ';' | '.' | '!' | '?' | '\"' | '\''
+            )
+        });
+        let skip = after_comparison;
+        after_comparison = token.ends_with(['<', '>', '=']);
+        // Preserve bare HTTP codes, but exclude IDs and numeric constraints such
+        // as "max_tokens <= 500", whether or not the operator has a space.
+        if skip || token.len() != 3 {
+            return None;
+        }
+        token.parse().ok()
+    })
+}
+
 pub fn is_retryable(e: &LocustError) -> bool {
     match e {
         LocustError::ProviderError(msg) => {
             let lower = msg.to_ascii_lowercase();
+            if let Some(status) = returned_status(&lower) {
+                return matches!(status, 408 | 425 | 429 | 500..=599);
+            }
             if lower.contains("cancelled")
-                || lower.contains("401")
-                || lower.contains("403")
                 || lower.contains("unauthorized")
                 || lower.contains("forbidden")
             {
                 return false;
             }
-            lower.contains("429")
+            let mut retryable_status = false;
+            for status in bare_status_codes(&lower) {
+                if matches!(status, 401 | 403) {
+                    return false;
+                }
+                retryable_status |= matches!(status, 429 | 500 | 502 | 503 | 504);
+            }
+            retryable_status
                 || lower.contains("rate limit")
                 || lower.contains("timeout")
                 || lower.contains("timed out")
-                || lower.contains("500")
-                || lower.contains("502")
-                || lower.contains("503")
-                || lower.contains("504")
                 || lower.contains("connection")
                 || lower.contains("network")
                 || lower.contains("dns")
@@ -351,6 +388,207 @@ mod tests {
     use super::super::tests::MockProvider;
     use super::*;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn invalid_request_status_is_not_a_retryable_body_number() {
+        let error = LocustError::ProviderError(
+            "OpenAI returned status 400 Bad Request: max_tokens must be <= 500".into(),
+        );
+        assert!(!is_retryable(&error));
+    }
+
+    #[test]
+    fn transient_status_is_not_overridden_by_an_auth_number_in_the_body() {
+        let error = LocustError::ProviderError(
+            "OpenAI returned status 503 Service Unavailable: request_id=401abc".into(),
+        );
+        assert!(is_retryable(&error));
+    }
+
+    #[test]
+    fn status_envelope_classifies_every_http_status_independently_of_the_body() {
+        for status in 100..=599 {
+            let expected = matches!(status, 408 | 425 | 429 | 500..=599);
+            for body in [
+                "max_tokens must be <= 500; timeout; connection; network; dns; rate limit",
+                "request_id=401abc; 403 unauthorized forbidden cancelled; returned status 400",
+            ] {
+                let message = format!("Provider returned status {status}: {body}");
+                assert_eq!(
+                    is_retryable(&LocustError::ProviderError(message.clone())),
+                    expected,
+                    "{message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn authentication_statuses_do_not_retry_real_error_bodies() {
+        for message in [
+            r#"OpenAI returned status 401 Unauthorized: {"error":{"message":"Incorrect API key provided","code":"invalid_api_key"},"request_id":"500abc"}"#,
+            r#"Claude returned status 403 Forbidden: {"error":{"type":"permission_error","message":"Your API key does not have permission; rate limit 429"}}"#,
+        ] {
+            assert!(
+                !is_retryable(&LocustError::ProviderError(message.into())),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn health_check_status_uses_the_same_policy() {
+        for status in 100..=599 {
+            let expected = matches!(status, 408 | 425 | 429 | 500..=599);
+            for suffix in ["", ": timeout 500; request_id=401abc; cancelled"] {
+                let message = format!("OpenAI health check returned status {status}{suffix}");
+                assert_eq!(
+                    is_retryable(&LocustError::ProviderError(message.clone())),
+                    expected,
+                    "{message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn first_status_envelope_wins() {
+        for (message, expected) in [
+            (
+                "Provider returned status 400: upstream returned status 503",
+                false,
+            ),
+            (
+                "Provider returned status 503: upstream returned status 401",
+                true,
+            ),
+            ("PROVIDER RETURNED STATUS 503: UNAUTHORIZED CANCELLED", true),
+            ("timeout 503: Provider returned status 400", false),
+        ] {
+            assert_eq!(
+                is_retryable(&LocustError::ProviderError(message.into())),
+                expected,
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_code_must_immediately_follow_the_envelope_marker() {
+        for message in [
+            "Provider returned status unavailable 400: timeout",
+            "Provider returned status  400: timeout",
+            "Provider returned status 40: timeout",
+        ] {
+            assert!(
+                is_retryable(&LocustError::ProviderError(message.into())),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn free_text_signals_keep_their_existing_priority() {
+        for (message, expected) in [
+            ("request TIMEOUT", true),
+            ("request timed out", true),
+            ("connection reset", true),
+            ("network unavailable", true),
+            ("DNS lookup failed", true),
+            ("rate limit exceeded", true),
+            ("cancelled", false),
+            ("cancelled after timeout", false),
+            ("unauthorized network request", false),
+            ("forbidden: rate limit exceeded", false),
+            ("400 request timeout", true),
+            ("malformed response", false),
+        ] {
+            assert_eq!(
+                is_retryable(&LocustError::ProviderError(message.into())),
+                expected,
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn free_text_status_numbers_must_be_whole_tokens() {
+        for (message, expected) in [
+            ("429 Too Many Requests", true),
+            ("500 Internal Server Error", true),
+            ("HTTP (502): Bad Gateway", true),
+            ("503 Service Unavailable", true),
+            ("504 Gateway Timeout", true),
+            ("401: network failure", false),
+            ("HTTP (403): timeout", false),
+            ("401 Unauthorized: timeout 503", false),
+            ("403 Forbidden: network 502", false),
+            ("request_id=401abc: connection reset", true),
+            ("request_id=403abc: 503 Service Unavailable", true),
+            ("request_id=503abc", false),
+            ("request_id=15003", false),
+            ("request_503_id", false),
+            ("request-503-id", false),
+        ] {
+            assert_eq!(
+                is_retryable(&LocustError::ProviderError(message.into())),
+                expected,
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn free_text_numeric_limits_are_not_status_codes() {
+        for comparison in ["<=", ">=", "<", ">", "=", "==", "!="] {
+            for spacing in ["", " "] {
+                let message = format!("max_tokens must be {comparison}{spacing}500");
+                assert!(
+                    !is_retryable(&LocustError::ProviderError(message.clone())),
+                    "{message}"
+                );
+                let message = format!("request_id {comparison}{spacing}401: network unavailable");
+                assert!(
+                    is_retryable(&LocustError::ProviderError(message.clone())),
+                    "{message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn io_errors_remain_retryable() {
+        assert!(is_retryable(&LocustError::IoError(std::io::Error::other(
+            "cancelled: invalid value 401"
+        ))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_attempts_follow_the_envelope_status() {
+        for (message, expected_attempts) in [
+            (
+                "OpenAI returned status 400 Bad Request: max_tokens must be <= 500",
+                1,
+            ),
+            (
+                "OpenAI returned status 503 Service Unavailable: request_id=401abc",
+                3,
+            ),
+        ] {
+            let attempts = std::sync::atomic::AtomicU32::new(0);
+            let result: Result<()> = with_retry(&RetryConfig::default(), || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async { Err(LocustError::ProviderError(message.into())) }
+            })
+            .await;
+            assert!(result.is_err());
+            assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                expected_attempts,
+                "{message}"
+            );
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn initial_rate_limit_queue_does_not_consume_http_deadline() {
