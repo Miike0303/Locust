@@ -23,9 +23,19 @@
 //! Injection splices only the selected byte ranges before reapplying container
 //! XOR, preserving separators, dispatch names, and original newline bytes.
 //!
-//! Out of scope: `nscript.___` (mode-3 key table from EXE / `--key-exe`), multi-file
-//! `1.txt`…`99.txt` concat, `pscript.dat` UTF-8, `arc.nsa` / `.sar` archive unpack,
-//! real commercial game fixtures.
+//! # Numbered plain scripts
+//! Selecting `0.txt` also extracts `1.txt`…`99.txt`; `00.txt` uses
+//! `01.txt`…`99.txt`. Files are visited in numeric order, skipping missing numbers
+//! through 99, as in `ScriptHandler::readScript`. The selected entry script fixes
+//! the numbering family here (upstream also permits unpadded/padded fallback).
+//! Each file retains its own line numbers and filename-qualified ids, including
+//! the existing `0.txt#N` / `0.txt#N:command:argument` locators. Injection preserves
+//! each file's Shift-JIS bytes and newline styles outside replaced ranges and
+//! writes only files with changed translations. Encrypted containers remain a
+//! single selected script and never append numbered plain files.
+//!
+//! Out of scope: `nscript.___` (mode-3 key table from EXE / `--key-exe`),
+//! `pscript.dat` UTF-8, `arc.nsa` / `.sar` archive unpack, real commercial fixtures.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -45,7 +55,8 @@ const NSCRIPT_DAT_XOR: u8 = 0x84;
 /// ONScripter `nscr_sec.dat` / encrypt_mode 2 rotating XOR key (`readScriptSub`).
 const NSCR_SEC_MAGIC: [u8; 5] = [0x79, 0x57, 0x0D, 0x80, 0x04];
 
-/// Supported script containers, highest priority first (engine `readScript` order).
+/// Entry containers, highest priority first (engine `readScript` order).
+/// Numbered continuations are selected only after choosing a plain entry script.
 const SUPPORTED_CONTAINERS: &[&str] = &["0.txt", "00.txt", "nscr_sec.dat", "nscript.dat"];
 
 /// Present in engine priority but not implemented in this cut.
@@ -53,7 +64,7 @@ const UNSUPPORTED_CONTAINERS: &[&str] = &["nscript.___"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ContainerKind {
-    /// Plain Shift-JIS text (`0.txt` / `00.txt`).
+    /// Plain Shift-JIS text (`0.txt` / `00.txt` and numbered continuations).
     Plain,
     /// Byte-wise XOR 0x84 then Shift-JIS (`nscript.dat`).
     Xor84,
@@ -64,9 +75,14 @@ enum ContainerKind {
 impl ContainerKind {
     fn from_name(name: &str) -> Option<Self> {
         match name {
-            "0.txt" | "00.txt" => Some(Self::Plain),
             "nscript.dat" => Some(Self::Xor84),
             "nscr_sec.dat" => Some(Self::XorRot5),
+            name if name.strip_suffix(".txt").is_some_and(|number| {
+                (1..=2).contains(&number.len()) && number.bytes().all(|b| b.is_ascii_digit())
+            }) =>
+            {
+                Some(Self::Plain)
+            }
             _ => None,
         }
     }
@@ -154,23 +170,12 @@ impl NScripterPlugin {
     /// Pick the highest-priority supported container (engine order).
     fn select_container(path: &Path) -> Option<SelectedContainer> {
         if path.is_file() {
-            let name = path.file_name()?.to_str()?;
-            let kind = ContainerKind::from_name(
-                SUPPORTED_CONTAINERS
-                    .iter()
-                    .find(|n| name.eq_ignore_ascii_case(n))
-                    .copied()
-                    .unwrap_or(name),
-            )?;
-            // Normalize to canonical lower names we use in ids.
-            let canon = SUPPORTED_CONTAINERS
-                .iter()
-                .find(|n| name.eq_ignore_ascii_case(n))
-                .copied()
-                .unwrap_or(name)
-                .to_string();
+            // Normalize to canonical lower names we use in ids, including
+            // directly selected continuations such as 1.TXT.
+            let name = path.file_name()?.to_str()?.to_ascii_lowercase();
+            let kind = ContainerKind::from_name(&name)?;
             return Some(SelectedContainer {
-                name: canon,
+                name,
                 path: path.to_path_buf(),
                 kind,
             });
@@ -189,12 +194,42 @@ impl NScripterPlugin {
         None
     }
 
+    /// Expand a plain entry script into its numbered files. An explicitly
+    /// selected continuation or encrypted container is still a single file.
+    fn select_containers(path: &Path) -> Option<Vec<SelectedContainer>> {
+        let selected = Self::select_container(path)?;
+        let padded = match selected.name.as_str() {
+            "0.txt" => false,
+            "00.txt" => true,
+            _ => return Some(vec![selected]),
+        };
+        let root = Self::root_dir(&selected.path);
+        let mut containers = vec![selected];
+        // Gap rule: readScript checks every i < 100 and reads only if fp exists;
+        // a missing number does not break the loop. Engine source:
+        // https://github.com/ogapee/onscripter/blob/a4fb132abd7fc01f058f383391cf3a9298bc5e6a/ScriptHandler.cpp#L1087-L1097
+        // Keep the selected family's spelling: 0 -> 1, 00 -> 01.
+        for number in 1..100 {
+            let name = if padded {
+                format!("{number:02}.txt")
+            } else {
+                format!("{number}.txt")
+            };
+            if let Some(path) = Self::file_in_root(&root, &name) {
+                containers.push(SelectedContainer {
+                    name,
+                    path,
+                    kind: ContainerKind::Plain,
+                });
+            }
+        }
+        Some(containers)
+    }
+
     fn detect_path(path: &Path) -> bool {
         if path.is_file() {
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if SUPPORTED_CONTAINERS
-                    .iter()
-                    .any(|n| name.eq_ignore_ascii_case(n))
+                if ContainerKind::from_name(&name.to_ascii_lowercase()).is_some()
                     || UNSUPPORTED_CONTAINERS
                         .iter()
                         .any(|n| name.eq_ignore_ascii_case(n))
@@ -484,7 +519,7 @@ impl FormatPlugin for NScripterPlugin {
     }
 
     fn description(&self) -> &str {
-        "NScripter scripts (0.txt / 00.txt; nscr_sec.dat rot5 XOR; nscript.dat XOR 0x84) — synthetic"
+        "NScripter scripts (0.txt / 00.txt + numbered continuations; nscr_sec.dat rot5 XOR; nscript.dat XOR 0x84) — synthetic"
     }
 
     fn stability(&self) -> locust_core::extraction::FormatStability {
@@ -518,7 +553,7 @@ impl FormatPlugin for NScripterPlugin {
                  (nscript.___ needs --key-exe / key table)",
             ));
         }
-        let Some(selected) = Self::select_container(path) else {
+        let Some(containers) = Self::select_containers(path) else {
             if Self::has_nsa(&root) {
                 return Err(parse_err(
                     &label,
@@ -533,30 +568,32 @@ impl FormatPlugin for NScripterPlugin {
             ));
         };
 
-        let bytes = std::fs::read(&selected.path)?;
-        let (text, _crlf) = decode_container(&bytes, selected.kind, &selected.name)?;
-
         let mut all = Vec::new();
-        for (idx, line) in text.split('\n').enumerate() {
-            let line = line.strip_suffix('\r').unwrap_or(line);
-            let line_no = idx + 1;
-            if !is_player_text_line(line) {
-                for field in display_fields(line.as_bytes()) {
-                    let id = format!("{}#{}:{}", selected.name, line_no, field_locator(&field));
-                    let mut entry =
-                        StringEntry::new(id, &line[field.range.clone()], selected.path.clone());
-                    entry.tags = vec![field.command.into()];
-                    entry
-                        .metadata
-                        .insert("nscripter_line".into(), serde_json::json!(line));
-                    all.push(entry);
+        for selected in containers {
+            let bytes = std::fs::read(&selected.path)?;
+            let (text, _crlf) = decode_container(&bytes, selected.kind, &selected.name)?;
+
+            for (idx, line) in text.split('\n').enumerate() {
+                let line = line.strip_suffix('\r').unwrap_or(line);
+                let line_no = idx + 1;
+                if !is_player_text_line(line) {
+                    for field in display_fields(line.as_bytes()) {
+                        let id = format!("{}#{}:{}", selected.name, line_no, field_locator(&field));
+                        let mut entry =
+                            StringEntry::new(id, &line[field.range.clone()], selected.path.clone());
+                        entry.tags = vec![field.command.into()];
+                        entry
+                            .metadata
+                            .insert("nscripter_line".into(), serde_json::json!(line));
+                        all.push(entry);
+                    }
+                    continue;
                 }
-                continue;
+                let id = format!("{}#{}", selected.name, line_no);
+                let mut entry = StringEntry::new(id, line, selected.path.clone());
+                entry.tags = vec!["dialogue".into()];
+                all.push(entry);
             }
-            let id = format!("{}#{}", selected.name, line_no);
-            let mut entry = StringEntry::new(id, line, selected.path.clone());
-            entry.tags = vec!["dialogue".into()];
-            all.push(entry);
         }
         Ok(all)
     }
@@ -873,6 +910,406 @@ click"
         let plain = encode_sjis_fixture(text);
         let xored = xor_rot5_bytes(&plain);
         fs::write(dir.join("nscr_sec.dat"), xored).unwrap();
+    }
+
+    #[test]
+    fn w7_numbered_extract_and_inject_roundtrip() {
+        let dir = tempdir();
+        write_0_txt(dir.path(), "`Opening\\\r\n");
+        fs::write(dir.path().join("1.txt"), b"`Later chapter\\\n").unwrap();
+        let plugin = NScripterPlugin::new();
+        // Selecting the entry script directly must include its continuations too.
+        for input in [dir.path().to_path_buf(), dir.path().join("0.txt")] {
+            let entries = plugin.extract(&input).unwrap();
+            assert_eq!(
+                entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+                ["0.txt#1", "1.txt#1"]
+            );
+            assert_eq!(
+                entries
+                    .iter()
+                    .map(|e| e.source.as_str())
+                    .collect::<Vec<_>>(),
+                ["`Opening\\", "`Later chapter\\"]
+            );
+            for (entry, name) in entries.iter().zip(["0.txt", "1.txt"]) {
+                assert_eq!(entry.file_path, dir.path().join(name));
+            }
+        }
+        let mut entries = plugin.extract(dir.path()).unwrap();
+        entries[0].translation = Some("Inicio\\".into());
+        entries[1].translation = Some("Capitulo posterior\\".into());
+        let report = plugin.inject(dir.path(), &entries).unwrap();
+        assert_eq!((report.files_modified, report.strings_written), (2, 2));
+        assert_eq!(report.strings_skipped, 0, "{report:?}");
+        assert!(report.warnings.is_empty(), "{report:?}");
+        assert_eq!(
+            fs::read(dir.path().join("0.txt")).unwrap(),
+            b"`Inicio\\\r\n"
+        );
+        assert_eq!(
+            fs::read(dir.path().join("1.txt")).unwrap(),
+            b"`Capitulo posterior\\\n"
+        );
+        let again = plugin.extract(dir.path()).unwrap();
+        assert_eq!(
+            again
+                .iter()
+                .map(|e| (e.id.as_str(), e.source.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("0.txt#1", "`Inicio\\"),
+                ("1.txt#1", "`Capitulo posterior\\")
+            ]
+        );
+    }
+
+    #[test]
+    fn w7_numbered_keeps_existing_zero_ids() {
+        let dir = tempdir();
+        write_0_txt(
+            dir.path(),
+            "; header\r\ncaption \"Title\"\n`Opening\\\r\nrmenu \"Skip\",skip\n",
+        );
+        let plugin = NScripterPlugin::new();
+        let before = plugin.extract(dir.path()).unwrap();
+        assert_eq!(
+            before.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            ["0.txt#2:caption:0", "0.txt#3", "0.txt#4:rmenu:0"]
+        );
+        fs::write(dir.path().join("1.txt"), b"`Later chapter\\\n").unwrap();
+        let after = plugin.extract(dir.path()).unwrap();
+        assert_eq!(after.len(), before.len() + 1);
+        for (old, new) in before.iter().zip(&after) {
+            assert_eq!(
+                (&old.id, &old.source, &old.file_path),
+                (&new.id, &new.source, &new.file_path)
+            );
+        }
+        assert_eq!(after.last().unwrap().id, "1.txt#1");
+    }
+
+    #[test]
+    fn w7_numbered_inject_changes_only_translated_file_and_ranges() {
+        for translated_name in ["0.txt", "1.txt"] {
+            let dir = tempdir();
+            // Preserve a non-canonical CP932 alias, mixed newlines, command
+            // fields, Japanese bytes and a final line without a newline.
+            let prefix = [b";".as_slice(), &[0xed, 0x40], b"\r\ncaption \"Keep\"\n"].concat();
+            let tail = encode_sjis_fixture("\r\n; 終わり");
+            let originals: Vec<_> = ["Opening", "Later chapter"]
+                .iter()
+                .map(|text| {
+                    [
+                        prefix.as_slice(),
+                        format!("`{text}\\").as_bytes(),
+                        tail.as_slice(),
+                    ]
+                    .concat()
+                })
+                .collect();
+            for (name, bytes) in ["0.txt", "1.txt"].iter().zip(&originals) {
+                fs::write(dir.path().join(name), bytes).unwrap();
+            }
+            let plugin = NScripterPlugin::new();
+            let mut entries = plugin.extract(dir.path()).unwrap();
+            assert_eq!(entries.len(), 4);
+            let target = entries
+                .iter_mut()
+                .find(|e| e.id == format!("{translated_name}#3"))
+                .unwrap();
+            target.translation = Some("翻訳済み\\".into());
+            let report = plugin.inject(dir.path(), &entries).unwrap();
+            assert_eq!(
+                (
+                    report.files_modified,
+                    report.strings_written,
+                    report.strings_skipped
+                ),
+                (1, 1, 3),
+                "{report:?}"
+            );
+            assert_eq!(report.files_written, [dir.path().join(translated_name)]);
+            assert!(report.warnings.is_empty(), "{report:?}");
+            for (name, original) in ["0.txt", "1.txt"].iter().zip(&originals) {
+                let expected = if *name == translated_name {
+                    [
+                        prefix.as_slice(),
+                        encode_sjis_fixture("翻訳済み\\").as_slice(),
+                        tail.as_slice(),
+                    ]
+                    .concat()
+                } else {
+                    original.clone()
+                };
+                assert_eq!(fs::read(dir.path().join(name)).unwrap(), expected, "{name}");
+            }
+            let again = plugin.extract(dir.path()).unwrap();
+            assert_eq!(
+                again
+                    .iter()
+                    .find(|e| e.id == format!("{translated_name}#3"))
+                    .unwrap()
+                    .source,
+                "翻訳済み\\"
+            );
+        }
+    }
+
+    #[test]
+    fn w7_numbered_continuation_identity_and_missing_rows_do_not_write() {
+        let dir = tempdir();
+        write_0_txt(dir.path(), "`Opening\\\n");
+        let original = [b";".as_slice(), &[0xed, 0x40], b"\r\n`Later chapter\\\n"].concat();
+        let path = dir.path().join("1.txt");
+        fs::write(&path, &original).unwrap();
+        for translation in [None, Some("`Later chapter\\".into())] {
+            // Construct this locator independently to exercise inject recognition.
+            let reason = if translation.is_some() {
+                "unchanged"
+            } else {
+                "missing_translation"
+            };
+            let mut entry = StringEntry::new("1.txt#2", "`Later chapter\\", path.clone());
+            entry.translation = translation;
+            let report = NScripterPlugin::new().inject(dir.path(), &[entry]).unwrap();
+            assert_eq!(
+                (
+                    report.files_modified,
+                    report.strings_written,
+                    report.strings_skipped
+                ),
+                (0, 0, 1)
+            );
+            assert!(report.files_written.is_empty());
+            assert_eq!(report.skip_reasons.get(reason), Some(&1));
+            assert!(report.warnings.is_empty(), "{report:?}");
+            assert_eq!(fs::read(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn w7_numbered_skips_gaps_in_numeric_order_through_99() {
+        let dir = tempdir();
+        // ScriptHandler::readScript loops i = 0..99 and reads only when fp is
+        // non-null; no break on missing 2.txt. Source: ogapee/onscripter,
+        // ScriptHandler.cpp, a4fb132abd7fc01f058f383391cf3a9298bc5e6a, lines 1087-1097.
+        for name in [
+            "99.txt", "3.txt", "0.txt", "10.txt", "1.txt", "100.txt", "000.txt",
+        ] {
+            fs::write(dir.path().join(name), format!("`{name}\\\n")).unwrap();
+        }
+        let entries = NScripterPlugin::new().extract(dir.path()).unwrap();
+        assert_eq!(
+            entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            ["0.txt#1", "1.txt#1", "3.txt#1", "10.txt#1", "99.txt#1"]
+        );
+    }
+
+    #[test]
+    fn w7_numbered_encrypted_selection_never_appends_plain_scripts() {
+        for selected_name in ["nscript.dat", "nscr_sec.dat"] {
+            let dir = tempdir();
+            write_nscript_dat(dir.path(), "`Encrypted dat\\\n");
+            if selected_name == "nscr_sec.dat" {
+                write_nscr_sec(dir.path(), "`Encrypted sec\\\r\n");
+            }
+            let plain = b"`Plain continuation\\\r\n";
+            for name in ["1.txt", "01.txt", "3.txt", "99.txt"] {
+                fs::write(dir.path().join(name), plain).unwrap();
+            }
+            let plugin = NScripterPlugin::new();
+            let mut entries = plugin.extract(dir.path()).unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].id, format!("{selected_name}#1"));
+            let unselected_dat = fs::read(dir.path().join("nscript.dat")).unwrap();
+            entries[0].translation = Some("Encrypted translation\\".into());
+            let report = plugin.inject(dir.path(), &entries).unwrap();
+            assert_eq!((report.files_modified, report.strings_written), (1, 1));
+            assert_eq!(report.files_written, [dir.path().join(selected_name)]);
+            assert_eq!(
+                plugin.extract(dir.path()).unwrap()[0].source,
+                "`Encrypted translation\\"
+            );
+            for name in ["1.txt", "01.txt", "3.txt", "99.txt"] {
+                assert_eq!(fs::read(dir.path().join(name)).unwrap(), plain);
+            }
+            if selected_name == "nscr_sec.dat" {
+                assert_eq!(
+                    fs::read(dir.path().join("nscript.dat")).unwrap(),
+                    unselected_dat
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn w7_numbered_plain_selection_keeps_encrypted_bytes_untouched() {
+        let dir = tempdir();
+        write_0_txt(dir.path(), "`Opening\\\n");
+        fs::write(dir.path().join("1.txt"), b"`Later chapter\\\n").unwrap();
+        write_nscript_dat(dir.path(), "`Encrypted dat\\\n");
+        write_nscr_sec(dir.path(), "`Encrypted sec\\\n");
+        let encrypted: Vec<_> = ["nscript.dat", "nscr_sec.dat"]
+            .iter()
+            .map(|name| fs::read(dir.path().join(name)).unwrap())
+            .collect();
+        let plugin = NScripterPlugin::new();
+        let mut entries = plugin.extract(dir.path()).unwrap();
+        assert_eq!(entries.len(), 2);
+        for entry in &mut entries {
+            entry.translation = Some("Plain translation\\".into());
+        }
+        assert_eq!(
+            plugin.inject(dir.path(), &entries).unwrap().files_modified,
+            2
+        );
+        for (name, bytes) in ["nscript.dat", "nscr_sec.dat"].iter().zip(encrypted) {
+            assert_eq!(fs::read(dir.path().join(name)).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn w7_numbered_direct_continuation_uses_its_own_locator() {
+        for name in ["1.TXT", "01.txt", "9.txt", "09.txt", "10.txt", "99.txt"] {
+            let dir = tempdir();
+            let path = dir.path().join(name);
+            fs::write(&path, b"`Later chapter\\\r\n").unwrap();
+            let plugin = NScripterPlugin::new();
+            assert!(plugin.detect(&path), "{name}");
+            let mut entries = plugin.extract(&path).unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].id, format!("{}#1", name.to_ascii_lowercase()));
+            entries[0].translation = Some("Later translation\\".into());
+            assert_eq!(plugin.inject(&path, &entries).unwrap().strings_written, 1);
+            assert_eq!(fs::read(&path).unwrap(), b"`Later translation\\\r\n");
+        }
+        for name in ["100.txt", "000.txt", "-1.txt", "chapter.txt"] {
+            let dir = tempdir();
+            let path = dir.path().join(name);
+            fs::write(&path, b"`Not a numbered script\\\n").unwrap();
+            let plugin = NScripterPlugin::new();
+            assert!(!plugin.detect(&path), "{name}");
+            let entry = StringEntry::new(
+                format!("{name}#1"),
+                "`Not a numbered script\\",
+                path.clone(),
+            );
+            assert!(plugin.extract(&path).is_err(), "{name}");
+            assert_eq!(
+                plugin
+                    .inject(&path, &[entry])
+                    .unwrap()
+                    .skip_reasons
+                    .get("unsupported_container"),
+                Some(&1)
+            );
+        }
+    }
+
+    #[test]
+    fn w7_numbered_double_zero_family_uses_padded_continuations() {
+        let dir = tempdir();
+        for name in [
+            "00.txt", "01.txt", "03.txt", "10.txt", "99.txt", "1.txt", "3.txt",
+        ] {
+            fs::write(dir.path().join(name), format!("`{name}\\\n")).unwrap();
+        }
+        let plugin = NScripterPlugin::new();
+        let mut entries = plugin.extract(dir.path()).unwrap();
+        assert_eq!(
+            entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            ["00.txt#1", "01.txt#1", "03.txt#1", "10.txt#1", "99.txt#1"]
+        );
+        for entry in &mut entries {
+            entry.translation = Some("Padded translation\\".into());
+        }
+        let report = plugin.inject(dir.path(), &entries).unwrap();
+        assert_eq!(
+            (
+                report.files_modified,
+                report.strings_written,
+                report.strings_skipped
+            ),
+            (5, 5, 0),
+            "{report:?}"
+        );
+        assert!(plugin
+            .extract(dir.path())
+            .unwrap()
+            .iter()
+            .all(|e| e.source == "`Padded translation\\"));
+        for name in ["1.txt", "3.txt"] {
+            assert_eq!(
+                fs::read(dir.path().join(name)).unwrap(),
+                format!("`{name}\\\n").as_bytes()
+            );
+        }
+        // The existing entry-script priority still selects 0.txt over 00.txt.
+        write_0_txt(dir.path(), "`Opening\\\n");
+        assert_eq!(
+            plugin
+                .extract(dir.path())
+                .unwrap()
+                .iter()
+                .map(|e| e.id.as_str())
+                .collect::<Vec<_>>(),
+            ["0.txt#1", "1.txt#1", "3.txt#1", "10.txt#1", "99.txt#1"]
+        );
+    }
+
+    #[test]
+    fn w7_numbered_verified_revision_handles_continuation_fields_and_dialogue() {
+        for (base, continuation) in [("0.txt", "1.txt"), ("00.txt", "01.txt")] {
+            let dir = tempdir();
+            fs::write(dir.path().join(base), b"; entry script\n").unwrap();
+            let path = dir.path().join(continuation);
+            fs::write(
+                &path,
+                encode_sjis_fixture("caption \"Title\"\r\nこんにちは。@\n"),
+            )
+            .unwrap();
+            let saved = dir.path().join("original.bin");
+            fs::copy(&path, &saved).unwrap();
+            let originals =
+                HashMap::from([(path.clone(), RevisionOriginal::capture(&saved).unwrap())]);
+            let plugin = NScripterPlugin::new();
+            let mut entries = plugin.extract(dir.path()).unwrap();
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].id, format!("{continuation}#1:caption:0"));
+            assert_eq!(entries[1].id, format!("{continuation}#2"));
+            entries[0].translation = Some("First title".into());
+            entries[1].translation = Some("First dialogue@".into());
+            assert_eq!(
+                plugin.inject(dir.path(), &entries).unwrap().strings_written,
+                2
+            );
+            plugin
+                .prepare_revision_entries(&mut entries, &originals)
+                .unwrap();
+            assert_eq!(entries[0].source, "First title");
+            assert_eq!(entries[1].source, "`First dialogue@");
+            entries[0].translation = Some("Second title".into());
+            entries[1].translation = Some("Second dialogue@".into());
+            let report = plugin.inject(dir.path(), &entries).unwrap();
+            assert_eq!(
+                (
+                    report.files_modified,
+                    report.strings_written,
+                    report.strings_skipped
+                ),
+                (1, 2, 0),
+                "{report:?}"
+            );
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                b"caption \"Second title\"\r\n`Second dialogue@\n"
+            );
+            assert_eq!(
+                fs::read(dir.path().join(base)).unwrap(),
+                b"; entry script\n"
+            );
+        }
     }
 
     #[test]
