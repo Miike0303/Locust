@@ -1,4 +1,4 @@
-import { useState, useEffect, type KeyboardEvent } from "react";
+import { useState, useEffect, useRef, type KeyboardEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Search, X, ChevronLeft, ChevronRight } from "lucide-react";
 import clsx from "clsx";
@@ -36,6 +36,7 @@ export default function FilterBar({ total, showing }: FilterBarProps) {
 	const projectPath = useProjectStore((s) => s.project?.path);
 	const { filter, setFilter } = useEditorStore();
 	const [searchInput, setSearchInput] = useState(filter.search || "");
+	const storedSearch = useRef(filter.search);
 	const [filePathDraft, setFilePathDraft] = useState(filter.file_path || "");
 	const [tagDraft, setTagDraft] = useState(filter.tag || "");
 	const { data: facets } = useQuery({
@@ -49,11 +50,18 @@ export default function FilterBar({ total, showing }: FilterBarProps) {
 	const tags = facetOptions(facets?.tags);
 
 	useEffect(() => {
+		// External search changes replace drafts without replaying them to the store.
+		if (storedSearch.current !== filter.search) {
+			storedSearch.current = filter.search;
+			setSearchInput(filter.search || "");
+			return;
+		}
+		if (searchInput === (filter.search || "")) return;
 		const timer = setTimeout(() => {
 			setFilter({ search: searchInput || undefined, offset: 0 });
 		}, 300);
 		return () => clearTimeout(timer);
-	}, [searchInput, setFilter]);
+	}, [searchInput, filter.search, setFilter]);
 
 	useEffect(() => setFilePathDraft(filter.file_path || ""), [filter.file_path]);
 	useEffect(() => setTagDraft(filter.tag || ""), [filter.tag]);
@@ -83,6 +91,8 @@ export default function FilterBar({ total, showing }: FilterBarProps) {
 
 	const hasFilters =
 		filter.status || filter.search || filter.file_path || filter.tag;
+	const offset = filter.offset ?? 0;
+	const limit = filter.limit ?? 100;
 
 	return (
 		<div className="flex flex-wrap items-center gap-2 p-2 border-b border-border bg-surface">
@@ -211,26 +221,26 @@ export default function FilterBar({ total, showing }: FilterBarProps) {
 				<span className="text-caption text-text-muted">
 					{total > 0
 						? t("filter.results", {
-								from: (filter.offset ?? 0) + 1,
-								to: Math.min((filter.offset ?? 0) + showing, total),
+								from: offset + 1,
+								to: Math.min(offset + showing, total),
 								total,
 							})
 						: t("filter.zeroResults")}
 				</span>
-				{total > (filter.limit ?? 100) && (
+				{(total > limit || offset > 0) && (
 					<div className="flex items-center gap-0.5">
 						<button
 							onClick={() =>
 								setFilter({
 									offset: Math.max(
 										0,
-										(filter.offset ?? 0) - (filter.limit ?? 100),
+										Math.min(offset - limit, (Math.ceil(total / limit) - 1) * limit),
 									),
 								})
 							}
 							type="button"
 							aria-label={t("filter.previousPage")}
-							disabled={(filter.offset ?? 0) === 0}
+							disabled={offset === 0}
 							className="p-1 text-text-muted hover:text-text disabled:opacity-30 focus:outline-none focus:ring-2 focus:ring-accent-fg rounded"
 						>
 							<ChevronLeft size={14} />
@@ -238,12 +248,12 @@ export default function FilterBar({ total, showing }: FilterBarProps) {
 						<button
 							onClick={() =>
 								setFilter({
-									offset: (filter.offset ?? 0) + (filter.limit ?? 100),
+									offset: offset + limit,
 								})
 							}
 							type="button"
 							aria-label={t("filter.nextPage")}
-							disabled={(filter.offset ?? 0) + (filter.limit ?? 100) >= total}
+							disabled={offset + limit >= total}
 							className="p-1 text-text-muted hover:text-text disabled:opacity-30 focus:outline-none focus:ring-2 focus:ring-accent-fg rounded"
 						>
 							<ChevronRight size={14} />
