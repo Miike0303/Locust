@@ -98,6 +98,13 @@ jobs:
       - name: Rust tests
         run: cargo test --locked --workspace
 
+      - name: Desktop startup self-test
+        env:
+          CARGO_TARGET_DIR: target
+        run: |
+          cargo build --locked -p locust-desktop
+          python tools/qa_desktop_startup.py target/debug/locust-desktop
+
   # windows-latest uses the native x64 MSVC toolchain.
   check-windows:
     runs-on: windows-latest
@@ -175,6 +182,13 @@ jobs:
 
       - name: Rust tests
         run: cargo test --locked --workspace
+
+      - name: Desktop startup self-test
+        env:
+          CARGO_TARGET_DIR: target
+        run: |
+          cargo build --locked -p locust-desktop
+          python tools/qa_desktop_startup.py target/debug/locust-desktop.exe
 
   # Informational only: no needs relationship to the required platform gates.
   dependency-audit:
