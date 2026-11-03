@@ -3241,11 +3241,13 @@ name = "locust-desktop"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "human-panic",
  "locust-core",
  "locust-formats",
  "locust-providers",
  "locust-server",
+ "minisign-verify",
  "serde",
  "serde_json",
  "tauri",
