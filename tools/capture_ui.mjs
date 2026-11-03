@@ -20,9 +20,29 @@ import { pause, digest, startProcess, freePort, DevTools, serveProduction, finge
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dist = path.join(root, 'apps/desktop/dist');
 const chromePath = process.env.CHROME_PATH || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
+const locales = ['en', 'es'];
+const expectedCapturesPerLanguage = 22;
 const manifest = { version: 1, startedAt: new Date().toISOString(), captures: [], fixtures: [], requests: [], errors: [] };
 let output, temporary, backend, chrome, staticServer, cdp, session, cleanupPromise;
 let interrupted = false;
+
+function summarize() {
+  const byLanguage = Object.fromEntries(locales.map(locale => {
+    const captures = manifest.captures.filter(capture => capture.locale === locale);
+    const passed = captures.filter(capture => Object.values(capture.checks).every(value => value === true)).length;
+    return [locale, { expected: expectedCapturesPerLanguage, captured: captures.length, passed, failed: captures.length - passed }];
+  }));
+  const checks = manifest.captures.flatMap(capture => Object.values(capture.checks));
+  return {
+    success: manifest.success === true,
+    durationMs: Date.parse(manifest.finishedAt) - Date.parse(manifest.startedAt),
+    expectedCaptures: locales.length * expectedCapturesPerLanguage,
+    captured: manifest.captures.length, byLanguage,
+    checks: { passed: checks.filter(value => value === true).length, failed: checks.filter(value => value !== true).length },
+    errors: manifest.errors.length + (manifest.cleanup?.errors.length || 0),
+    cleanupOk: manifest.cleanup?.ok === true,
+  };
+}
 
 const start = (executable, args, env = process.env) => startProcess(executable, args, env, { cwd: root, interrupted });
 async function serveDist() {
@@ -62,7 +82,7 @@ async function click(selector) {
 }
 async function button(text, within = 'document') {
   const expression = `Array.from(${within}.querySelectorAll('button')).find(el => el.textContent.trim() === ${q(text)})`;
-  await waitFor(`!!(${expression})`, `button ${text}`);
+  await waitFor(`!!(${expression}) && !(${expression}).disabled`, `enabled button ${text}`);
   await evaluate(`(${expression}).click()`);
 }
 async function fill(selector, value) {
@@ -151,6 +171,9 @@ async function capture(scenario, viewport, locale, evidence = {}) {
     visibleKeyboardFocus: diagnostics.focus.focusVisible && bounded(diagnostics.focus.rect)
       && (diagnostics.focus.boxShadow !== 'none' || !diagnostics.focus.outline.includes(' none ')) };
   manifest.captures.push({ scenario, viewport, locale, gitHead: manifest.gitHead, timestamp: new Date().toISOString(), path: file, sha256: digest(bytes), evidence, checks, diagnostics });
+  for (const [check, passed] of Object.entries(checks)) {
+    assert.equal(passed, true, `${file}: ${check} failed; diagnostics: ${JSON.stringify(diagnostics)}`);
+  }
   console.log(`Captured ${file}`);
 }
 
@@ -222,8 +245,25 @@ async function scenarios(viewport, locale) {
     const affected = f.seeded.find(row => row.translation && row.source !== 'Welcome traveler!');
     await api(`/api/strings/${encodeURIComponent(affected.id)}`, 'PATCH', { translation: 'Changed after the preview was computed.' });
     const beforeApply = (await api('/api/strings?limit=100')).entries;
+    const applyText = es ? 'Aplicar importación' : 'Apply import';
+    // ExportModal's labelled acknowledgement is optional and resets per preview.
+    const confirmationText = es ? 'Idioma sin declarar — importar de todos modos' : 'Language not declared — import anyway';
+    const confirmationLabel = `Array.from(${dialog}.querySelectorAll('label')).find(el => el.textContent.trim() === ${q(confirmationText)})`;
+    if (await evaluate(`!!(${confirmationLabel})`)) {
+      await evaluate(`(() => {
+        const label = ${confirmationLabel}, checkbox = label.querySelector('input[type=checkbox]');
+        if (!checkbox || checkbox.disabled) throw Error('Missing or disabled language confirmation checkbox');
+        label.scrollIntoView({block:'nearest'});
+        const rect = label.getBoundingClientRect();
+        if (!rect.width || !rect.height) throw Error('Language confirmation label is not visible');
+        if (!checkbox.checked) label.click();
+      })()`);
+      await until(() => evaluate(`(${confirmationLabel})?.querySelector('input[type=checkbox]')?.checked
+        && Array.from(${dialog}.querySelectorAll('button')).some(el => el.textContent.trim() === ${q(applyText)} && !el.disabled)`),
+      `Language confirmation checkbox must be checked and enable "${applyText}"`, 3000);
+    }
     const requestOffset = manifest.requests.length;
-    await button(es ? 'Aplicar importación' : 'Apply import', dialog);
+    await button(applyText, dialog);
     await waitFor(`!!document.querySelector('[role=dialog] [role=alert]')`, 'stale plan error');
     assert(manifest.requests.slice(requestOffset).some(request => request.url.includes('/api/import/po/apply') && request.status === 409), 'Expected genuine stale-plan HTTP 409');
     assert.deepEqual((await api('/api/strings?limit=100')).entries, beforeApply, 'Stale apply must not change rows');
@@ -326,10 +366,17 @@ function cleanup() {
       result.tempDeleted = !(await stat(target).catch(() => null));
       assert(result.tempDeleted, 'Owned temp directory remains');
     });
+    await attempt(async () => {
+      if (!manifest.inputs) return;
+      assert.deepEqual(await fingerprint(dist), manifest.inputs.assets, 'Production assets changed during capture');
+      manifest.assetsUnchanged = true;
+    });
     manifest.cleanup = { ...result, errors, ok: errors.length === 0 && result.tempDeleted && result.processes.every(p => p.exited) };
     manifest.finishedAt = new Date().toISOString();
+    manifest.success = manifest.success === true && manifest.cleanup.ok && manifest.errors.length === 0 && !interrupted;
+    manifest.summary = summarize();
     if (output) await writeFile(path.join(output, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
-    if (!manifest.cleanup.ok) process.exitCode = 1;
+    if (output && !manifest.success) process.exitCode ||= 1;
   })();
   return cleanupPromise;
 }
@@ -387,12 +434,15 @@ async function main() {
     await command('Fetch.continueRequest', { requestId: event.requestId, url: `${manifest.backendUrl}${url.pathname}${url.search}` });
   });
   await command('Fetch.enable', { patterns: [{ urlPattern: 'http://localhost:7842/*', requestStage: 'Request' }] });
-  for (const locale of ['en', 'es']) for (const viewport of [{ width: 1024, height: 700 }, { width: 1440, height: 900 }]) {
+  for (const locale of locales) for (const viewport of [{ width: 1024, height: 700 }, { width: 1440, height: 900 }]) {
     console.log(`Starting ${locale} ${viewport.width}x${viewport.height}`);
     await command('Emulation.setDeviceMetricsOverride', { ...viewport, deviceScaleFactor: 1, mobile: false });
     await scenarios(viewport, locale);
   }
-  assert.equal(manifest.captures.length, 44, 'Complete scenario × viewport × locale matrix');
+  assert.equal(manifest.captures.length, locales.length * expectedCapturesPerLanguage, 'Complete scenario × viewport × locale matrix');
+  for (const locale of locales) {
+    assert.equal(manifest.captures.filter(capture => capture.locale === locale).length, expectedCapturesPerLanguage, `${locale} capture count`);
+  }
   assert.equal(manifest.errors.length, 0, 'Unexpected browser/DevTools errors');
   assert(manifest.requests.every(request => request.status < 400 || (request.status === 409 && request.url.includes('/api/import/po/apply'))), 'Unexpected backend HTTP error');
   manifest.success = true;
@@ -407,5 +457,9 @@ for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => {
 });
 try { await main(); }
 catch (error) { manifest.success = false; manifest.errors.push(error.stack || error.message); console.error(error.stack || error); process.exitCode = 1; }
-finally { await cleanup(); }
+finally {
+  try { await cleanup(); }
+  catch (error) { manifest.success = false; manifest.errors.push(error.stack || error.message); console.error(error.stack || error); process.exitCode = 1; }
+}
+if (!process.argv.includes('--help')) console.log(JSON.stringify(summarize()));
 if (output) console.log(`Manifest: ${path.join(output, 'manifest.json')} (cleanup ${manifest.cleanup.ok ? 'OK' : 'FAILED'})`);
