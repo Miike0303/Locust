@@ -134,6 +134,17 @@ jobs:
           node tools/ui_release_lifecycle.mjs
           exit $LASTEXITCODE
 
+      - name: Stable public CLI lifecycles
+        shell: pwsh
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          $cli = if ($IsWindows) { 'target/debug/locust.exe' } else { 'target/debug/locust' }
+          python -B tools/test_qa_stable_cli.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python -B tools/qa_stable_cli.py --cli $cli
+          exit $LASTEXITCODE
+
   # windows-latest uses the native x64 MSVC toolchain.
   check-windows:
     runs-on: windows-latest
@@ -246,6 +257,17 @@ jobs:
           if (!$env:CHROME_PATH) { throw 'Chrome not found' }
           $env:LOCUST_CLI = Join-Path $env:GITHUB_WORKSPACE "target/debug/$binary"
           node tools/ui_release_lifecycle.mjs
+          exit $LASTEXITCODE
+
+      - name: Stable public CLI lifecycles
+        shell: pwsh
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          $cli = if ($IsWindows) { 'target/debug/locust.exe' } else { 'target/debug/locust' }
+          python -B tools/test_qa_stable_cli.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python -B tools/qa_stable_cli.py --cli $cli
           exit $LASTEXITCODE
 
   # Informational only: no needs relationship to the required platform gates.
