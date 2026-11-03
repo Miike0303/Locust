@@ -7,6 +7,7 @@ use human_panic::setup_panic;
 use tauri_plugin_dialog::DialogExt;
 
 mod commands;
+mod self_test;
 
 fn write_startup_note(message: &str) {
     use std::io::Write;
@@ -51,8 +52,29 @@ fn exit_with_startup_error(error: anyhow::Error) -> ! {
     std::process::exit(1);
 }
 
-fn start_backend() -> anyhow::Result<(std::sync::Arc<locust_server::AppState>, u16)> {
-    let state = locust_server::create_app_state()?;
+struct Backend {
+    state: std::sync::Arc<locust_server::AppState>,
+    port: u16,
+    stop: tokio::sync::oneshot::Sender<()>,
+    thread: std::thread::JoinHandle<anyhow::Result<()>>,
+}
+
+impl Backend {
+    fn shutdown(self) -> anyhow::Result<()> {
+        let _ = self.stop.send(());
+        self.thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("Embedded server thread panicked"))?
+    }
+}
+
+fn start_backend() -> anyhow::Result<Backend> {
+    start_backend_with_state(locust_server::create_app_state()?)
+}
+
+fn start_backend_with_state(
+    state: std::sync::Arc<locust_server::AppState>,
+) -> anyhow::Result<Backend> {
     let state_for_server = state.clone();
 
     // Keep the socket bound while handing it to the backend. Probing a free
@@ -77,23 +99,42 @@ fn start_backend() -> anyhow::Result<(std::sync::Arc<locust_server::AppState>, u
             format!("Cannot initialize the embedded server socket on 127.0.0.1:{port}")
         })?
     };
-    std::thread::Builder::new()
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let thread = std::thread::Builder::new()
         .name("locust-server".into())
         .spawn(move || {
             rt.block_on(async {
                 tracing::info!("Starting embedded server on port {}", port);
-                if let Err(e) =
-                    locust_server::start_server_with_listener(state_for_server, listener).await
-                {
-                    tracing::error!("Server error: {}", e);
+                // Self-test requests finish and close their connections before
+                // this signal. Drop the idle serve future, then the runtime,
+                // releasing the listener and state before joining the thread.
+                tokio::select! {
+                    result = locust_server::start_server_with_listener(state_for_server, listener) => {
+                        if let Err(error) = &result {
+                            tracing::error!("Server error: {}", error);
+                        }
+                        result
+                    }
+                    _ = stopped => Ok(()),
                 }
-            });
+            })
         })
         .context("Cannot start the embedded server thread. Check available system resources.")?;
-    Ok((state, port))
+    Ok(Backend {
+        state,
+        port,
+        stop,
+        thread,
+    })
 }
 
 fn main() {
+    // Branch before panic dialogs, tracing output, or any Tauri/GTK setup.
+    // A self-test failure must never wait for a native error dialog.
+    if std::env::args_os().any(|arg| arg == "--self-test") {
+        std::process::exit(self_test::run());
+    }
+
     #[cfg(not(debug_assertions))]
     setup_panic!();
 
@@ -105,15 +146,15 @@ fn main() {
         )
         .init();
 
-    let (state, port) = start_backend().unwrap_or_else(|error| exit_with_startup_error(error));
+    let backend = start_backend().unwrap_or_else(|error| exit_with_startup_error(error));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .manage(commands::AppStateWrapper(state))
-        .manage(commands::ServerPort(port))
+        .manage(commands::AppStateWrapper(backend.state.clone()))
+        .manage(commands::ServerPort(backend.port))
         .invoke_handler(tauri::generate_handler![
             commands::get_server_port,
             commands::text_fit,
@@ -152,4 +193,8 @@ fn main() {
             write_startup_note(&format!("Cannot run Locust desktop application: {error}"));
             std::process::exit(1);
         });
+    if let Err(error) = backend.shutdown() {
+        write_startup_note(&format!("Cannot stop the embedded server: {error:#}"));
+        std::process::exit(1);
+    }
 }
