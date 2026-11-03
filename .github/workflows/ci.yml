@@ -105,6 +105,35 @@ jobs:
           cargo build --locked -p locust-desktop
           python tools/qa_desktop_startup.py target/debug/locust-desktop
 
+      - name: Verify throwaway updater signatures
+        env:
+          CARGO_TARGET_DIR: target
+          CARGO_INCREMENTAL: '0'
+        run: python scripts/qa-updater-signatures.py
+
+      - name: Production browser lifecycle
+        timeout-minutes: 5
+        shell: pwsh -NoProfile -File {0}
+        env:
+          CARGO_TARGET_DIR: target
+          LOCUST_CHROME_NO_SANDBOX: '1'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($IsWindows) {
+            $env:CHROME_PATH = @(
+              "$env:ProgramFiles/Google/Chrome/Application/chrome.exe",
+              "${env:ProgramFiles(x86)}/Google/Chrome/Application/chrome.exe"
+            ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+            $binary = 'locust.exe'
+          } else {
+            $env:CHROME_PATH = (Get-Command google-chrome -ErrorAction Stop).Source
+            $binary = 'locust'
+          }
+          if (!$env:CHROME_PATH) { throw 'Chrome not found' }
+          $env:LOCUST_CLI = Join-Path $env:GITHUB_WORKSPACE "target/debug/$binary"
+          node tools/ui_release_lifecycle.mjs
+          exit $LASTEXITCODE
+
   # windows-latest uses the native x64 MSVC toolchain.
   check-windows:
     runs-on: windows-latest
@@ -189,6 +218,35 @@ jobs:
         run: |
           cargo build --locked -p locust-desktop
           python tools/qa_desktop_startup.py target/debug/locust-desktop.exe
+
+      - name: Verify throwaway updater signatures
+        env:
+          CARGO_TARGET_DIR: target
+          CARGO_INCREMENTAL: '0'
+        run: python scripts/qa-updater-signatures.py
+
+      - name: Production browser lifecycle
+        timeout-minutes: 5
+        shell: pwsh -NoProfile -File {0}
+        env:
+          CARGO_TARGET_DIR: target
+          LOCUST_CHROME_NO_SANDBOX: '1'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($IsWindows) {
+            $env:CHROME_PATH = @(
+              "$env:ProgramFiles/Google/Chrome/Application/chrome.exe",
+              "${env:ProgramFiles(x86)}/Google/Chrome/Application/chrome.exe"
+            ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+            $binary = 'locust.exe'
+          } else {
+            $env:CHROME_PATH = (Get-Command google-chrome -ErrorAction Stop).Source
+            $binary = 'locust'
+          }
+          if (!$env:CHROME_PATH) { throw 'Chrome not found' }
+          $env:LOCUST_CLI = Join-Path $env:GITHUB_WORKSPACE "target/debug/$binary"
+          node tools/ui_release_lifecycle.mjs
+          exit $LASTEXITCODE
 
   # Informational only: no needs relationship to the required platform gates.
   dependency-audit:
