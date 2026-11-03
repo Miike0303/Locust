@@ -9,24 +9,26 @@
  * LOCUST_CHROME_NO_SANDBOX=1 for these trusted local fixtures only.
  * See docs/UI-RESPONSIVE-CYCLE.md.
  */
-import { spawn, execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { createServer } from 'node:http';
-import { createServer as createSocket } from 'node:net';
-import { readFile, writeFile, mkdir, mkdtemp, rm, stat, realpath, copyFile, readdir } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { readFile, writeFile, mkdir, mkdtemp, rm, stat, realpath, copyFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
+import { pause, digest, startProcess, freePort, DevTools, serveProduction, fingerprint, alive, stop } from './ui_browser_helpers.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dist = path.join(root, 'apps/desktop/dist');
 const chromePath = process.env.CHROME_PATH || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
-const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
-const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const manifest = { version: 1, startedAt: new Date().toISOString(), captures: [], fixtures: [], requests: [], errors: [] };
 let output, temporary, backend, chrome, staticServer, cdp, session, cleanupPromise;
 let interrupted = false;
+
+const start = (executable, args, env = process.env) => startProcess(executable, args, env, { cwd: root, interrupted });
+async function serveDist() {
+  staticServer = await serveProduction(dist);
+  manifest.frontendUrl = `http://127.0.0.1:${staticServer.address().port}`;
+}
 
 async function until(probe, description, timeout = 15000) {
   const end = Date.now() + timeout;
@@ -39,74 +41,6 @@ async function until(probe, description, timeout = 15000) {
   throw new Error(`Timed out: ${description}${last ? ` (${last.message})` : ''}`);
 }
 
-function start(executable, args, env = process.env) {
-  assert(!interrupted, 'Capture interrupted before process startup');
-  const child = spawn(executable, args, { cwd: root, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
-  const owned = { child, pid: child.pid, executable, log: '', exited: false };
-  for (const stream of [child.stdout, child.stderr]) stream.on('data', bytes => {
-    owned.log = (owned.log + bytes.toString()).slice(-24000);
-  });
-  owned.done = new Promise(resolve => {
-    child.once('error', error => { owned.error = error.message; owned.exited = true; resolve(); });
-    child.once('close', (code, signal) => { owned.code = code; owned.signal = signal; owned.exited = true; resolve(); });
-  });
-  return owned;
-}
-
-async function freePort() {
-  const socket = createSocket();
-  await new Promise((resolve, reject) => { socket.once('error', reject); socket.listen(0, '127.0.0.1', resolve); });
-  const port = socket.address().port;
-  await new Promise((resolve, reject) => socket.close(error => error ? reject(error) : resolve()));
-  return port;
-}
-
-class DevTools {
-  constructor(url) {
-    this.socket = new WebSocket(url);
-    this.pending = new Map();
-    this.listeners = new Map();
-    this.sequence = 0;
-    this.ready = new Promise((resolve, reject) => {
-      this.socket.addEventListener('open', resolve, { once: true });
-      this.socket.addEventListener('error', () => reject(new Error(`DevTools connection failed: ${url}`)), { once: true });
-    });
-    this.socket.addEventListener('message', event => {
-      const message = JSON.parse(event.data);
-      if (message.id) {
-        const pending = this.pending.get(message.id);
-        if (!pending) return;
-        clearTimeout(pending.timer);
-        this.pending.delete(message.id);
-        if (message.error) pending.reject(new Error(`${pending.method}: ${message.error.message}`));
-        else pending.resolve(message.result);
-      } else {
-        for (const listener of this.listeners.get(message.method) || []) {
-          Promise.resolve().then(() => listener(message.params)).catch(error => manifest.errors.push(error.message));
-        }
-      }
-    });
-    this.socket.addEventListener('close', () => {
-      for (const pending of this.pending.values()) {
-        clearTimeout(pending.timer);
-        pending.reject(new Error(`DevTools closed during ${pending.method}`));
-      }
-      this.pending.clear();
-    });
-  }
-  on(method, listener) {
-    this.listeners.set(method, [...(this.listeners.get(method) || []), listener]);
-  }
-  async call(method, params = {}, sessionId) {
-    await this.ready;
-    const id = ++this.sequence;
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error(`DevTools timeout: ${method}`)); }, 15000);
-      this.pending.set(id, { resolve, reject, timer, method });
-      this.socket.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
-    });
-  }
-}
 const command = (method, params = {}) => cdp.call(method, params, session);
 async function evaluate(expression) {
   const result = await command('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true, userGesture: true });
@@ -144,36 +78,6 @@ async function api(route, method = 'GET', body) {
   const text = await response.text();
   assert(response.ok, `${method} ${route}: ${response.status} ${text}`);
   return text ? JSON.parse(text) : null;
-}
-
-async function serveDist() {
-  // Vite preview semantics: unmodified production assets + SPA history fallback.
-  const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png', '.woff2': 'font/woff2', '.ico': 'image/x-icon' };
-  staticServer = createServer(async (req, res) => {
-    try {
-      const pathname = decodeURIComponent(new URL(req.url, 'http://localhost').pathname);
-      let file = path.resolve(dist, `.${pathname}`);
-      assert(!path.relative(dist, file).startsWith('..'), 'Path outside dist');
-      if (!(await stat(file).catch(() => null))?.isFile()) {
-        if (path.extname(pathname)) { res.writeHead(404); res.end(); return; }
-        file = path.join(dist, 'index.html');
-      }
-      res.writeHead(200, { 'Content-Type': types[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-store' });
-      res.end(await readFile(file));
-    } catch { res.writeHead(400); res.end(); }
-  });
-  await new Promise((resolve, reject) => { staticServer.once('error', reject); staticServer.listen(0, '127.0.0.1', resolve); });
-  manifest.frontendUrl = `http://127.0.0.1:${staticServer.address().port}`;
-}
-
-async function fingerprint(directory) {
-  const files = [];
-  for (const entry of (await readdir(directory, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
-    const file = path.join(directory, entry.name);
-    if (entry.isDirectory()) files.push(...await fingerprint(file));
-    else if (entry.isFile()) files.push({ path: path.relative(dist, file).replaceAll('\\', '/'), sha256: digest(await readFile(file)) });
-  }
-  return files;
 }
 
 // Generated synthetic fixture shapes from crates/cli/tests/ja_en_es_pipeline.rs
@@ -369,21 +273,6 @@ async function scenarios(viewport, locale) {
   }
 }
 
-function alive(pid) {
-  try { process.kill(pid, 0); return true; }
-  catch (error) { if (error.code === 'ESRCH') return false; throw error; }
-}
-async function stop(owned) {
-  if (!owned || owned.exited) return;
-  if (process.platform === 'win32') {
-    try { execFileSync('taskkill.exe', ['/PID', String(owned.pid), '/T', '/F'], { windowsHide: true, stdio: 'pipe', timeout: 10000 }); }
-    catch (error) { if (!owned.exited) owned.stopError = error.message; }
-  } else owned.child.kill('SIGTERM');
-  await Promise.race([owned.done, pause(5000)]);
-  if (!owned.exited) { owned.child.kill('SIGKILL'); await Promise.race([owned.done, pause(5000)]); }
-  assert(owned.exited, `Owned process ${owned.pid} did not exit`);
-}
-
 function cleanup() {
   if (cleanupPromise) return cleanupPromise;
   cleanupPromise = (async () => {
@@ -479,7 +368,7 @@ async function main() {
     const lines = (await readFile(path.join(temporary, 'chrome/DevToolsActivePort'), 'utf8')).trim().split(/\r?\n/);
     return `ws://127.0.0.1:${lines[0]}${lines[1]}`;
   }, 'Chrome DevToolsActivePort');
-  cdp = new DevTools(websocket);
+  cdp = new DevTools(websocket, error => manifest.errors.push(error.message));
   manifest.browser = { executable: chromePath, noSandbox: process.env.LOCUST_CHROME_NO_SANDBOX === '1', ...await cdp.call('Browser.getVersion') };
   const { targetId } = await cdp.call('Target.createTarget', { url: 'about:blank' });
   ({ sessionId: session } = await cdp.call('Target.attachToTarget', { targetId, flatten: true }));
