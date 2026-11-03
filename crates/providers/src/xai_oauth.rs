@@ -844,13 +844,15 @@ mod tests {
             900,
             now_secs() + 900,
         );
-        let result = tokio::time::timeout(Duration::from_secs(1), async {
+        // Generous bounds: slow CI runners must still read the request
+        // before the client deadline fires, or the stall is never reached.
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
             if poll {
-                poll_for_token_with_timeout(&url, &device, Duration::from_millis(100))
+                poll_for_token_with_timeout(&url, &device, Duration::from_millis(1500))
                     .await
                     .map(|_| ())
             } else {
-                request_device_code_with_timeout(&url, Duration::from_millis(100))
+                request_device_code_with_timeout(&url, Duration::from_millis(1500))
                     .await
                     .map(|_| ())
             }
