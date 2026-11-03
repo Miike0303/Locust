@@ -145,6 +145,38 @@ jobs:
           python -B tools/qa_stable_cli.py --cli $cli
           exit $LASTEXITCODE
 
+      - name: Production browser captures
+        timeout-minutes: 5
+        shell: pwsh -NoProfile -File {0}
+        env:
+          CARGO_TARGET_DIR: target
+          LOCUST_CHROME_NO_SANDBOX: '1'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($IsWindows) {
+            $env:CHROME_PATH = @(
+              "$env:ProgramFiles/Google/Chrome/Application/chrome.exe",
+              "${env:ProgramFiles(x86)}/Google/Chrome/Application/chrome.exe"
+            ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+            $binary = 'locust.exe'
+          } else {
+            $env:CHROME_PATH = (Get-Command google-chrome -ErrorAction Stop).Source
+            $binary = 'locust'
+          }
+          if (!$env:CHROME_PATH) { throw 'Chrome not found' }
+          $env:LOCUST_CLI = Join-Path $env:GITHUB_WORKSPACE "target/debug/$binary"
+          node tools/capture_ui.mjs "$env:RUNNER_TEMP/ui-captures"
+          exit $LASTEXITCODE
+
+      - name: Upload production browser captures
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-browser-captures-${{ runner.os }}
+          path: ${{ runner.temp }}/ui-captures
+          if-no-files-found: ignore
+          retention-days: 7
+
   # windows-latest uses the native x64 MSVC toolchain.
   check-windows:
     runs-on: windows-latest
@@ -269,6 +301,38 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           python -B tools/qa_stable_cli.py --cli $cli
           exit $LASTEXITCODE
+
+      - name: Production browser captures
+        timeout-minutes: 5
+        shell: pwsh -NoProfile -File {0}
+        env:
+          CARGO_TARGET_DIR: target
+          LOCUST_CHROME_NO_SANDBOX: '1'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($IsWindows) {
+            $env:CHROME_PATH = @(
+              "$env:ProgramFiles/Google/Chrome/Application/chrome.exe",
+              "${env:ProgramFiles(x86)}/Google/Chrome/Application/chrome.exe"
+            ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+            $binary = 'locust.exe'
+          } else {
+            $env:CHROME_PATH = (Get-Command google-chrome -ErrorAction Stop).Source
+            $binary = 'locust'
+          }
+          if (!$env:CHROME_PATH) { throw 'Chrome not found' }
+          $env:LOCUST_CLI = Join-Path $env:GITHUB_WORKSPACE "target/debug/$binary"
+          node tools/capture_ui.mjs "$env:RUNNER_TEMP/ui-captures"
+          exit $LASTEXITCODE
+
+      - name: Upload production browser captures
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-browser-captures-${{ runner.os }}
+          path: ${{ runner.temp }}/ui-captures
+          if-no-files-found: ignore
+          retention-days: 7
 
   # Informational only: no needs relationship to the required platform gates.
   dependency-audit:
