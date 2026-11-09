@@ -1,5 +1,7 @@
 ---
 
+**CURRENT (owner 2026-11-09, overrides every Codex line below): the Codex subscription was cancelled. Never dispatch Codex. Claude writes, researches and verifies directly; subagents are Claude models only. All Codex model, tier, lane and launcher notes below are history.**
+
 **CURRENT (owner 2026-10-22, overrides the 2026-10-12 line below for the overnight run): Codex `gpt-6.1-sol`, Fast tier (`service_tier="fast"`), `high` effort, several parallel Codex writers, each in its own worktree `C:/Projects/Locust-lane-<lane>` with its own cargo target under `%LOCALAPPDATA%/locust-shared-target/lane-<lane>` (avoids the stale-crate trap). Worktrees are not Codex-trusted, so writers get explicit `writable_roots`/`network_access` flags (launcher in the session scratchpad `lane-write.ps1`). Owning ledger: `odd/tasks/overnight-2026-10-22.md`. Claude quota resets 02:10 UTC-6 (resume then); if Codex is genuinely exhausted, stop own processes and write the Engram handoff.**
 
 **PREVIOUS (owner 2026-10-12, overrides every Codex model line below): Codex `gpt-6.1-sol` ONLY, standard tier (no Fast), for every researcher, writer, correction, reviewer, agent and subagent. Never `gpt-6-astra`, `gpt-6-sol` (6.0), any `luna` or `terra`. Owner: "quitar todos los otros modelos, solo dejar sol". Defaults in `~/.codex/config.toml`, `codex-write.ps1`, `codex-loop.ps1`, the fleet-orchestrator skill and global CLAUDE.md are sol 6.1, so no `-Model` flag is needed.**
