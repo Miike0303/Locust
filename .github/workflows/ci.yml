@@ -151,6 +151,7 @@ jobs:
           exit $LASTEXITCODE
 
       - name: Production browser captures
+        id: captures
         # Informational on Linux until hosted Chrome passes (W11-CIFIX).
         continue-on-error: true
         timeout-minutes: 5
@@ -176,7 +177,8 @@ jobs:
           exit $LASTEXITCODE
 
       - name: Upload production browser captures
-        if: failure()
+        # The step above continues on error, which failure() does not see.
+        if: always() && steps.captures.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
           name: production-browser-captures-${{ runner.os }}
