@@ -24,6 +24,20 @@ export function startProcess(executable, args, env = process.env, { cwd, interru
   return owned;
 }
 
+// One Chrome argument list for every production-browser runner.
+export function chromeArguments({ profileDir, platform = process.platform, noSandbox = false }) {
+  // Linux omits the crash-reporter switches and avoids /dev/shm: hosted Ubuntu Chrome killed its
+  // network service with "FD ownership violation" (Actions run 41552463447). Hypothesis, unverified locally.
+  const crash = platform === 'linux'
+    ? ['--disable-dev-shm-usage']
+    : ['--disable-crashpad-for-testing', '--disable-crash-reporter', '--disable-breakpad'];
+  return ['--headless=new', `--user-data-dir=${profileDir}`,
+    '--remote-debugging-port=0', '--remote-debugging-address=127.0.0.1', '--no-first-run', '--no-default-browser-check',
+    '--disable-background-networking', '--disable-component-update', '--disable-sync', '--disable-extensions',
+    ...crash, '--noerrdialogs', '--password-store=basic',
+    ...(noSandbox ? ['--no-sandbox', '--disable-gpu'] : []), 'about:blank'];
+}
+
 export async function freePort() {
   const socket = createSocket();
   await new Promise((resolve, reject) => { socket.once('error', reject); socket.listen(0, '127.0.0.1', resolve); });

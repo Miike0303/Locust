@@ -15,7 +15,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
-import { pause, digest, startProcess, freePort, DevTools, serveProduction, fingerprint, alive, stop } from './ui_browser_helpers.mjs';
+import { pause, digest, startProcess, chromeArguments, freePort, DevTools, serveProduction, fingerprint, alive, stop } from './ui_browser_helpers.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dist = path.join(root, 'apps/desktop/dist');
@@ -396,7 +396,7 @@ async function main() {
   const cli = process.env.LOCUST_CLI || path.resolve(process.env.CARGO_TARGET_DIR, 'debug', process.platform === 'win32' ? 'locust.exe' : 'locust');
   for (const file of [chromePath, cli, path.join(dist, 'index.html')]) assert((await stat(file)).isFile(), `Missing prerequisite: ${file}`);
   manifest.inputs = { runnerSha256: digest(await readFile(fileURLToPath(import.meta.url))), cli, cliSha256: digest(await readFile(cli)), assets: await fingerprint(dist) };
-  temporary = await mkdtemp(path.join(tmpdir(), 'locust-ui-capture-'));
+  temporary = await realpath(await mkdtemp(path.join(tmpdir(), 'locust-ui-capture-')));
   const profile = path.join(temporary, 'data');
   await mkdir(profile);
   // Explicitly replace inherited backup/config overrides too. No real profile.
@@ -409,7 +409,7 @@ async function main() {
     return (await fetch(`${manifest.backendUrl}/health`, { signal: AbortSignal.timeout(500) })).ok;
   }, 'isolated real backend');
   await serveDist();
-  chrome = start(chromePath, ['--headless=new', `--user-data-dir=${path.join(temporary, 'chrome')}`, '--remote-debugging-port=0', '--remote-debugging-address=127.0.0.1', '--no-first-run', '--no-default-browser-check', '--disable-background-networking', '--disable-component-update', '--disable-sync', '--disable-extensions', '--disable-crashpad-for-testing', '--disable-crash-reporter', '--disable-breakpad', '--noerrdialogs', '--password-store=basic', ...(process.env.LOCUST_CHROME_NO_SANDBOX === '1' ? ['--no-sandbox', '--disable-gpu'] : []), 'about:blank']);
+  chrome = start(chromePath, chromeArguments({ profileDir: path.join(temporary, 'chrome'), noSandbox: process.env.LOCUST_CHROME_NO_SANDBOX === '1' }));
   const websocket = await until(async () => {
     if (chrome.exited) throw new Error(`Chrome exited: ${chrome.error || chrome.log}`);
     const lines = (await readFile(path.join(temporary, 'chrome/DevToolsActivePort'), 'utf8')).trim().split(/\r?\n/);

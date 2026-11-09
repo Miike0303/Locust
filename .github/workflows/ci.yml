@@ -78,6 +78,9 @@ jobs:
           PYTHONDONTWRITEBYTECODE: '1'
         run: python tools/test_updater_manifest.py
 
+      - name: Browser runner helper tests
+        run: node --test tools/test_ui_browser_helpers.mjs
+
       # tauri-build reads tauri.conf.json > frontendDist (apps/desktop/dist),
       # so the frontend must be built before any cargo command touches the
       # desktop crate. This also type-checks the frontend (build runs tsc).
@@ -240,6 +243,9 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: '1'
         run: python tools/test_updater_manifest.py
+
+      - name: Browser runner helper tests
+        run: node --test tools/test_ui_browser_helpers.mjs
 
       # tauri-build requires apps/desktop/dist before workspace Rust checks.
       - name: Build frontend

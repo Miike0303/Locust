@@ -21,7 +21,7 @@ import { cp, mkdir, mkdtemp, readFile, writeFile, readdir, realpath, rm, stat } 
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { pause, digest, startProcess, freePort, DevTools, serveProduction, fingerprint, alive, stop } from './ui_browser_helpers.mjs';
+import { pause, digest, startProcess, chromeArguments, freePort, DevTools, serveProduction, fingerprint, alive, stop } from './ui_browser_helpers.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dist = path.join(root, 'apps/desktop/dist');
@@ -131,7 +131,8 @@ async function main() {
   for (const file of [chromePath, cli, path.join(dist, 'index.html')]) assert((await stat(file)).isFile(), `Missing prerequisite: ${file}`);
   const assetsBefore = await fingerprint(dist), fixtureBefore = await fingerprint(fixture);
   summary.inputs = { cliSha256: digest(await readFile(cli)), assetsSha256: digest(JSON.stringify(assetsBefore)), fixtureSha256: digest(JSON.stringify(fixtureBefore)) };
-  temporary = await mkdtemp(path.join(tmpdir(), 'locust-ui-lifecycle-'));
+  // Canonical form: hosted Windows reports an 8.3 short temp root (RUNNER~1).
+  temporary = await realpath(await mkdtemp(path.join(tmpdir(), 'locust-ui-lifecycle-')));
   const source = path.join(temporary, 'Synthetic MV'), consumer = path.join(temporary, 'Pristine consumer');
   const output = path.join(temporary, 'Injected copies'), downloadDir = path.join(temporary, 'downloads');
   const profile = path.join(temporary, 'profile'), zip = path.join(temporary, 'synthetic-patch.zip');
@@ -154,11 +155,7 @@ async function main() {
   }, 'isolated backend');
   staticServer = await serveProduction(dist);
   frontendUrl = `http://127.0.0.1:${staticServer.address().port}`;
-  chrome = startProcess(chromePath, ['--headless=new', `--user-data-dir=${path.join(temporary, 'chrome')}`,
-    '--remote-debugging-port=0', '--remote-debugging-address=127.0.0.1', '--no-first-run', '--no-default-browser-check',
-    '--disable-background-networking', '--disable-component-update', '--disable-sync', '--disable-extensions',
-    '--disable-crashpad-for-testing', '--disable-crash-reporter', '--disable-breakpad', '--noerrdialogs', '--password-store=basic',
-    ...(process.env.LOCUST_CHROME_NO_SANDBOX === '1' ? ['--no-sandbox', '--disable-gpu'] : []), 'about:blank'], process.env, { cwd: temporary });
+  chrome = startProcess(chromePath, chromeArguments({ profileDir: path.join(temporary, 'chrome'), noSandbox: process.env.LOCUST_CHROME_NO_SANDBOX === '1' }), process.env, { cwd: temporary });
   const websocket = await until(async () => {
     if (chrome.exited) throw new Error(`Chrome exited: ${chrome.error || chrome.log}`);
     const lines = (await readFile(path.join(temporary, 'chrome/DevToolsActivePort'), 'utf8')).trim().split(/\r?\n/);
