@@ -390,7 +390,14 @@ impl RpgMakerMvPlugin {
         if game_root.join("js").join("rmmz_core.js").exists() {
             return MvMzVersion::Mz;
         }
-        if game_root.join("js").join("rpg_core.js").exists() {
+        // Deployed MV games keep the engine under www/js.
+        if game_root.join("js").join("rpg_core.js").exists()
+            || game_root
+                .join("www")
+                .join("js")
+                .join("rpg_core.js")
+                .exists()
+        {
             return MvMzVersion::Mv;
         }
         if let Ok(pkg) = std::fs::read_to_string(game_root.join("package.json")) {
@@ -4613,6 +4620,37 @@ mod tests {
         let content = fs::read_to_string(&lang_file).unwrap();
         let json: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert!(!json.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn inject_add_deployed_mv_writes_inside_www_data() {
+        let game_dir_guard = temp_game_dir();
+        let game_dir = game_dir_guard.path().to_path_buf();
+        // Standard deployed MV layout: everything lives under www/.
+        fs::create_dir_all(game_dir.join("www").join("js")).unwrap();
+        fs::write(game_dir.join("www").join("js").join("rpg_core.js"), "").unwrap();
+        fs::rename(game_dir.join("data"), game_dir.join("www").join("data")).unwrap();
+
+        let plugin = RpgMakerMvPlugin::new();
+        let mut entries = plugin.extract(&game_dir).unwrap();
+        assert!(!entries.is_empty());
+        for entry in &mut entries {
+            entry.translation = Some(format!("[es] {}", entry.source));
+        }
+
+        let report = plugin.inject_add(&game_dir, "es", &entries).unwrap();
+
+        let lang_file = game_dir
+            .join("www")
+            .join("data")
+            .join("i18n")
+            .join("es.json");
+        assert!(lang_file.exists());
+        assert_eq!(report.files_modified, 1);
+        assert!(
+            !game_dir.join("data").exists(),
+            "Add must not create a data tree outside www/"
+        );
     }
 
     #[test]

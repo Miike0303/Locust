@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use crate::archive_replace::{guard_target, note_backups, replace_files};
 use locust_core::backup::RevisionOriginal;
 use locust_core::error::Result;
-use locust_core::extraction::{FormatPlugin, InjectionReport};
+use locust_core::extraction::{Extraction, FormatPlugin, InjectionReport};
 use locust_core::models::{OutputMode, StringEntry};
 use locust_core::patch::GameLock;
 use tracing::warn;
@@ -1045,8 +1045,15 @@ impl FormatPlugin for TyranoPlugin {
     }
 
     fn extract(&self, path: &Path) -> Result<Vec<StringEntry>> {
+        Ok(self.extract_with_diagnostics(path)?.entries)
+    }
+
+    /// A container or member that cannot be read makes the extraction
+    /// incomplete, so saved rows from it survive the next project open.
+    fn extract_with_diagnostics(&self, path: &Path) -> Result<Extraction> {
         let root = Self::root_dir(path);
         let label = path.display().to_string();
+        let mut warnings = Vec::new();
 
         let ks_files = if path.is_file() && Self::is_ks(path) && Self::detect_path(path) {
             vec![path.to_path_buf()]
@@ -1109,6 +1116,9 @@ impl FormatPlugin for TyranoPlugin {
                     asar_errors += 1;
                     last_asar_err = e.to_string();
                     warn!(archive = %asar_rel, error = %e, "failed to open app.asar");
+                    warnings.push(format!(
+                        "{asar_rel}: could not be opened ({e}); its scenario text was not extracted"
+                    ));
                     continue;
                 }
             };
@@ -1123,6 +1133,10 @@ impl FormatPlugin for TyranoPlugin {
                             error = %e,
                             "asar .ks read failed; skipped"
                         );
+                        warnings.push(format!(
+                            "{asar_rel}/{}: scenario script was skipped ({e})",
+                            entry.path
+                        ));
                         ks_skipped += 1;
                         continue;
                     }
@@ -1138,6 +1152,10 @@ impl FormatPlugin for TyranoPlugin {
                             error = %e,
                             "asar .ks is not valid UTF-8 text; skipped"
                         );
+                        warnings.push(format!(
+                            "{asar_rel}/{}: scenario script was skipped ({e})",
+                            entry.path
+                        ));
                         ks_skipped += 1;
                     }
                 }
@@ -1156,6 +1174,9 @@ impl FormatPlugin for TyranoPlugin {
                     nw_errors += 1;
                     last_nw_err = e.to_string();
                     warn!(archive = %nw_rel, error = %e, "failed to open NW.js package");
+                    warnings.push(format!(
+                        "{nw_rel}: could not be opened ({e}); its scenario text was not extracted"
+                    ));
                     continue;
                 }
             };
@@ -1170,6 +1191,10 @@ impl FormatPlugin for TyranoPlugin {
                             error = %e,
                             "NW.js .ks read failed; skipped"
                         );
+                        warnings.push(format!(
+                            "{nw_rel}/{}: scenario script was skipped ({e})",
+                            entry.path
+                        ));
                         ks_skipped += 1;
                         continue;
                     }
@@ -1185,6 +1210,10 @@ impl FormatPlugin for TyranoPlugin {
                             error = %e,
                             "NW.js .ks is not valid UTF-8 text; skipped"
                         );
+                        warnings.push(format!(
+                            "{nw_rel}/{}: scenario script was skipped ({e})",
+                            entry.path
+                        ));
                         ks_skipped += 1;
                     }
                 }
@@ -1226,7 +1255,13 @@ impl FormatPlugin for TyranoPlugin {
             }
         }
 
-        Ok(all)
+        let mut warnings_from_rows = locust_core::project::extraction_warnings(&all);
+        warnings_from_rows.append(&mut warnings);
+        Ok(Extraction {
+            complete: warnings_from_rows.is_empty(),
+            entries: all,
+            warnings: warnings_from_rows,
+        })
     }
 
     fn revision_original_path(&self, file_path: &Path) -> PathBuf {
@@ -3404,6 +3439,58 @@ block comment body\r\n\
         assert_eq!(
             rebuild_speaker_line("  #表示名:happy", "Name"),
             "  #Name:happy"
+        );
+    }
+
+    #[test]
+    fn unreadable_container_marks_extraction_incomplete() {
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
+        let scenario = dir.join("data").join("scenario");
+        fs::create_dir_all(&scenario).unwrap();
+        fs::write(scenario.join("loose.ks"), sample_scenario()).unwrap();
+        let resources = dir.join("resources");
+        fs::create_dir_all(&resources).unwrap();
+        fs::write(resources.join("app.asar"), b"not an asar archive").unwrap();
+
+        let extraction = TyranoPlugin::new().extract_with_diagnostics(&dir).unwrap();
+
+        // Loose rows are still returned, but saved rows from the unreadable
+        // container must not be treated as removed from the game.
+        assert!(!extraction.entries.is_empty());
+        assert!(!extraction.complete);
+        assert_eq!(extraction.warnings.len(), 1, "{:?}", extraction.warnings);
+        assert!(
+            extraction.warnings[0].contains("resources/app.asar"),
+            "{:?}",
+            extraction.warnings
+        );
+    }
+
+    #[test]
+    fn readable_containers_keep_extraction_complete() {
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
+        let scenario = dir.join("data").join("scenario");
+        fs::create_dir_all(&scenario).unwrap();
+        fs::write(scenario.join("loose.ks"), sample_scenario()).unwrap();
+        let resources = dir.join("resources");
+        fs::create_dir_all(&resources).unwrap();
+        let asar = crate::tyrano_asar::write_asar(&[(
+            "data/scenario/scene1.ks".into(),
+            sample_scenario().as_bytes().to_vec(),
+        )])
+        .unwrap();
+        fs::write(resources.join("app.asar"), asar).unwrap();
+
+        let plugin = TyranoPlugin::new();
+        let extraction = plugin.extract_with_diagnostics(&dir).unwrap();
+
+        assert!(extraction.complete, "{:?}", extraction.warnings);
+        assert!(extraction.warnings.is_empty());
+        assert_eq!(
+            extraction.entries.len(),
+            plugin.extract(&dir).unwrap().len()
         );
     }
 }
