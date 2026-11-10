@@ -207,6 +207,48 @@ class ManifestTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": repo}):
                 self.assert_refused(self.invoke([], args=[tag]), "invalid repository or version tag")
 
+    def updater_config(self, key_id, text=None):
+        # Outside the working directory: refusals must leave only latest.json there.
+        folder = tempfile.TemporaryDirectory(dir=ROOT / "tools", prefix="locust-manifest-config-")
+        self.addCleanup(folder.cleanup)
+        wire = ("untrusted comment: minisign public key: TEST\n" +
+                base64.b64encode(b"Ed" + key_id + bytes(32)).decode() + "\n")
+        pubkey = base64.b64encode(wire.encode()).decode() if text is None else text
+        path = Path(folder.name) / "tauri.conf.json"
+        path.write_text(json.dumps({"plugins": {"updater": {"pubkey": pubkey}}}), encoding="utf-8")
+        return mock.patch.dict(os.environ, {"LOCUST_UPDATER_CONFIG": str(path)})
+
+    def test_configured_public_key_accepts_only_its_own_key_id(self):
+        same_key = {name + ".sig": signature(9) for name in ASSETS.values()}
+        with self.updater_config(bytes([9]) * 8):
+            code, out, err = self.invoke(self.pairs(ASSETS), signatures=same_key)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(set(json.loads(out)["platforms"]), set(ASSETS))
+        self.manifest.write_bytes(b"existing manifest\n")
+        with self.updater_config(bytes([8]) * 8):
+            self.assert_refused(self.invoke(self.pairs(ASSETS), signatures=same_key),
+                                "updater signature was not made with the configured public key")
+        one_foreign = dict(same_key)
+        one_foreign[ASSETS["linux-x86_64"] + ".sig"] = signature(3)
+        with self.updater_config(bytes([9]) * 8):
+            self.assert_refused(self.invoke(self.pairs(ASSETS), signatures=one_foreign),
+                                "updater signature was not made with the configured public key")
+
+    def test_unreadable_configured_public_key_is_refused(self):
+        same_key = {name + ".sig": signature(9) for name in ASSETS.values()}
+        with self.updater_config(b"", text="not base64!"):
+            self.assert_refused(self.invoke(self.pairs(ASSETS), signatures=same_key),
+                                "invalid configured updater public key")
+        with mock.patch.dict(os.environ, {"LOCUST_UPDATER_CONFIG": str(ROOT / "tools" / "missing.conf.json")}):
+            self.assert_refused(self.invoke(self.pairs(ASSETS), signatures=same_key),
+                                "invalid configured updater public key")
+
+    def test_release_workflow_checks_the_key_and_requires_green_ci(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        self.assertIn("LOCUST_UPDATER_CONFIG: apps/desktop/src-tauri/tauri.conf.json", workflow)
+        self.assertIn('gh run list --workflow ci.yml --commit "$RELEASE_SHA" --status success', workflow)
+        self.assertIn("actions: read", workflow)
+
     def test_write_failure_leaves_no_scratch_and_no_output(self):
         with mock.patch.object(m.os, "replace", side_effect=OSError("PRIVATE PATH")):
             self.assert_refused(self.invoke(self.pairs(ASSETS)), "manifest write failed")

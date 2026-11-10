@@ -34,8 +34,26 @@ def run(command, reason):
         raise Refused(reason) from error
 
 
-def validate_signature(text):
-    """Check Tauri's base64-encoded minisign shape, not key correspondence."""
+def configured_key_id():
+    """Key id of the updater public key in LOCUST_UPDATER_CONFIG, or None when unset."""
+    config = os.environ.get("LOCUST_UPDATER_CONFIG")
+    if not config:
+        return None
+    try:
+        pubkey = json.loads(Path(config).read_text(encoding="utf-8"))["plugins"]["updater"]["pubkey"]
+        lines = base64.b64decode(pubkey, validate=True).decode("ascii").splitlines()
+        packet = base64.b64decode(lines[1], validate=True)
+        if len(lines) != 2 or len(packet) != 42 or packet[:2] != b"Ed":
+            raise ValueError()
+    except (OSError, ValueError, TypeError, KeyError, IndexError, UnicodeError, binascii.Error) as error:
+        raise Refused("invalid configured updater public key") from error
+    return packet[2:10]
+
+
+def validate_signature(text, key_id=None):
+    """Check Tauri's base64-encoded minisign shape and, given a key id, that the
+    signature names that key. This catches a wrong or regenerated signing key; it
+    is not cryptographic verification of the payload."""
     text = text.strip()
     try:
         lines = base64.b64decode(text, validate=True).decode("ascii").splitlines()
@@ -47,6 +65,8 @@ def validate_signature(text):
             raise ValueError()
     except (ValueError, UnicodeError, binascii.Error) as error:
         raise Refused("invalid updater signature") from error
+    if key_id is not None and packet[2:10] != key_id:
+        raise Refused("updater signature was not made with the configured public key")
     return text
 
 
@@ -81,6 +101,7 @@ def release_pairs(raw, allow_partial=False):
 
 
 def generate(tag, repo, allow_partial=False):
+    key_id = configured_key_id()
     raw = run(["gh", "release", "view", tag, "--repo", repo, "--json", "assets,body,isDraft"],
               "release lookup failed")
     pairs, notes = release_pairs(raw, allow_partial=allow_partial)
@@ -96,7 +117,7 @@ def generate(tag, repo, allow_partial=False):
             command = ["curl", "--fail", "--silent", "--show-error", "--location", "--",
                        base + quote(artifact + ".sig", safe="")]
         text = run(command, "signature download failed")
-        platforms[target] = {"signature": validate_signature(text),
+        platforms[target] = {"signature": validate_signature(text, key_id),
                              "url": base + quote(artifact, safe="")}
     return {"version": tag.removeprefix("v"), "notes": notes,
             "pub_date": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),

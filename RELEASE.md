@@ -69,6 +69,10 @@ The release owner performs these steps after candidate verification:
    - `validate` first checks the tag against `Cargo.toml`,
      `apps/desktop/package.json` and `tauri.conf.json`, and requires one nonempty
      `## [X.Y.Z]` CHANGELOG section for the release body.
+   - It then requires a **successful CI run for that exact commit**. The CI run
+     started by the tag push is still in progress at that point, so the manual
+     CI run from the pre-commit checklist is what satisfies it; without one the
+     release stops before any build.
    - It creates a **draft** bound to the candidate SHA, or reuses a matching
      draft. A public release, prerelease or different target SHA is refused.
      Runs for the same ref are serialized.
@@ -81,13 +85,16 @@ The release owner performs these steps after candidate verification:
 4. The finalizer requires all five desktop artifact families with exact `.sig`
    companions, all four named CLI binaries and `latest.json`, each nonempty.
    It checks draft/tag/source SHA, all five manifest platform keys, asset URLs,
-   signature shape/equality and changelog-derived notes. It then alone publishes
+   signature shape/equality and changelog-derived notes. It also refuses any
+   signature whose key id differs from the public key in `tauri.conf.json`
+   (a wrong or regenerated signing key). It then alone publishes
    the draft and marks it latest. Any build, download or verification failure
    leaves the draft unpublished; the existing public latest is unchanged.
    Inspect the resulting release body/assets and record the finalizer outcome.
 5. Verify signatures against the configured public key using supported updater
-   tooling before claiming signing-key correspondence. Offline shape/equality
-   tests do not prove cryptographic validity or that installed apps can update.
+   tooling before claiming signing-key correspondence. The key-id check and the
+   offline shape/equality tests do not prove cryptographic validity or that
+   installed apps can update.
 6. Record source SHA, CI runs, release runs and observed assets separately.
    Recovery from a failed run may reuse only the matching draft at the same
    candidate SHA. Never move an existing tag or bypass the final inventory gate.

@@ -22,6 +22,9 @@ env:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
     outputs:
       release_id: ${{ steps.draft.outputs.release_id }}
     steps:
@@ -38,6 +41,15 @@ jobs:
         run: |
           python scripts/release-gate.py prepare --ref "$RELEASE_REF" > release-notes.md
           test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+
+      # Run CI on this exact commit (workflow_dispatch) before tagging: the CI run
+      # started by the tag push itself is still in progress at this point.
+      - name: Require a successful CI run for this commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          run_id="$(gh run list --workflow ci.yml --commit "$RELEASE_SHA" --status success --limit 1 --json databaseId --jq '.[0].databaseId')"
+          test -n "$run_id" || { echo "No successful CI run for $RELEASE_SHA" >&2; exit 1; }
 
       - name: Create or reuse the candidate draft
         id: draft
@@ -222,6 +234,9 @@ jobs:
           python scripts/release-gate.py draft --tag "$RELEASE_TAG" --sha "$RELEASE_SHA" --metadata release.json
 
       - name: Generate and upload strict five-platform manifest
+        env:
+          # Refuse signatures made with a key other than the shipped public key.
+          LOCUST_UPDATER_CONFIG: apps/desktop/src-tauri/tauri.conf.json
         run: |
           bash scripts/generate-updater-manifest.sh "$RELEASE_TAG"
           gh release upload "$RELEASE_TAG" latest.json --clobber
