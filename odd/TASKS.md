@@ -1,5 +1,9 @@
 # Current task index
 
+## Next session: UI/UX fixes (queued 2026-11-09)
+
+Owner **"todo eso guardalo para la siguiente sesion"**: 36 findings from the Fable 5.2 UI/UX check are owned by [UI/UX check 2026-11-09](tasks/ui-ux-fable-2026-11-09.md); nothing is fixed yet. Start with S1 (tabbing through a saved API key field deletes the key). Open release and backend follow-ups stay in [cycle 2026-11-01](tasks/cycle-2026-11-01.md).
+
 ## Production readiness 2026-11-09 (current)
 
 Owner **"continuala y terminala de una vez y ve subiendo todo a github ... dejarlo listo para produccion"**, then **"ya no usar codex para nada"**: owned by [cycle 2026-11-01](tasks/cycle-2026-11-01.md). Verified candidate `777998c` on remote `main` ([CI 42752140796](https://github.com/Miike0303/Locust/actions/runs/42752140796): Ubuntu Rust 3744/0/42, Windows 3758/0/42, frontend 1707/0 on both, browser lifecycle and captures gated on both). A three-area read-only Fable 5.2 check found no blocker; its fixes (Tyrano incomplete extraction, deployed-MV Add path, release CI gate and signing-key-id check) are delivered and the remaining follow-ups are listed in that ledger. Version 0.3.0 is prepared but **not released**: the owner must repair the Tauri signing secrets and tag. `release.yml` changes are untested until a tag exists.
