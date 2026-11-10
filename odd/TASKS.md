@@ -1,5 +1,9 @@
 # Current task index
 
+## Production readiness 2026-11-09 (current)
+
+Owner **"continuala y terminala de una vez y ve subiendo todo a github ... dejarlo listo para produccion"**, then **"ya no usar codex para nada"**: owned by [cycle 2026-11-01](tasks/cycle-2026-11-01.md). Verified candidate `777998c` on remote `main` ([CI 42752140796](https://github.com/Miike0303/Locust/actions/runs/42752140796): Ubuntu Rust 3744/0/42, Windows 3758/0/42, frontend 1707/0 on both, browser lifecycle and captures gated on both). A three-area read-only Fable 5.2 check found no blocker; its fixes (Tyrano incomplete extraction, deployed-MV Add path, release CI gate and signing-key-id check) are delivered and the remaining follow-ups are listed in that ledger. Version 0.3.0 is prepared but **not released**: the owner must repair the Tauri signing secrets and tag. `release.yml` changes are untested until a tag exists.
+
 ## Cycle 2026-10-28 (current)
 
 Owner **"termina lo de gentle shell… sube todo a main… analiza el proyecto y continúalo"** plus speed-first steering and the 10%-Codex stop rule own [cycle 2026-10-28](tasks/cycle-2026-10-28.md). Delivered through Codex writers verified outside the sandbox, landed on `main` in four CI-green fast-forwards (`a9acd81`, `8ad661d`, `362286a`, `a84b56d`, `0ebed00`), with the fifth candidate `6d45065` (W3-01/04/06/08/09) gated locally (fe1400/0, Rust3253/0/34, fmt, clippy, CLI, 4 Python steps) and CI pending at write time. Next session: [wave 4 plan](tasks/cycle-2026-10-28-wave4-research.md) and the "Next session" section of the ledger. Owner decision pending: OPUS EN→ES local NMT pilot.

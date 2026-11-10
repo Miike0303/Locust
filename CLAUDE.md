@@ -4,14 +4,14 @@
 
 Leer primero [odd/TASKS.md](odd/TASKS.md), luego el ledger propietario de la tarea y su evidencia; consultar [docs/IMPROVEMENT-GOAL.md](docs/IMPROVEMENT-GOAL.md) para entregas y backlog del producto. El mapa tecnico esta en [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Los HANDOFF y checkpoints fechados de abajo son historia, no la cola actual ni el estado de publicacion. Sus preferencias y restricciones explicitas del usuario siguen vigentes salvo autorizacion posterior.
 
-Checkpoint observado por el padre (2026-10-12): `main` remoto y local con el codigo del candidato probado `f9bc58c` (el commit siguiente es solo documental). [GitHub Actions run 38316078151](https://github.com/Miike0303/Locust/actions/runs/38316078151):
+Checkpoint observado por el padre (2026-11-09): `main` remoto y local con el codigo del candidato probado `777998c` (los commits siguientes son solo documentales). [GitHub Actions run 42752140796](https://github.com/Miike0303/Locust/actions/runs/42752140796):
 
 | Plataforma | Rust (pasan / fallan / ignorados) | Frontend (pasan / fallan / ignorados) |
 |---|---|---|
-| Ubuntu | 2242 / 0 / 21 | 439 / 0 / 0 |
-| Windows | 2253 / 0 / 21 | 439 / 0 / 0 |
+| Ubuntu | 3744 / 0 / 42 | 1707 / 0 / 0 |
+| Windows | 3758 / 0 / 42 | 1707 / 0 / 0 |
 
-Ambas plataformas pasaron `npm ci`, build frontend, fmt, Clippy estricto y tests del workspace, incluido el crate Tauri. Los tests ignorados no se ejecutaron. No verifica la UI Tauri nativa ni juegos reales; las capturas headless usaron el build de produccion con un backend real aislado y fixtures sinteticos. El 2026-10-09 se entregaron 30 unidades de codigo (ver las entradas Done del 2026-10-09 en el ledger). Los temporales de los tests van a `.test-tmp/` (ver Build); al final de cada sesion correr `tools/cleanup-scratch.ps1 -Apply`.
+Ambas plataformas pasaron `npm ci`, build frontend, fmt, Clippy estricto, tests del workspace (incluido el crate Tauri), el self-test de escritorio, la QA de firmas desechables, los ciclos de CLI publica de las familias Stable y, con Chrome headless real, el lifecycle de la UI de produccion y las capturas; `dependency-audit` (informativo) tambien paso. Los tests ignorados no se ejecutaron. No verifica la UI Tauri nativa, juegos reales ni `release.yml` (sin tag desde el cambio). Version preparada: 0.3.0, sin publicar; los pendientes de release y de la revision Fable estan en [cycle 2026-11-01](odd/tasks/cycle-2026-11-01.md). Codex ya no se usa (dueno, 2026-11-09): Claude escribe y verifica directamente. Los temporales de los tests van a `.test-tmp/` (ver Build); al final de cada sesion correr `tools/cleanup-scratch.ps1 -Apply`.
 
 Secuencia autorizada: una unidad acotada, checks completos, publicacion de la rama de trabajo y CI manual, luego fast-forward de `main` antes de empezar otra unidad. Este checkpoint registra una observacion; no garantiza que `main` permanezca limpio o verificado tras futuros cambios.
 
