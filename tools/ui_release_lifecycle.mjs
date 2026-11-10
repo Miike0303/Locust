@@ -204,15 +204,20 @@ async function main() {
       request.body = text ? JSON.parse(text) : null;
     }
   });
+  // The page may abort a paused request (unmount, superseded query) before the
+  // answer arrives; Chrome then reports the id as invalid. Nothing was lost.
+  const answerPaused = (method, parameters) => command(method, parameters).catch(error => {
+    if (!/Invalid InterceptionId/.test(error.message)) throw error;
+  });
   cdp.on('Fetch.requestPaused', async e => {
     const url = new URL(e.request.url);
     if (url.origin === 'http://localhost:7842') {
-      await command('Fetch.continueRequest', { requestId: e.requestId, url: `${backendUrl}${url.pathname}${url.search}` });
+      await answerPaused('Fetch.continueRequest', { requestId: e.requestId, url: `${backendUrl}${url.pathname}${url.search}` });
     } else if ([frontendUrl, backendUrl].includes(url.origin)) {
-      await command('Fetch.continueRequest', { requestId: e.requestId });
+      await answerPaused('Fetch.continueRequest', { requestId: e.requestId });
     } else {
       summary.errors.push(`Refused non-owned browser request: ${url.origin}`);
-      await command('Fetch.failRequest', { requestId: e.requestId, errorReason: 'BlockedByClient' });
+      await answerPaused('Fetch.failRequest', { requestId: e.requestId, errorReason: 'BlockedByClient' });
     }
   });
   await command('Fetch.enable', { patterns: [{ urlPattern: 'http://*/*', requestStage: 'Request' }, { urlPattern: 'https://*/*', requestStage: 'Request' }] });
