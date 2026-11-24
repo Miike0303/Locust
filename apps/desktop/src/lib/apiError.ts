@@ -72,6 +72,15 @@ const EXACT: Record<string, MessageKey> = {
 	// project.rs returns InjectionError; also recognize the exact inner reason.
 	"injection error: saved Direct project format is incompatible": "api.error.directFormatIncompatible",
 	"saved Direct project format is incompatible": "api.error.directFormatIncompatible",
+	// routes/io.rs and the Tauri export command; routes/speakers.rs; server font_patch.rs.
+	"no entries to export": "api.error.nothingToExport",
+	"speaker not found": "api.error.speakerNotFound",
+	"The current project has no translated text. Translate entries before generating a font patch.":
+		"api.error.fontPatchNoTranslations",
+	"Select a clean game copy or roll back its installed patch before generating a font patch.":
+		"api.error.fontPatchPatchedGame",
+	"output_path already exists; choose a new file name": "api.error.outputPathExists",
+	"game_path must be an existing game directory or file": "api.error.gamePathMustExist",
 };
 
 // Match the original line so trimming cannot turn a multiline diagnostic into guidance.

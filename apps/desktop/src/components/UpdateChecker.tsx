@@ -23,12 +23,23 @@ function updateFailure(error: unknown, messageKey: UpdateFailureKey, retry: Upda
   return { kind: "error", messageKey, retry };
 }
 
+const FOCUS_RING = "focus:outline-none focus:ring-2 focus:ring-accent-fg";
+
+// The one mounted checker owns the visible check; the sidebar version label triggers it.
+let manualCheck: (() => Promise<void>) | null = null;
+
+/** Run a visible update check: unlike the silent startup check, results and failures are shown. */
+export function requestUpdateCheck(): Promise<void> {
+  return manualCheck ? manualCheck() : Promise.resolve();
+}
+
 export default function UpdateChecker() {
   const t = useT();
   const [state, setState] = useState<UpdateState>({ kind: "idle" });
 
   // React state updates are deferred; a ref claims ownership before any await.
   const busy = useRef(false);
+  const latestCheck = useRef<(silent?: boolean) => Promise<void>>(async () => {});
 
   const checkForUpdate = async (silent = false) => {
     if (busy.current) return;
@@ -58,6 +69,7 @@ export default function UpdateChecker() {
       busy.current = false;
     }
   };
+  latestCheck.current = checkForUpdate;
 
   const restartInstalled = async () => {
     if (!IS_TAURI || busy.current) return;
@@ -120,6 +132,15 @@ export default function UpdateChecker() {
     }
   }, []);
 
+  // "Later" only hides the automatic prompt; a manual check can always run again.
+  useEffect(() => {
+    const run = () => latestCheck.current(false);
+    manualCheck = run;
+    return () => {
+      if (manualCheck === run) manualCheck = null;
+    };
+  }, []);
+
   if (state.kind === "idle") return null;
 
   return (
@@ -134,7 +155,15 @@ export default function UpdateChecker() {
       {state.kind === "upToDate" && (
         <div className="bg-success-muted text-success border border-success rounded-lg shadow-lg p-3 flex items-center gap-2 text-body">
           <CheckCircle size={16} className="text-success" />
-          <span>{t("update.upToDate")}</span>
+          <span className="flex-1">{t("update.upToDate")}</span>
+          <button
+            type="button"
+            onClick={() => setState({ kind: "idle" })}
+            aria-label={t("common.dismiss")}
+            className={`rounded text-text-muted hover:text-text ${FOCUS_RING}`}
+          >
+            <span aria-hidden="true">✕</span>
+          </button>
         </div>
       )}
 
@@ -153,15 +182,17 @@ export default function UpdateChecker() {
               )}
               <div className="flex gap-2 mt-3">
                 <button
+                  type="button"
                   onClick={downloadAndInstall}
                   disabled={busy.current}
-                  className="px-3 py-1.5 bg-accent hover:bg-accent-hover text-white rounded text-body font-medium"
+                  className={`px-3 py-1.5 bg-accent hover:bg-accent-hover text-white rounded text-body font-medium ${FOCUS_RING}`}
                 >
                   {t("update.download")}
                 </button>
                 <button
+                  type="button"
                   onClick={() => setState({ kind: "idle" })}
-                  className="px-3 py-1.5 bg-surface-muted text-text rounded text-body"
+                  className={`px-3 py-1.5 bg-surface-muted text-text rounded text-body ${FOCUS_RING}`}
                 >
                   {t("common.later")}
                 </button>
@@ -207,9 +238,10 @@ export default function UpdateChecker() {
             <div className="text-caption text-text-muted">{t(state.messageKey)}</div>
             {state.retry && (
               <button
+                type="button"
                 onClick={state.retry === "install" ? downloadAndInstall : state.retry === "restart" ? restartInstalled : () => checkForUpdate()}
                 disabled={busy.current}
-                className="mt-2 font-medium hover:underline"
+                className={`mt-2 rounded font-medium hover:underline ${FOCUS_RING}`}
               >
                 {t(state.retry === "restart" ? "update.restart" : "common.retry")}
               </button>
@@ -219,7 +251,7 @@ export default function UpdateChecker() {
             type="button"
             onClick={() => setState({ kind: "idle" })}
             aria-label={t("common.dismiss")}
-            className="text-text-muted hover:text-text"
+            className={`rounded text-text-muted hover:text-text ${FOCUS_RING}`}
           >
             <span aria-hidden="true">✕</span>
           </button>

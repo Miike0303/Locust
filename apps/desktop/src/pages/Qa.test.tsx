@@ -107,9 +107,64 @@ for (const [locale, heading] of [["en", "Quality assurance"], ["es", "Control de
     assert.ok(html.includes(t("qa.checkedAt", { time: new Date(completedAt).toLocaleString(locale) })));
     assert.match(html, /lucide-shield-check[^>]*text-success/);
     assert.ok(!html.includes(t("qa.notChecked")));
-    assert.match(html, /<button[^>]*bg-accent-muted[^>]*>/);
+    assertPrimaryRun(html);
     assert.equal([...html.matchAll(/<button[^>]*>Run validation<\/button>/g)].length, locale === "en" ? 1 : 0);
   });
+
+  test(`${locale}: QA rows show each translation so inconsistent rows are distinguishable`, () => {
+    setLocale(locale);
+    const first: StoredValidationIssue = { ...issue, id: 3, entry_id: "entry-b", kind: "InconsistentTranslation", message: "Inconsistent", source: "Hello", translation: "Hola" };
+    const second: StoredValidationIssue = { ...first, id: 4, entry_id: "entry-c", translation: "Buenas <b>tardes</b>" };
+    const empty: StoredValidationIssue = { ...issue, id: 5, translation: "" };
+    const missing: StoredValidationIssue = { ...issue, id: 6, source: null, translation: null };
+    seed([first, second, empty, missing], 4, { InconsistentTranslation: { open: 2, ignored: 0 }, EmptyTranslation: { open: 2, ignored: 0 } });
+    const html = render();
+    const headers = [...html.matchAll(/<th[^>]*>([^<]*)<\/th>/g)].map(match => match[1]);
+    assert.deepEqual(headers, ["qa.col.kind", "qa.col.file", "qa.col.source", "qa.col.translation", "qa.col.message", "qa.col.actions"].map(key => t(key as Parameters<typeof t>[0])));
+    const rows = [...html.matchAll(/<tbody>([\s\S]*)<\/tbody>/g)][0][1].split("</tr>").filter(Boolean);
+    const translationCell = (row: string) => [...row.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/g)][3][0];
+    assert.match(translationCell(rows[0]), /title="Hola"[^>]*>Hola<\/td>/);
+    assert.match(translationCell(rows[1]), /title="Buenas &lt;b&gt;tardes&lt;\/b&gt;"[^>]*>Buenas &lt;b&gt;tardes&lt;\/b&gt;<\/td>/);
+    assert.notEqual(translationCell(rows[0]), translationCell(rows[1]));
+    assert.ok(translationCell(rows[2]).includes(t("qa.noTranslation")));
+    assert.ok(translationCell(rows[3]).includes(t("qa.unavailable")));
+  });
+
+  test(`${locale}: QA row actions stay on one line and use neutral secondary buttons`, () => {
+    setLocale(locale);
+    seed();
+    const html = render();
+    const actions = html.match(/<div class="([^"]*)"><button[^>]*>[^<]*<\/button><button[^>]*>[^<]*<\/button><\/div>/);
+    assert.ok(actions, "row actions container");
+    const container = actions[1].split(" ");
+    assert.ok(container.includes("flex-nowrap"));
+    assert.ok(!container.includes("flex-wrap"));
+    for (const label of [t("qa.openEditor"), t("qa.ignore")]) {
+      const button = html.match(new RegExp(`<button[^>]*class="([^"]*)"[^>]*>${label}</button>`));
+      assert.ok(button, label);
+      const classes = button[1].split(" ");
+      assert.ok(classes.includes("whitespace-nowrap"), `${label} must not wrap`);
+      assert.ok(classes.includes("border-border") && !classes.includes("bg-accent-muted"), `${label} is a neutral secondary action`);
+    }
+    assertPrimaryRun(html);
+  });
+
+  test(`${locale}: every QA control uses the accent focus ring`, () => {
+    setLocale(locale);
+    seed([issue, { ...issue, id: 2 }], 51);
+    const html = render();
+    const controls = html.match(/<(button|input|select)\b[^>]*>/g) ?? [];
+    assert.ok(controls.length >= 6);
+    for (const control of controls) assert.match(control, /focus(-visible)?:ring-accent-fg/, control);
+  });
+}
+
+function assertPrimaryRun(html: string) {
+  const run = html.match(new RegExp(`<button[^>]*class="([^"]*)"[^>]*>${t("qa.run")}</button>`));
+  assert.ok(run, "header run action");
+  const classes = run[1].split(" ");
+  assert.ok(classes.includes("bg-accent") && classes.includes("text-white"), "Run validation stays the solid primary action");
+  assert.ok(!classes.includes("bg-accent-muted"));
 }
 
 test("QA loading and failure states expose status, localized API error and retry", () => {
@@ -209,7 +264,7 @@ test("QA persisted ignored rows use a neutral filtered state without inventing a
   assert.ok(html.includes(t("qa.noMatchingIssues")));
   assert.ok(!html.includes(t("qa.notChecked")));
   assert.doesNotMatch(html, /text-success/);
-  assert.match(html, /<button[^>]*bg-accent-muted[^>]*>/);
+  assertPrimaryRun(html);
 });
 
 test("QA clean completion does not leak to another database and is retained when returning", async () => {

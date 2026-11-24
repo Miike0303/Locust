@@ -617,6 +617,34 @@ for (const locale of ["en", "es"] as const) {
     assert.ok(!completed.includes(t("fastWorkflow.resumeHint")));
     resetModalState();
   });
+
+  test(`${locale}: workflow options disclosure reads as a toggle with a well-formed focus ring`, () => {
+    setLocale(locale); resetModalState();
+    const html = modalMarkup();
+    const summary = html.match(/<summary\b([^>]*)>([\s\S]*?)<\/summary>/);
+    assert.ok(summary, "options disclosure");
+    assert.doesNotMatch(summary[1], /tabindex/i, "summary is natively focusable");
+    const classes = summary[1].match(/class="([^"]*)"/)![1].split(" ");
+    for (const name of ["inline-flex", "w-fit", "list-none", "rounded", "focus-visible:outline-none", "focus-visible:ring-2", "focus-visible:ring-accent-fg"]) {
+      assert.ok(classes.includes(name), `summary needs ${name}`);
+    }
+    assert.match(summary[2], /<svg[^>]*lucide-chevron-right[^>]*aria-hidden="true"/, "a chevron shows the disclosure state");
+    assert.ok(summary[2].includes(t("fastWorkflow.options")));
+    assert.match(html, /<details\b[^>]*class="[^"]*\bgroup\b/, "the chevron can follow the open state");
+  });
+
+  test(`${locale}: every Fast workflow control uses the accent focus ring`, () => {
+    setLocale(locale);
+    for (const running of [false, true]) {
+      const receipt = running ? directReceipt("inject") : null;
+      if (receipt) { Object.assign(stage(receipt, "inject"), { status: "running", startedAt: Date.now() }); receipt.status = "running"; }
+      resetModalState(receipt, running);
+      const controls = modalMarkup().match(/<(button|input|select|summary)\b[^>]*>/g) ?? [];
+      assert.ok(controls.length >= (running ? 3 : 10));
+      for (const control of controls) assert.match(control, /focus(-visible)?:ring-accent-fg/, control);
+    }
+    resetModalState();
+  });
 }
 
 test("actual modal restores a project-bound receipt when reopened from its planned pivot alias", async () => {

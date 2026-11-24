@@ -51,9 +51,31 @@ import {
 	modalPanelClass,
 } from "../lib/modalA11y";
 import { operationalShortcutTarget } from "../lib/settingsNav";
-import { useT, type TranslateKey } from "../lib/i18n";
+import { readLastUsedTranslationPrefs } from "../lib/translationDefaults";
+import { useT, type TranslateFn, type TranslateKey } from "../lib/i18n";
 
 const INJECT_LANG_KEY = "locust.inject.langs";
+const FOCUS_RING = "focus:outline-none focus:ring-2 focus:ring-accent-fg";
+
+/** Last translation target first (as the font patch dialog does), then the last injected language, then Spanish. */
+function defaultInjectLanguages(): string[] {
+	const target = readLastUsedTranslationPrefs().target;
+	if (typeof target === "string" && LANGUAGES.some((l) => l.code === target)) return [target];
+	try {
+		const saved = JSON.parse(localStorage.getItem(INJECT_LANG_KEY) || "null") as unknown;
+		if (Array.isArray(saved) && typeof saved[0] === "string" && saved[0]) return [saved[0]];
+	} catch {
+		/* ignore */
+	}
+	return ["es"];
+}
+
+/** Catalog name for a backend mode; an unknown mode stays as reported. */
+function injectModeName(mode: string, t: TranslateFn): string {
+	return mode === "replace" ? t("activity.inject.modeReplace")
+		: mode === "add" ? t("activity.inject.modeAdd")
+		: mode === "direct" ? t("activity.inject.modeDirect") : mode;
+}
 
 // The native backend returns actual per-language roots for Add/Replace.
 // Optional for compatibility with reports that do not include this field.
@@ -99,18 +121,7 @@ export default function InjectModal({
 	useEffect(() => {
 		setMode((m) => coerceInjectMode(m, project?.supported_modes));
 	}, [project?.supported_modes, project?.format_id]);
-	const savedLangs = (() => {
-		try {
-			return JSON.parse(localStorage.getItem(INJECT_LANG_KEY) || "null") as
-				| string[]
-				| null;
-		} catch {
-			return null;
-		}
-	})();
-	const [selectedLangs, setSelectedLangs] = useState<string[]>(
-		savedLangs?.length ? savedLangs.slice(0, 1) : ["es"],
-	);
+	const [selectedLangs, setSelectedLangs] = useState<string[]>(defaultInjectLanguages);
 	const [outputDir, setOutputDir] = useState("");
 	const [loading, setLoading] = useState(false);
 	const [result, setResult] = useState<NativeInjectReport | null>(null);
@@ -128,6 +139,16 @@ export default function InjectModal({
 			setRegReports([]);
 		}
 	}, [open, loading, regLoading]);
+	// The modal stays mounted: on each visit, take a translation target chosen since
+	// the last one. Never while an operation from the previous visit is still running.
+	useEffect(() => {
+		if (!open || loading || regLoading) return;
+		setSelectedLangs((current) => {
+			const next = defaultInjectLanguages();
+			return current.join(",") === next.join(",") ? current : next;
+		});
+		// Only the open transition re-derives the default; later renders keep the user's choice.
+	}, [open]);
 	/** Optional UI label override (CLI `--label`). Used when a single lang is selected. */
 	const [regLabelOverride, setRegLabelOverride] = useState(() =>
 		loadRegLabelOverride(),
@@ -289,7 +310,7 @@ export default function InjectModal({
 					addLog(
 						"warning",
 						t("activity.inject.preflight", { count: binary }),
-						"UTF-8 / UTF-16LE / Shift-JIS length must be ≤ source",
+						t("activity.inject.detail.preflight"),
 						"inject",
 					);
 				}
@@ -313,22 +334,23 @@ export default function InjectModal({
 			const written = sumStringsWritten(report);
 			const warnings = collectInjectWarnings(report);
 			const filesWritten = collectFilesWritten(report);
+			// Labels come from the catalog; paths, warnings and errors stay raw diagnostics.
 			const destInfo = isDirect
-				? `Direct inject into ${project.path}` +
-					(report.backup_path ? `\nBackup: ${report.backup_path}` : "")
+				? t("activity.inject.detail.direct", { path: project.path }) +
+					(report.backup_path ? `\n${t("inject.backup", { path: report.backup_path })}` : "")
 				: mode === "replace"
 					? Object.entries(report.injected_roots ?? {}).map(([lang, path]) =>
 						t("inject.copyDestination", { lang, path }),
 					).join("\n")
-					: `Added translation folders in ${project.path}`;
+					: t("activity.inject.detail.add", { path: project.path });
 			const failDetail = report.languages_failed?.length
-				? `Failed: ${report.languages_failed.map(([l, e]) => `${l}: ${e}`).join(", ")}`
-				: "No language failures";
+				? t("activity.inject.detail.failed", { list: report.languages_failed.map(([l, e]) => `${l}: ${e}`).join(", ") })
+				: t("activity.inject.detail.noFailures");
 			const warnDetail = warnings.length
-				? `\nWarnings:\n${warnings.map((w) => `- ${w}`).join("\n")}`
+				? `\n${t("activity.inject.detail.warnings")}\n${warnings.map((w) => `- ${w}`).join("\n")}`
 				: "";
 			const filesDetail = filesWritten.length
-				? `\nFiles written:\n${filesWritten.map((f) => `- ${f}`).join("\n")}`
+				? `\n${t("activity.inject.detail.files")}\n${filesWritten.map((f) => `- ${f}`).join("\n")}`
 				: "";
 
 			addLog(
@@ -340,12 +362,10 @@ export default function InjectModal({
 						: "activity.inject.complete",
 					{
 						languages: report.languages_processed.join(", ") || t("inject.selectedNone"),
-						mode: report.mode === "replace" ? t("activity.inject.modeReplace")
-							: report.mode === "add" ? t("activity.inject.modeAdd")
-							: report.mode === "direct" ? t("activity.inject.modeDirect") : report.mode,
+						mode: injectModeName(report.mode, t),
 					},
 				),
-				`${destInfo}\nStrings written: ${written}\n${failDetail}${warnDetail}${filesDetail}`,
+				`${destInfo}\n${t("activity.inject.detail.written", { written })}\n${failDetail}${warnDetail}${filesDetail}`,
 				"inject",
 			);
 
@@ -423,9 +443,10 @@ export default function InjectModal({
 						{t("inject.title")}
 					</h2>
 					<button
+						type="button"
 						onClick={onClose}
 						aria-label={t("common.close")}
-						className="text-text-muted hover:text-text"
+						className={`rounded text-text-muted hover:text-text ${FOCUS_RING}`}
 					>
 						<X size={20} />
 					</button>
@@ -509,6 +530,7 @@ export default function InjectModal({
 									>
 										<input
 											type="radio"
+											className={FOCUS_RING}
 											name="inject-target-language"
 											checked={selectedLangs.includes(l.code)}
 											onChange={() => toggleLang(l.code)}
@@ -544,7 +566,7 @@ export default function InjectModal({
 									/>
 									<button
 										onClick={handlePickFolder}
-										className="px-3 py-2 bg-surface-muted text-text hover:bg-surface rounded text-body transition-colors"
+										className={`px-3 py-2 bg-surface-muted text-text hover:bg-surface rounded text-body transition-colors ${FOCUS_RING}`}
 										title={t("inject.browseTitle")}
 									>
 										<FolderOpen size={16} />
@@ -587,6 +609,7 @@ export default function InjectModal({
 								<label className="flex items-center gap-2 text-caption text-text-muted cursor-pointer">
 									<input
 										type="checkbox"
+										className={FOCUS_RING}
 										checked={autoRegisterAfterInject}
 										disabled={!canRegisterLang}
 										aria-describedby={!canRegisterLang ? "inject-register-mode-hint" : undefined}
@@ -680,7 +703,7 @@ export default function InjectModal({
 								})}
 							</p>
 							<p className="text-body opacity-90">
-								{t("inject.modeLine", { mode: result.mode })}
+								{t("inject.modeLine", { mode: injectModeName(result.mode, t) })}
 							</p>
 							<p className="text-body opacity-90">
 								{t("inject.stringsWritten", {
@@ -882,7 +905,7 @@ export default function InjectModal({
 						<button
 							onClick={handleInject}
 							disabled={loading || !canInject}
-							className="w-full py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed text-white rounded font-medium transition-colors"
+							className={`w-full py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed text-white rounded font-medium transition-colors ${FOCUS_RING}`}
 						>
 							{loading
 								? t("inject.injecting")
@@ -897,7 +920,7 @@ export default function InjectModal({
 							onClick={handleRegisterLang}
 							disabled={!canRegisterLang || regLoading || selectedLangs.length === 0}
 							aria-describedby={!canRegisterLang ? "inject-register-mode-hint" : undefined}
-							className="w-full py-1.5 text-body border border-accent-fg text-accent-fg hover:bg-accent-muted disabled:opacity-50 rounded font-medium"
+							className={`w-full py-1.5 text-body border border-accent-fg text-accent-fg hover:bg-accent-muted disabled:opacity-50 rounded font-medium ${FOCUS_RING}`}
 						>
 							{regLoading
 								? t("inject.registering")
@@ -912,7 +935,7 @@ export default function InjectModal({
 								onClose();
 								onOpenPack(result?.pristine_backup_id || undefined);
 							}}
-							className="mt-2 text-caption font-medium text-sky-700 dark:text-sky-300 hover:underline"
+							className={`mt-2 rounded text-caption font-medium text-sky-700 dark:text-sky-300 hover:underline ${FOCUS_RING}`}
 						>
 							{t("inject.openPack")}
 						</button>}
@@ -921,7 +944,7 @@ export default function InjectModal({
 							onClick={handleRegisterLang}
 							disabled={!canRegisterLang || regLoading || selectedLangs.length === 0}
 							aria-describedby={!canRegisterLang ? "inject-register-mode-hint" : undefined}
-							className="w-full py-1.5 text-body bg-accent hover:bg-accent-hover disabled:opacity-50 text-white rounded font-medium"
+							className={`w-full py-1.5 text-body bg-accent hover:bg-accent-hover disabled:opacity-50 text-white rounded font-medium ${FOCUS_RING}`}
 						>
 							{regLoading
 								? t("inject.registering")
@@ -935,13 +958,13 @@ export default function InjectModal({
 								onClose();
 								navigate(operationalShortcutTarget("manage-backups").path);
 							}}
-							className="text-caption font-medium text-accent-fg hover:underline"
+							className={`rounded text-caption font-medium text-accent-fg hover:underline ${FOCUS_RING}`}
 						>
 							{t("inject.manageBackups")}
 						</button>
 						<button
 							onClick={onClose}
-							className="w-full py-2 bg-accent hover:bg-accent-hover text-white rounded font-medium"
+							className={`w-full py-2 bg-accent hover:bg-accent-hover text-white rounded font-medium ${FOCUS_RING}`}
 						>
 							{t("common.close")}
 						</button>

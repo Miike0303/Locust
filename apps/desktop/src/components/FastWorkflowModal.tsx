@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { AlertCircle, CheckCircle2, Circle, Clock3, Loader2, MinusCircle, X, Zap } from "lucide-react";
+import { AlertCircle, CheckCircle2, ChevronRight, Circle, Clock3, Loader2, MinusCircle, X, Zap } from "lucide-react";
 import { getConfig, getProviders, type PatchCompression, type ProjectInfo } from "../lib/api";
 import { localizeApiError } from "../lib/apiError";
 import {
@@ -157,17 +157,21 @@ export default function FastWorkflowModal({ open, onClose, project, sampleSource
 	const ready = !providers || resolveProviderReadiness(selected.providerId, providers, config).ready;
 	const invalid = selected.sourceLang === selected.targetLang || !selected.targetLang || !selected.providerId || !selected.patchOutputPath.trim()
 		|| (selected.injectMode === "replace" && !selected.outputDir.trim()) || (selected.englishPivot && !selected.pivotOutputPath.trim());
-	const fieldClass = "mt-1 w-full rounded border border-border bg-surface px-2.5 py-2 text-body text-text focus:outline-none focus:ring-2 focus:ring-accent-fg disabled:opacity-60";
+	const focusRing = "focus:outline-none focus:ring-2 focus:ring-accent-fg";
+	const fieldClass = `mt-1 w-full rounded border border-border bg-surface px-2.5 py-2 text-body text-text ${focusRing} disabled:opacity-60`;
 	return <div className={`${MODAL_BACKDROP_CLASS} px-4`}>
 		<div ref={dialogRef} {...dialogProps} className={modalPanelClass("max-w-2xl")}>
 			<header className={`${MODAL_HEADER_CLASS} flex items-center justify-between gap-3 border-b border-border px-5 py-4`}>
 				<h2 {...titleProps} className="text-section font-bold flex items-center gap-2"><Zap size={20} aria-hidden="true" />{t("fastWorkflow.title")}</h2>
-				<button type="button" onClick={close} disabled={isRunning} aria-label={t("common.close")} className="rounded p-1 text-text-muted hover:text-text focus-visible:ring-2 focus-visible:ring-accent-fg disabled:opacity-40"><X size={20} aria-hidden="true" /></button>
+				<button type="button" onClick={close} disabled={isRunning} aria-label={t("common.close")} className="rounded p-1 text-text-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg disabled:opacity-40"><X size={20} aria-hidden="true" /></button>
 			</header>
 			<div className={`${MODAL_BODY_CLASS} px-5 py-4 space-y-4`}>
 				<p className="text-body text-text-muted">{t("fastWorkflow.description")}</p>
-				<details open={!isRunning && (!saved || changed || saved.status === "idle")} className="space-y-3">
-					<summary tabIndex={0} className="cursor-pointer text-body font-medium focus-visible:ring-2 focus-visible:ring-accent-fg">{t("fastWorkflow.options")}</summary>
+				<details open={!isRunning && (!saved || changed || saved.status === "idle")} className="group space-y-3">
+					{/* A compact toggle with a chevron, not a full-width box that reads as an empty field. */}
+					<summary className="-mx-1 inline-flex w-fit list-none items-center gap-1.5 rounded px-1 py-0.5 cursor-pointer text-body font-medium hover:text-accent-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg [&::-webkit-details-marker]:hidden">
+						<ChevronRight size={16} aria-hidden="true" className="shrink-0 transition-transform group-open:rotate-90" />{t("fastWorkflow.options")}
+					</summary>
 				<fieldset disabled={isRunning} className="grid grid-cols-1 sm:grid-cols-2 gap-3">
 					<legend className="sr-only">{t("fastWorkflow.options")}</legend>
 					<label className="text-caption font-medium">{t("fastWorkflow.source")}
@@ -192,23 +196,23 @@ export default function FastWorkflowModal({ open, onClose, project, sampleSource
 					<label className="text-caption font-medium">{t("patch.compression")}
 						<select value={selected.compression} onChange={(event) => patch({ compression: event.target.value as PatchCompression })} className={fieldClass}><option value="fast">{t("patch.compressionFast")}</option><option value="default">{t("patch.compressionDefault")}</option><option value="store">{t("patch.compressionStore")}</option></select>
 					</label>
-					<label className="flex items-center gap-2 text-body sm:self-end sm:pb-2"><input type="checkbox" checked={selected.englishPivot} disabled={selected.sourceLang !== "ja" || selected.targetLang === "en"} onChange={(event) => patch({ englishPivot: event.target.checked })} className="accent-accent" />{t("fastWorkflow.englishPivot")}</label>
+					<label className="flex items-center gap-2 text-body sm:self-end sm:pb-2"><input type="checkbox" checked={selected.englishPivot} disabled={selected.sourceLang !== "ja" || selected.targetLang === "en"} onChange={(event) => patch({ englishPivot: event.target.checked })} className={`accent-accent ${focusRing}`} />{t("fastWorkflow.englishPivot")}</label>
 					{selected.injectMode === "replace" && <label className="text-caption font-medium sm:col-span-2">{t("fastWorkflow.outputDir")}<input value={selected.outputDir} onChange={(event) => patch({ outputDir: event.target.value })} className={fieldClass} /></label>}
 					<label className="text-caption font-medium sm:col-span-2">{t("fastWorkflow.patchOutput")}<input value={selected.patchOutputPath} onChange={(event) => patch({ patchOutputPath: event.target.value })} className={fieldClass} /></label>
 					{selected.englishPivot && <label className="text-caption font-medium sm:col-span-2">{t("fastWorkflow.pivotOutput")}<input value={selected.pivotOutputPath} onChange={(event) => patch({ pivotOutputPath: event.target.value })} className={fieldClass} /></label>}
 				</fieldset>
 				<p className="text-caption text-text-muted">{t("fastWorkflow.pivotHint")}</p>
 				</details>
-				{changed && <div role="status" className="rounded border border-warning bg-warning-muted p-3 text-body text-warning"><p>{t(uncertainWrite ? "fastWorkflow.restoreBeforeResume" : "fastWorkflow.optionsChanged")}</p><button type="button" onClick={() => saved && setOptions(saved.options)} disabled={isRunning} className="mt-2 underline underline-offset-2 focus-visible:ring-2 focus-visible:ring-accent-fg">{t("fastWorkflow.restoreOptions")}</button></div>}
+				{changed && <div role="status" className="rounded border border-warning bg-warning-muted p-3 text-body text-warning"><p>{t(uncertainWrite ? "fastWorkflow.restoreBeforeResume" : "fastWorkflow.optionsChanged")}</p><button type="button" onClick={() => saved && setOptions(saved.options)} disabled={isRunning} className="mt-2 rounded underline underline-offset-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg">{t("fastWorkflow.restoreOptions")}</button></div>}
 				{saved && matches && saved.status !== "completed" && !isRunning && <p className="text-caption text-accent-fg">{t("fastWorkflow.resumeHint")}</p>}
 				{!ready && <p role="alert" className="text-body text-danger">{t("fastWorkflow.providerUnavailable")}</p>}
 				{invalid && <p role="alert" className="text-caption text-danger">{t("fastWorkflow.invalidOptions")}</p>}
 				<FastWorkflowView receipt={visibleReceipt} isRunning={isRunning} cancelRequested={cancelRequested} error={error} />
 			</div>
 			<footer className={MODAL_FOOTER_CLASS}>
-				{isRunning ? <button type="button" onClick={cancel} disabled={cancelRequested} className="rounded border border-border px-4 py-2 text-body hover:bg-surface-muted disabled:opacity-50">{t(cancelRequested ? "fastWorkflow.cancelling" : "fastWorkflow.cancel")}</button> : <>
-					<button type="button" onClick={close} className="rounded border border-border px-4 py-2 text-body hover:bg-surface-muted">{t("common.close")}</button>
-					<button type="button" onClick={() => void start(project, selected, changed)} disabled={invalid || !ready || (changed && uncertainWrite) || (matches && saved?.status === "completed")} className="flex items-center gap-1.5 rounded bg-accent px-4 py-2 text-body font-medium text-white hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed"><Zap size={15} aria-hidden="true" />{t(changed ? "fastWorkflow.startFresh" : saved && saved.status !== "idle" ? "fastWorkflow.resume" : "fastWorkflow.start")}</button>
+				{isRunning ? <button type="button" onClick={cancel} disabled={cancelRequested} className={`rounded border border-border px-4 py-2 text-body hover:bg-surface-muted disabled:opacity-50 ${focusRing}`}>{t(cancelRequested ? "fastWorkflow.cancelling" : "fastWorkflow.cancel")}</button> : <>
+					<button type="button" onClick={close} className={`rounded border border-border px-4 py-2 text-body hover:bg-surface-muted ${focusRing}`}>{t("common.close")}</button>
+					<button type="button" onClick={() => void start(project, selected, changed)} disabled={invalid || !ready || (changed && uncertainWrite) || (matches && saved?.status === "completed")} className={`flex items-center gap-1.5 rounded bg-accent px-4 py-2 text-body font-medium text-white hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed ${focusRing}`}><Zap size={15} aria-hidden="true" />{t(changed ? "fastWorkflow.startFresh" : saved && saved.status !== "idle" ? "fastWorkflow.resume" : "fastWorkflow.start")}</button>
 				</>}
 			</footer>
 		</div>

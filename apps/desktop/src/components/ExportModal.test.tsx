@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { after, beforeEach, test } from "node:test";
 import { registerHooks } from "node:module";
 import { setLocale, t } from "../lib/i18n";
+import { Download, FolderOpen } from "lucide-react";
 import * as a11y from "../lib/modalA11y";
 import type { FileStats, ProjectInfo, StringStatus, ImportPreview } from "../lib/api";
 
@@ -801,3 +802,28 @@ for (const locale of ["en", "es"] as const) {
     assert.equal(h.imported, 0);
   });
 }
+
+for (const native of [true, false]) {
+  test(`${native ? "Tauri" : "browser"}: the export action uses an icon that matches its label`, () => {
+    h.setTauri(native);
+    const action = primary();
+    assert.equal(text(action), native ? t("common.saveAs") : t("export.download"));
+    const icons = nodes(action).filter(node => node.type === Download || node.type === FolderOpen);
+    assert.equal(icons.length, 1);
+    assert.equal(icons[0].type, native ? FolderOpen : Download, native ? "Save as picks a location" : "Download is not a folder");
+    assert.equal(icons[0].props["aria-hidden"], "true");
+  });
+}
+
+test("every visible Export and Import control uses the accent focus ring", async () => {
+  const focusable = (tree: any) => nodes(tree).filter(node => ["button", "input", "select"].includes(node.type) && node.props.className !== "hidden");
+  const assertRings = (tree: any) => {
+    const controls = focusable(tree);
+    assert.ok(controls.length >= 5);
+    for (const control of controls) assert.match(String(control.props.className), /focus(-visible)?:ring-accent-fg/, `${control.type} ${text(control) || control.props.type || control.props.id || ""}`);
+  };
+  assertRings(render());
+  h.previewHandler = async keep => ({ ...importPreview(keep), languages: { ...importPreview(keep).languages, requires_confirmation: true } });
+  await chooseImport(true); await click("export.preview.action");
+  assertRings(render());
+});

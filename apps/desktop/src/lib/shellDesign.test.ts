@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
+import { setLocale, t } from "./i18n";
 
 // Inspect every authored branch, including conditional status and update states.
 const files = [
@@ -72,4 +73,22 @@ test("collapsed sidebar is a 64px rail with hover and keyboard-focus tooltips", 
   assert.match(source, /group-focus-visible:visible/);
   assert.match(source, /PanelLeftOpen/);
   assert.match(source, /PanelLeftClose/);
+});
+
+test("the version label runs a visible update check and names the action in both languages", () => {
+  const source = readFileSync(new URL("../components/Layout.tsx", import.meta.url), "utf8");
+  assert.match(source, /import \{ requestUpdateCheck \} from "\.\/UpdateChecker";/);
+  const label = source.match(/<button[^>]*onClick=\{\(\) => \{ void requestUpdateCheck\(\); \}\}[\s\S]*?<\/button>/);
+  assert.ok(label, "the version label is a button that requests a check");
+  assert.match(label[0], /v\{APP_VERSION\}/);
+  assert.match(label[0], /title=\{t\("update\.checkNow"\)\}/);
+  assert.match(label[0], /aria-label=\{t\("update\.checkNowVersion", \{ version: APP_VERSION \}\)\}/);
+  assert.match(label[0], /focus:ring-accent-fg/);
+  for (const locale of ["en", "es"] as const) {
+    setLocale(locale);
+    const name = t("update.checkNowVersion", { version: "0.3.0" });
+    assert.ok(name.includes("v0.3.0"), "the accessible name keeps the visible version");
+    assert.ok(name.startsWith(t("update.checkNow")), name);
+  }
+  setLocale("en");
 });

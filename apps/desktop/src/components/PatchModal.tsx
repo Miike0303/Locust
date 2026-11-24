@@ -433,7 +433,9 @@ export default function PatchModal({
 			t(report.dry_run ? "activity.patch.dryRun" : "activity.patch.applied", {
 				id: report.patch_id, version: report.patch_version,
 			}),
-			`replaced ${report.replaced}, added ${report.added}, baseline ${report.baseline}`,
+			t("activity.patch.appliedDetail", {
+				replaced: report.replaced, added: report.added, baseline: patchValue(report.baseline),
+			}),
 			"patch",
 		);
 		addToast(
@@ -652,7 +654,7 @@ export default function PatchModal({
 				"info",
 				t("activity.patch.rollback"),
 				report.messages?.join("\n") ||
-					`restored ${report.restored}, deleted ${report.deleted}`,
+					t("activity.patch.rollbackDetail", { restored: report.restored, deleted: report.deleted }),
 				"patch",
 			);
 			setApplyResult(null);
@@ -711,7 +713,9 @@ export default function PatchModal({
 			addLog(
 				"info",
 				t("activity.patch.packed", { id: report.patch_id, version: report.patch_version }),
-				`${report.files_packed} file(s), ${report.size_bytes} bytes, tier ${report.tier}`,
+				t("activity.patch.packedDetail", {
+					files: report.files_packed, bytes: report.size_bytes, tier: patchValue(report.tier),
+				}),
 				"patch",
 			);
 			addToast(
@@ -736,7 +740,7 @@ export default function PatchModal({
 				setTab(id);
 				setError(null);
 			}}
-			className={`px-3 py-1.5 text-body font-medium rounded-t border-b-2 ${
+			className={`px-3 py-1.5 text-body font-medium rounded-t border-b-2 focus:outline-none focus:ring-2 focus:ring-accent-fg ${
 				tab === id
 					? "border-accent-fg text-accent-fg"
 					: "border-transparent text-text-muted hover:text-text"
@@ -835,9 +839,10 @@ export default function PatchModal({
 							<Package size={20} /> {t("patch.title")}
 						</h2>
 						<button
+							type="button"
 							onClick={onClose}
 							aria-label={t("common.close")}
-							className="text-text-muted hover:text-text"
+							className="rounded text-text-muted hover:text-text focus:outline-none focus:ring-2 focus:ring-accent-fg"
 						>
 							<X size={20} />
 						</button>
@@ -870,8 +875,9 @@ export default function PatchModal({
 								className="flex-1 p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
 							/>
 							<button
+								type="button"
 								onClick={pickGame}
-								className="px-3 py-2 bg-surface-muted text-text hover:bg-surface rounded"
+								className="px-3 py-2 bg-surface-muted text-text hover:bg-surface rounded focus:outline-none focus:ring-2 focus:ring-accent-fg"
 								title={t("common.browse")}
 							>
 								<FolderOpen size={16} />
@@ -896,7 +902,7 @@ export default function PatchModal({
 								</pre>
 								{errorSnapshot?.technical && (
 									<details className="mt-2">
-										<summary className="cursor-pointer">{t("patch.technicalDetails")}</summary>
+										<summary className="cursor-pointer rounded focus:outline-none focus:ring-2 focus:ring-accent-fg">{t("patch.technicalDetails")}</summary>
 										<pre className="whitespace-pre-wrap break-words">{errorSnapshot.technical}</pre>
 									</details>
 								)}

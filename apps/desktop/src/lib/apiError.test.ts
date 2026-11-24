@@ -1242,3 +1242,62 @@ for (const locale of ["en", "es"] as const) {
     });
   }
 }
+
+// Exact server/Tauri bodies (routes/io.rs, routes/speakers.rs, font_patch.rs, commands.rs).
+const ownedServerErrors = [
+	{
+		raw: "no entries to export", key: "api.error.nothingToExport",
+		en: "Nothing to export: no strings match the selected language and scope.",
+		es: "No hay nada que exportar: ninguna cadena coincide con el idioma y el alcance seleccionados.",
+	},
+	{
+		raw: "speaker not found", key: "api.error.speakerNotFound",
+		en: "This speaker no longer exists. Refresh the speaker list.",
+		es: "Este personaje ya no existe. Actualice la lista de personajes.",
+	},
+	{
+		raw: "The current project has no translated text. Translate entries before generating a font patch.", key: "api.error.fontPatchNoTranslations",
+		en: "The current project has no translated text. Translate entries before generating a font patch.",
+		es: "El proyecto actual no tiene texto traducido. Traduzca entradas antes de generar un parche de fuentes.",
+	},
+	{
+		raw: "Select a clean game copy or roll back its installed patch before generating a font patch.", key: "api.error.fontPatchPatchedGame",
+		en: "Select a clean game copy or roll back its installed patch before generating a font patch.",
+		es: "Seleccione una copia limpia del juego o revierta su parche instalado antes de generar un parche de fuentes.",
+	},
+	{
+		raw: "output_path already exists; choose a new file name", key: "api.error.outputPathExists",
+		en: "The output file already exists. Choose a new file name.",
+		es: "El archivo de salida ya existe. Elija un nombre de archivo nuevo.",
+	},
+	{
+		raw: "game_path must be an existing game directory or file", key: "api.error.gamePathMustExist",
+		en: "The game path must be an existing game folder or file.",
+		es: "La ruta del juego debe ser una carpeta o un archivo de juego existente.",
+	},
+] as const;
+
+for (const locale of ["en", "es"] as const) {
+	test(`${locale}: owned export, speaker and font-patch refusals map to catalog guidance`, () => {
+		setLocale(locale);
+		for (const mapping of ownedServerErrors) {
+			for (const frame of ["", "400: ", "409: "]) {
+				const error = new ApiError(frame + mapping.raw);
+				assert.equal(error.key, mapping.key, mapping.raw);
+				assert.equal(error.message, mapping[locale]);
+				assert.equal(error.raw, frame + mapping.raw);
+			}
+		}
+	});
+}
+
+test("owned refusal near misses keep the unknown-error fallback", () => {
+	for (const locale of ["en", "es"] as const) {
+		setLocale(locale);
+		for (const body of ["no entries to export for file 'a.rpy'; known files: b.rpy", "speaker not found: Alice", "output_path already exists", "no entries to export\nextra"]) {
+			assert.equal(new ApiError(body).key, undefined, body);
+			assert.equal(localizeApiError(body), body);
+		}
+	}
+	setLocale("en");
+});

@@ -41,7 +41,7 @@ const hooks = registerHooks({
     return nextResolve(specifier, context);
   },
 });
-const { default: UpdateChecker, triggerUpdateCheck } = await import("./UpdateChecker");
+const { default: UpdateChecker, triggerUpdateCheck, requestUpdateCheck } = await import("./UpdateChecker");
 after(() => { hooks.deregister(); Reflect.deleteProperty(globalThis, "__updater"); setLocale("en"); });
 beforeEach(() => {
   h.states = []; h.cursor = 0; h.effects = []; h.logs = [];
@@ -198,4 +198,64 @@ test("a restart failure retries only relaunch, without reinstalling", async () =
   await button(render(), t("update.restart" as any)).props.onClick();
   assert.equal(h.downloads, 1);
   assert.equal(h.relaunches, 2);
+});
+
+for (const locale of ["en", "es"] as const) {
+  test(`${locale}: a manual check after Later shows the update again`, async () => {
+    setLocale(locale);
+    button(await available(), t("common.later")).props.onClick();
+    assert.equal(render(), null, "Later hides the automatic prompt");
+    const checks = h.checks;
+    await requestUpdateCheck();
+    assert.equal(h.checks, checks + 1);
+    assert.ok(text(render()).includes(t("update.available", { version: "9.0.0" })));
+  });
+
+  test(`${locale}: a manual check reports up to date and can be dismissed`, async () => {
+    setLocale(locale);
+    h.check = async () => null;
+    render(); await flush();
+    assert.equal(render(), null, "the silent startup check shows nothing when current");
+    const pending = requestUpdateCheck();
+    assert.ok(text(render()).includes(t("update.checking")), "the manual check is visible while it runs");
+    await pending;
+    const tree = render();
+    assert.ok(text(tree).includes(t("update.upToDate")));
+    const dismiss = nodes(tree).find(node => node.type === "button" && node.props["aria-label"] === t("common.dismiss"));
+    assert.ok(dismiss, "the up-to-date notice can be dismissed");
+    dismiss.props.onClick();
+    assert.equal(render(), null);
+  });
+
+  test(`${locale}: a failed manual check is shown to the user with a retry, not only logged`, async () => {
+    setLocale(locale);
+    h.check = async () => { throw new Error("offline"); };
+    render(); await flush();
+    assert.equal(render(), null, "the silent startup failure stays in the log");
+    assert.equal(h.logs.length, 1);
+    await requestUpdateCheck();
+    const failed = render();
+    assert.ok(text(failed).includes(t("update.checkFailed")));
+    assert.ok(text(failed).includes(t("update.checkFailedHint")));
+    assert.ok(!text(failed).includes("offline"));
+    assert.equal(h.logs[1]?.[2], "offline");
+    h.check = async () => null;
+    await button(failed, t("common.retry")).props.onClick();
+    assert.ok(text(render()).includes(t("update.upToDate")));
+  });
+}
+
+test("every update notice control uses the accent focus ring", async () => {
+  const assertRings = (tree: any) => {
+    const controls = nodes(tree).filter(node => node.type === "button");
+    assert.ok(controls.length > 0);
+    for (const control of controls) assert.match(String(control.props.className), /focus(-visible)?:ring-accent-fg/, text(control) || control.props["aria-label"]);
+  };
+  assertRings(await available());
+  h.check = async () => { throw new Error("offline"); };
+  await requestUpdateCheck();
+  assertRings(render());
+  h.check = async () => null;
+  await requestUpdateCheck();
+  assertRings(render());
 });

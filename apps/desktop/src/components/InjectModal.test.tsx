@@ -75,6 +75,7 @@ let stringsWritten = 3;
 let binaryCount = 0;
 let injectGate: Promise<void> | undefined;
 let injectFailure: string | Error | undefined;
+let injectExtra: Record<string, unknown> = {};
 const originalFetch = globalThis.fetch;
 Object.defineProperty(globalThis, "window", { configurable: true, value: {
   addEventListener() {},
@@ -89,6 +90,7 @@ Object.defineProperty(globalThis, "window", { configurable: true, value: {
       languages_processed: ["es"], languages_failed: [], backup_id: "backup",
       reports: { es: { strings_written: stringsWritten, files_modified: stringsWritten ? 1 : 0 } },
       injected_roots: args.params.mode === "replace" ? { es: "/returned/actual-copy-es" } : {},
+      ...injectExtra,
     };
     if (command === "register_lang") return {
       plugins_js: true, iavra_languages: false, visumz_options: true,
@@ -156,7 +158,7 @@ function selectMode(mode: "add" | "direct" | "replace") {
 }
 function reset(locale: "en" | "es", mode: "add" | "direct" | "replace", autoRegister = true) {
   storage.clear();
-  injectFailure = undefined; binaryCount = 0; injectGate = undefined;
+  injectFailure = undefined; binaryCount = 0; injectGate = undefined; injectExtra = {};
   h.navigations = []; h.closeCalls = 0;
   globalThis.fetch = originalFetch;
   h.setTauri(true);
@@ -587,4 +589,95 @@ for (const locale of ["en", "es"] as const) test(`${locale} Godot defaults to Re
   const options = nodes(modeSelect()).filter(node => node.type === "option").map(node => node.props.value);
   assert.deepEqual(options, ["replace", "direct"]);
   assert.ok(text(render()).includes(t("inject.archiveOnly")));
+});
+
+function remount(entries: Record<string, string>) {
+  storage.clear();
+  for (const [key, value] of Object.entries(entries)) storage.set(key, value);
+  h.values = [];
+}
+function checkedLanguages() {
+  return nodes(render())
+    .filter(node => node.type === "label" && nodes(node).some(child => child.type === "input" && child.props.type === "radio" && child.props.checked))
+    .map(text);
+}
+
+test("Inject defaults the target language from the last-used translation target", () => {
+  reset("en", "add");
+  remount({ "locust.translation.langs": JSON.stringify({ source: "ja", target: "fr" }) });
+  assert.deepEqual(checkedLanguages(), ["Français"]);
+  assert.ok(text(render()).includes(t("inject.selected", { langs: "Français" })));
+  remount({ "locust.translation.langs": JSON.stringify({ target: "de" }), "locust.inject.langs": JSON.stringify(["es"]) });
+  assert.deepEqual(checkedLanguages(), ["Deutsch"], "the last translation target outranks an older injection");
+  remount({ "locust.translation.langs": JSON.stringify({ target: "xx" }), "locust.inject.langs": JSON.stringify(["it"]) });
+  assert.deepEqual(checkedLanguages(), ["Italiano"], "an unknown target falls back to the last injected language");
+  remount({ "locust.translation.langs": "not json" });
+  assert.deepEqual(checkedLanguages(), ["Español"]);
+  assert.equal(calls.length, 0, "choosing a default must not call the backend");
+});
+
+test("Reopening Inject picks up a translation target chosen while it was closed, but keeps a choice while open", () => {
+  reset("en", "add");
+  remount({});
+  assert.deepEqual(checkedLanguages(), ["Español"]);
+  const french = nodes(render()).find(node => node.type === "label" && text(node) === "Français");
+  nodes(french).find(node => node.type === "input").props.onChange();
+  storage.set("locust.translation.langs", JSON.stringify({ target: "ko" }));
+  assert.deepEqual(checkedLanguages(), ["Français"], "rerenders while open keep the user's choice");
+  render(false);
+  assert.deepEqual(checkedLanguages(), ["한국어"]);
+});
+
+const ENGLISH_DETAIL = /Direct inject into|Added translation folders|Strings written|No language failures|Failed:|Warnings:|Files written:|Backup:|must be ≤ source/;
+async function runInject(mode: "add" | "direct" | "replace") {
+  if (mode === "replace") setOutput("/output");
+  await button(t(mode === "direct" ? "inject.directAction" : mode === "replace" ? "inject.copyAction" : "inject.injectAction")).props.onClick();
+}
+
+test("en: inject activity details keep their existing English text", async () => {
+  reset("en", "direct");
+  binaryCount = 1;
+  injectExtra = { backup_path: "/backups/1", warnings: ["raw backend warning"], files_written: ["data/Map001.json"] };
+  await runInject("direct");
+  assert.deepEqual(h.logs[0], ["warning", t("activity.inject.preflight", { count: 1 }), "UTF-8 / UTF-16LE / Shift-JIS length must be ≤ source", "inject"]);
+  assert.equal(h.logs[1][2], "Direct inject into /game\nBackup: /backups/1\nStrings written: 3\nNo language failures\nWarnings:\n- raw backend warning\nFiles written:\n- data/Map001.json");
+  assert.ok(text(render()).includes("Mode: direct"));
+  reset("en", "add");
+  injectExtra = { languages_failed: [["fr", "raw failure"]] };
+  await runInject("add");
+  assert.equal(h.logs[0][2], "Added translation folders in /game\nStrings written: 3\nFailed: fr: raw failure");
+});
+
+for (const mode of ["direct", "add", "replace"] as const) {
+  test(`es: ${mode} inject activity details and result mode use the Spanish catalog`, async () => {
+    reset("es", mode);
+    binaryCount = 1;
+    injectExtra = { backup_path: "/backups/1", warnings: ["raw backend warning"], files_written: ["data/Map001.json"], languages_failed: [["fr", "raw failure"]] };
+    await runInject(mode);
+    const preflight = h.logs.find(log => log[1] === t("activity.inject.preflight", { count: 1 }));
+    assert.ok(preflight);
+    assert.equal(preflight[2], "La longitud en UTF-8 / UTF-16LE / Shift-JIS debe ser menor o igual que la del texto original");
+    const detail = String(h.logs.find(log => String(log[1]).startsWith("Inyección"))?.[2]);
+    assert.doesNotMatch(detail, ENGLISH_DETAIL);
+    for (const diagnostic of ["raw backend warning", "data/Map001.json", "fr: raw failure"]) assert.ok(detail.includes(diagnostic), diagnostic);
+    assert.ok(detail.includes("Cadenas escritas: 3"));
+    if (mode === "direct") assert.ok(detail.startsWith("Inyección directa en /game\nCopia de seguridad: /backups/1\n"));
+    if (mode === "add") assert.ok(detail.startsWith("Se añadieron carpetas de traducción en /game\n"));
+    if (mode === "replace") assert.ok(detail.startsWith("Copia traducida (es): /returned/actual-copy-es\n"));
+    const modeName = { direct: "directo", add: "adición", replace: "reemplazo" }[mode];
+    assert.ok(text(render()).includes(`Modo: ${modeName}`));
+    assert.doesNotMatch(text(render()), new RegExp(`Modo: ${mode}(?![a-záéíóúñ])`), "the raw backend mode is not shown");
+  });
+}
+
+test("every Inject control uses the accent focus ring before and after injecting", async () => {
+  reset("en", "replace");
+  const controls = (tree: any) => nodes(tree).filter(node => ["button", "input", "select"].includes(node.type));
+  assert.ok(controls(render()).length > 10);
+  for (const control of controls(render())) assert.match(String(control.props.className), /focus(-visible)?:ring-accent-fg/, `${control.type} ${text(control) || control.props.type || ""}`);
+  await inject("replace");
+  injectExtra = {};
+  const after = controls(render());
+  assert.ok(after.length >= 3);
+  for (const control of after) assert.match(String(control.props.className), /focus(-visible)?:ring-accent-fg/, `${control.type} ${text(control)}`);
 });

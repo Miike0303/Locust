@@ -15,6 +15,7 @@ import {
 	ListOrdered,
 	PanelLeftOpen,
 	PanelLeftClose,
+	RefreshCw,
 } from "lucide-react";
 import clsx from "clsx";
 import { useGlobalHotkeys } from "../lib/hotkeys";
@@ -25,6 +26,7 @@ import ToastContainer from "./ToastContainer";
 import ActivityLog from "./ActivityLog";
 import BottomBar from "./BottomBar";
 import QueuePanel from "./QueuePanel";
+import { requestUpdateCheck } from "./UpdateChecker";
 import { useLogStore } from "../stores/logStore";
 import { useQueueStore } from "../stores/queueStore";
 import { APP_VERSION } from "../lib/appVersion";
@@ -98,9 +100,17 @@ export default function Layout() {
 			<aside className="w-60 data-[collapsed=true]:w-16 shrink-0 flex flex-col bg-surface-muted dark:bg-surface border-r border-border" data-collapsed={collapsed}>
 				<div className={clsx("p-4", collapsed && "text-center")}>
 					<p className="text-page font-bold text-accent-fg" title={t("nav.appName")} aria-label={t("nav.appName")}>{collapsed ? "L" : t("nav.appName")}</p>
-					{!collapsed && <p className="text-caption text-text-muted">
+					{/* The version label is the manual entry point; "Later" only hides the automatic prompt. */}
+					{!collapsed && <button
+						type="button"
+						onClick={() => { void requestUpdateCheck(); }}
+						title={t("update.checkNow")}
+						aria-label={t("update.checkNowVersion", { version: APP_VERSION })}
+						className="inline-flex items-center gap-1 rounded text-caption text-text-muted hover:text-text focus:outline-none focus:ring-2 focus:ring-accent-fg"
+					>
 						v{APP_VERSION}
-					</p>}
+						<RefreshCw size={11} aria-hidden="true" />
+					</button>}
 				</div>
 
 				<nav className="flex-1 px-2 space-y-1">

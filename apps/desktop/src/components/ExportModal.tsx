@@ -318,9 +318,10 @@ export default function ExportModal({
 						{mode === "export" ? t("export.exportTitle") : t("export.importTitle")}
 					</h2>
 					<button
+						type="button"
 						onClick={() => { clearImportPreview(); onClose(); }}
 						aria-label={t("common.close")}
-						className="text-text-muted hover:text-text"
+						className="rounded text-text-muted hover:text-text focus:outline-none focus:ring-2 focus:ring-accent-fg"
 					>
 						<X size={20} />
 					</button>
@@ -331,7 +332,7 @@ export default function ExportModal({
 						type="button"
 						onClick={() => { clearImportPreview(); setMode("export"); }}
 						disabled={loading}
-						className={`flex-1 py-1.5 text-body rounded transition-colors ${
+						className={`flex-1 py-1.5 text-body rounded transition-colors focus:outline-none focus:ring-2 focus:ring-accent-fg ${
 							mode === "export"
 								? "bg-surface text-text shadow font-medium"
 								: "text-text-muted hover:text-text"
@@ -343,7 +344,7 @@ export default function ExportModal({
 						type="button"
 						onClick={() => { clearImportPreview(); setMode("import"); }}
 						disabled={loading}
-						className={`flex-1 py-1.5 text-body rounded transition-colors ${
+						className={`flex-1 py-1.5 text-body rounded transition-colors focus:outline-none focus:ring-2 focus:ring-accent-fg ${
 							mode === "import"
 								? "bg-surface text-text shadow font-medium"
 								: "text-text-muted hover:text-text"
@@ -555,8 +556,9 @@ export default function ExportModal({
 
 				<div className={clsx(MODAL_FOOTER_CLASS, "mt-4 -mx-6 -mb-6")}>
 					<button
+						type="button"
 						onClick={() => { clearImportPreview(); onClose(); }}
-						className="px-3 py-2 text-body rounded border border-border bg-surface text-text hover:bg-surface-muted"
+						className="px-3 py-2 text-body rounded border border-border bg-surface text-text hover:bg-surface-muted focus:outline-none focus:ring-2 focus:ring-accent-fg"
 					>
 						{t("common.cancel")}
 					</button>
@@ -579,11 +581,12 @@ export default function ExportModal({
 							void handleExport();
 						}}
 						disabled={exportDisabled}
-						className="flex items-center gap-1.5 px-4 py-2 text-body font-medium rounded bg-accent hover:bg-accent-hover disabled:opacity-50 text-white"
+						className="flex items-center gap-1.5 px-4 py-2 text-body font-medium rounded bg-accent hover:bg-accent-hover disabled:opacity-50 text-white focus:outline-none focus:ring-2 focus:ring-accent-fg"
 					>
 						{loading ? t("export.exporting") : (
 							<>
-								<FolderOpen size={16} />
+								{/* Save as picks a location; the browser downloads the file. */}
+								{IS_TAURI ? <FolderOpen size={16} aria-hidden="true" /> : <Download size={16} aria-hidden="true" />}
 								{IS_TAURI ? t("common.saveAs") : t("export.download")}
 							</>
 						)}

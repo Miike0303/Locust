@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import ts from "typescript";
 import PatchApplyTab, { PatchApplyActions } from "./patch/PatchApplyTab";
 import PatchPackTab, { PatchPackActions } from "./patch/PatchPackTab";
 import ConfirmDialog from "./ConfirmDialog";
@@ -702,4 +703,75 @@ test("Editor leaves Escape to the open Patch dialog so one key press closes it o
   assert.ok(closePanel, "Editor registers its Escape hotkey");
   assert.doesNotMatch(closePanel[1], /setShowPatchModal\(false\)/, "the hotkey must not close the Patch dialog as well");
   assert.match(closePanel[1], /!showPatchModal/, "the hotkey pauses while the Patch dialog owns Escape");
+});
+
+for (const locale of ["en", "es"] as const) test(`${locale} rollback without backend messages logs a localized count detail`, async () => {
+  reset(locale);
+  report.aborted_edited = []; report.messages = [];
+  button(t("patch.rollback")).props.onClick();
+  await rollbackConfirm().props.onConfirm();
+  const log = h.logs.find(entry => entry[1] === t("activity.patch.rollback"));
+  assert.ok(log, "rollback is logged");
+  assert.equal(log[2], locale === "en" ? "restored 2, deleted 1" : "restaurados 2, eliminados 1");
+});
+
+test("rollback backend messages remain the raw activity detail", async () => {
+  reset("es");
+  report.aborted_edited = [];
+  button(t("patch.rollback")).props.onClick();
+  await rollbackConfirm().props.onConfirm();
+  assert.equal(h.logs.find(entry => entry[1] === t("activity.patch.rollback"))?.[2], "preview <message>");
+});
+
+for (const locale of ["en", "es"] as const) test(`${locale} a completed apply logs a localized count detail`, async () => {
+  reset(locale);
+  await verifyAndInterrupt();
+  await button(t("patch.applyBtn")).props.onClick();
+  h.jobHandlers!.onDone({ report: {
+    patch_id: "apply-result", patch_version: "1", replaced: 2, added: 1,
+    baseline: "Pristine", dry_run: false, forced: false, user_edits_overwritten: [], messages: [],
+  } });
+  await settleApply();
+  const log = h.logs.find(entry => entry[1] === t("activity.patch.applied", { id: "apply-result", version: "1" }));
+  assert.ok(log, "apply is logged");
+  assert.equal(log[2], locale === "en" ? "replaced 2, added 1, baseline Original game" : "reemplazados 2, añadidos 1, base Juego original");
+});
+
+for (const locale of ["en", "es"] as const) test(`${locale} a completed pack logs a localized size detail`, async () => {
+  recordedRoot = "/game";
+  reset(locale);
+  h.values = []; h.runEffects = true; h.effectDeps = []; h.effects = [];
+  renderOptions = { initialTab: "pack", allowPack: true };
+  try {
+    await flushEffects();
+    nodes(render()).find(node => node.type === "input" && node.props.placeholder === t("patch.outputPlaceholder"))
+      .props.onChange({ target: { value: "/patch.zip" } });
+    await button(t("patch.packBtn"), 1).props.onClick();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const log = h.logs.find(entry => entry[1] === t("activity.patch.packed", { id: "godot", version: "1" }));
+    assert.ok(log, JSON.stringify(h.logs));
+    assert.equal(log[2], locale === "en" ? "1 file(s), 200 bytes, tier strict" : "1 archivo(s), 200 bytes, nivel estricto");
+  } finally {
+    h.runEffects = false; h.effects = []; renderOptions = {}; recordedRoot = "/copies/game.pck-es";
+  }
+});
+
+test("every control PatchModal renders itself uses the accent focus ring", () => {
+  const url = new URL("./PatchModal.tsx", import.meta.url);
+  const source = ts.createSourceFile(url.pathname, readFileSync(url, "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const missing: string[] = [];
+  let checked = 0;
+  const visit = (node: ts.Node): void => {
+    if ((ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) && ["button", "input", "select", "textarea", "summary"].includes(node.tagName.getText(source))) {
+      checked++;
+      const className = node.attributes.properties.find(attribute => ts.isJsxAttribute(attribute) && attribute.name.getText(source) === "className");
+      if (!className || !/focus(-visible)?:ring-accent-fg/.test(className.getText(source))) {
+        missing.push(`${node.tagName.getText(source)}:${source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1}`);
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  assert.ok(checked >= 5, `scan found ${checked} controls`);
+  assert.deepEqual(missing, []);
 });
