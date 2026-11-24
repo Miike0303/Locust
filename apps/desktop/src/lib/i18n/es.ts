@@ -1428,6 +1428,7 @@ export const es: Record<keyof typeof en, string> = {
   "validate.fontSuggestions": "Fuentes de reemplazo sugeridas",
   "validate.fontCovers": "Cubre: {scripts}",
   "validate.fontDownload": "Descargar familia de fuentes",
+  "validate.fontDownloadFailed": "No se pudo abrir la página de la fuente: {error}",
   "validate.missingGlyphs.one": "{count} glifo ausente · {percent}% de cobertura",
   "validate.missingGlyphs.other": "{count} glifos ausentes · {percent}% de cobertura",
   "validate.more": " +{count} más",
@@ -1538,6 +1539,8 @@ export const es: Record<keyof typeof en, string> = {
   "update.installed": "Actualización instalada — reiniciando...",
   "update.checkFailed": "La comprobación de actualización falló",
   "update.desktopOnly": "Las actualizaciones solo están disponibles en la aplicación de escritorio",
+  "update.waiting": "Actualización en espera",
+  "update.jobRunning": "Hay una traducción o un parche en curso. Termínelo o cancélelo y luego instale la actualización.",
   "update.checkNow": "Buscar actualizaciones",
   "update.checkNowVersion": "Buscar actualizaciones (versión actual v{version})",
 

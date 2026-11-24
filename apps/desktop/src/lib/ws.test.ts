@@ -304,6 +304,25 @@ test("translation row events stale the original project even if the job later fa
   assert.equal(queryClient.getQueryData(["workflow-last-edit", draftProjectKey(other)]), undefined);
   queryClient.clear();
 });
+test("a malformed frame is a parse failure; a throwing handler is reported as a handler failure", async (ctx) => {
+  reset();
+  const errors: unknown[][] = [];
+  ctx.mock.method(console, "error", (...args: unknown[]) => { errors.push(args); });
+  let started = 0;
+  const stop = subscribeToJob("ws-error-split", {
+    onStarted: () => { started++; throw new Error("handler exploded"); },
+  });
+  const socket = await lastSocket();
+  socket.onmessage?.({ data: "{not json" });
+  assert.equal(errors.length, 1);
+  assert.match(String(errors[0][0]), /^Failed to parse WS message/);
+  socket.emitMessage({ type: "started" });
+  assert.equal(started, 1);
+  assert.equal(errors.length, 2);
+  assert.match(String(errors[1][0]), /^WS handler failed for "started" message/);
+  assert.equal((errors[1][1] as Error).message, "handler exploded");
+  stop();
+});
 test("patch jobs and unsubscribed sockets do not mark translation edits", async () => {
   reset(); queryClient.clear(); useProjectStore.getState().setProject(project);
   const stop = subscribeToJob("workflow-patch", {}, "patch");

@@ -1452,6 +1452,7 @@ export const en = {
   "validate.fontSuggestions": "Suggested replacement fonts",
   "validate.fontCovers": "Covers: {scripts}",
   "validate.fontDownload": "Download font family",
+  "validate.fontDownloadFailed": "Could not open the font page: {error}",
   "validate.missingGlyphs.one": "{count} missing glyph · {percent}% coverage",
   "validate.missingGlyphs.other": "{count} missing glyphs · {percent}% coverage",
   "validate.more": " +{count} more",
@@ -1565,6 +1566,8 @@ export const en = {
   "update.installed": "Update installed — restarting...",
   "update.checkFailed": "Update check failed",
   "update.desktopOnly": "Updates only available in desktop app",
+  "update.waiting": "Update on hold",
+  "update.jobRunning": "A translation or patch job is running. Finish or cancel it, then install the update.",
   "update.checkNow": "Check for updates",
   "update.checkNowVersion": "Check for updates (current version v{version})",
 

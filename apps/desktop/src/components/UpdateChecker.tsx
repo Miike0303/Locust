@@ -2,9 +2,10 @@ import { IS_TAURI } from "../lib/runtime";
 import { useEffect, useRef, useState } from "react";
 import { Download, CheckCircle, AlertCircle } from "lucide-react";
 import { t as translateStandalone, useT } from "../lib/i18n";
+import { getActiveJobs } from "../lib/api";
 import { addLog } from "../stores/logStore";
 
-type UpdateFailureKey = "update.desktopOnly" | "update.checkFailedHint" | "update.installFailedHint" | "update.restartFailedHint";
+type UpdateFailureKey = "update.desktopOnly" | "update.checkFailedHint" | "update.installFailedHint" | "update.restartFailedHint" | "update.jobRunning";
 type UpdateRetry = "check" | "install" | "restart";
 
 type UpdateState =
@@ -24,6 +25,17 @@ function updateFailure(error: unknown, messageKey: UpdateFailureKey, retry: Upda
 }
 
 const FOCUS_RING = "focus:outline-none focus:ring-2 focus:ring-accent-fg";
+
+/** Installing relaunches Locust, which would cut a running translation or patch short. */
+async function jobIsRunning(): Promise<boolean> {
+  try {
+    const jobs = await getActiveJobs();
+    return jobs.translation !== null || jobs.patches.length > 0;
+  } catch {
+    // An unreachable backend has no job of its own to interrupt.
+    return false;
+  }
+}
 
 // The one mounted checker owns the visible check; the sidebar version label triggers it.
 let manualCheck: (() => Promise<void>) | null = null;
@@ -74,8 +86,12 @@ export default function UpdateChecker() {
   const restartInstalled = async () => {
     if (!IS_TAURI || busy.current) return;
     busy.current = true;
-    setState({ kind: "installed" });
     try {
+      if (await jobIsRunning()) {
+        setState({ kind: "error", messageKey: "update.jobRunning", retry: "restart" });
+        return;
+      }
+      setState({ kind: "installed" });
       const { relaunch } = await import("@tauri-apps/plugin-process");
       await relaunch();
     } catch (error: unknown) {
@@ -88,9 +104,13 @@ export default function UpdateChecker() {
   const downloadAndInstall = async () => {
     if (!IS_TAURI || busy.current) return;
     busy.current = true;
-    setState({ kind: "downloading", progress: 0 });
     let installed = false;
     try {
+      if (await jobIsRunning()) {
+        setState({ kind: "error", messageKey: "update.jobRunning", retry: "install" });
+        return;
+      }
+      setState({ kind: "downloading", progress: 0 });
       const { check } = await import("@tauri-apps/plugin-updater");
       const update = await check();
       if (!update) {
@@ -234,7 +254,7 @@ export default function UpdateChecker() {
         <div className="bg-danger-muted text-danger border border-danger rounded-lg shadow-lg p-3 flex items-center gap-2 text-body">
           <AlertCircle size={16} className="text-danger flex-shrink-0" />
           <div className="flex-1">
-            <div className="font-semibold">{t(state.messageKey === "update.checkFailedHint" || state.messageKey === "update.desktopOnly" ? "update.checkFailed" : "update.failed")}</div>
+            <div className="font-semibold">{t(state.messageKey === "update.jobRunning" ? "update.waiting" : state.messageKey === "update.checkFailedHint" || state.messageKey === "update.desktopOnly" ? "update.checkFailed" : "update.failed")}</div>
             <div className="text-caption text-text-muted">{t(state.messageKey)}</div>
             {state.retry && (
               <button

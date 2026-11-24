@@ -6,7 +6,7 @@ import { SETTINGS_INPUT_CLASS } from "../../components/BufferedSetting";
 import type { ProviderInfo } from "../../lib/api";
 import { xaiAuthPoll, xaiAuthStart } from "../../lib/api";
 import { useT } from "../../lib/i18n";
-import { IS_TAURI } from "../../lib/runtime";
+import { openExternalUrl } from "../../lib/externalUrl";
 import {
   XAI_POLL_INTERVAL_MS,
   grokSubIsReady,
@@ -14,15 +14,6 @@ import {
   type XaiAuthPollStatus,
 } from "../../lib/xaiAuth";
 import { addToast } from "../../stores/toastStore";
-
-async function openExternalUrl(url: string): Promise<void> {
-  if (IS_TAURI) {
-    const { open } = await import("@tauri-apps/plugin-shell");
-    await open(url);
-    return;
-  }
-  window.open(url, "_blank", "noopener,noreferrer");
-}
 
 export default function GrokSubCard({
   provider,

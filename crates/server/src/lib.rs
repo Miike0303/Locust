@@ -192,6 +192,36 @@ pub fn active_translation_job(state: &AppState) -> Option<String> {
     None
 }
 
+/// Unfinished jobs the desktop updater must not cut short by installing and relaunching.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct ActiveJobs {
+    /// Id of the in-flight translation job, if any.
+    pub translation: Option<String>,
+    /// Ids of unfinished patch-apply jobs, for any game folder.
+    pub patches: Vec<String>,
+}
+
+/// UI status query with the same "unfinished" rule as the per-kind helpers above.
+pub fn active_jobs(state: &AppState) -> ActiveJobs {
+    let mut patches: Vec<String> = state
+        .active_jobs
+        .iter()
+        .filter(|job| matches!(job.kind, JobKind::Patch))
+        .filter(|job| {
+            !job.replay
+                .lock()
+                .map(|log| log.iter().any(job_event_is_terminal))
+                .unwrap_or(false)
+        })
+        .map(|job| job.key().clone())
+        .collect();
+    patches.sort();
+    ActiveJobs {
+        translation: active_translation_job(state),
+        patches,
+    }
+}
+
 /// Shared HTTP/Tauri admission. Acquire before awaiting project/provider state,
 /// and move the returned guard into any detached task that uses the live DB.
 pub fn try_project_operation(state: &AppState) -> Result<ProjectExclusiveGuard, String> {
@@ -699,6 +729,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/stats", get(get_stats))
         .route("/api/stats/files", get(get_file_stats))
         .route("/api/runs", get(list_translation_runs))
+        .route("/api/jobs/active", get(routes::jobs::active_jobs))
         .route("/api/translate/start", post(translate_start))
         .route("/api/translate/estimate", post(translate_estimate))
         .route("/api/translate/cancel/:job_id", post(translate_cancel))
@@ -1044,6 +1075,66 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&game_a);
         let _ = std::fs::remove_dir_all(&game_b);
+    }
+
+    #[tokio::test]
+    async fn active_jobs_lists_only_unfinished_translation_and_patch_jobs() {
+        let state = create_test_state();
+        assert_eq!(
+            active_jobs(&state),
+            ActiveJobs {
+                translation: None,
+                patches: vec![]
+            }
+        );
+        park_job_with_patch_key(
+            &state,
+            "t-done",
+            JobKind::Translate,
+            Some("completed"),
+            None,
+        );
+        park_job_with_patch_key(
+            &state,
+            "p-done",
+            JobKind::Patch,
+            Some("done"),
+            Some("a".into()),
+        );
+        assert_eq!(
+            active_jobs(&state),
+            ActiveJobs {
+                translation: None,
+                patches: vec![]
+            }
+        );
+        park_job_with_patch_key(&state, "t-live", JobKind::Translate, None, None);
+        park_job_with_patch_key(&state, "p-live-b", JobKind::Patch, None, Some("b".into()));
+        park_job_with_patch_key(&state, "p-live-a", JobKind::Patch, None, Some("a".into()));
+        assert_eq!(
+            active_jobs(&state),
+            ActiveJobs {
+                translation: Some("t-live".into()),
+                patches: vec!["p-live-a".into(), "p-live-b".into()]
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn active_jobs_route_reports_running_jobs() {
+        let state = create_test_state();
+        park_job_with_patch_key(&state, "t-live", JobKind::Translate, None, None);
+        let (url, server) = start_test_server(state).await;
+        let response = reqwest::get(format!("{url}/api/jobs/active"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let json: serde_json::Value = response.json().await.unwrap();
+        server.abort();
+        assert_eq!(
+            json,
+            serde_json::json!({ "translation": "t-live", "patches": [] })
+        );
     }
 
     #[test]

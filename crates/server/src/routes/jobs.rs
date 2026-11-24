@@ -36,6 +36,13 @@ impl JobSubscription {
     }
 }
 
+/// `GET /api/jobs/active`: lets the desktop updater refuse to relaunch mid-job.
+pub(crate) async fn active_jobs(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> axum::Json<crate::ActiveJobs> {
+    axum::Json(crate::active_jobs(&state))
+}
+
 pub(crate) fn cancel_job(state: &AppState, job_id: &str) -> Result<StatusCode, ApiError> {
     if let Some(job) = state.active_jobs.get(job_id) {
         let already_done = job

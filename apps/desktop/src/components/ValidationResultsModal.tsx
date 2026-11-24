@@ -12,6 +12,8 @@ import type {
 import { validationKindLabel } from "../lib/api";
 import { validationMessage, validationBadgeLabel } from "../lib/validationLabels";
 import { useT } from "../lib/i18n";
+import { openExternalUrl } from "../lib/externalUrl";
+import { addToast } from "../stores/toastStore";
 import {
 	useModalA11y,
 	MODAL_BACKDROP_CLASS,
@@ -143,7 +145,12 @@ function FontSection({
 							<div className="text-caption text-text-muted mt-0.5">{s.license}</div>
 							<button
 								type="button"
-								onClick={() => window.open(s.download_url, "_blank", "noopener,noreferrer")}
+								onClick={() => {
+									openExternalUrl(s.download_url).catch((e: unknown) => {
+										const message = e instanceof Error ? e.message : String(e);
+										addToast("error", t("validate.fontDownloadFailed", { error: message }));
+									});
+								}}
 								className="text-caption font-medium text-accent-fg hover:underline mt-1"
 							>
 								{t("validate.fontDownload")}

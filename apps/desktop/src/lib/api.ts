@@ -1013,6 +1013,14 @@ export const updateConfig = (partial: ConfigUpdate): Promise<AppConfig> => {
   return operation;
 };
 
+/** Unfinished jobs on the backend; both runtimes ask the HTTP server. */
+export interface ActiveJobs {
+  translation: string | null;
+  patches: string[];
+}
+
+export const getActiveJobs = (): Promise<ActiveJobs> => request<ActiveJobs>("/jobs/active");
+
 export const getBackups = (): Promise<BackupEntry[]> =>
   IS_TAURI ? tauriInvoke("get_backups") : request("/backups");
 

@@ -102,8 +102,14 @@ export function subscribeToJob(
 
       ws.onmessage = (event) => {
         if (cancelled) return;
+        let data: any;
         try {
-          const data = JSON.parse(event.data);
+          data = JSON.parse(event.data);
+        } catch (err) {
+          console.error("Failed to parse WS message:", err);
+          return;
+        }
+        try {
           switch (data.type) {
             case "started":
               handlers.onStarted?.(data);
@@ -142,7 +148,7 @@ export function subscribeToJob(
               break;
           }
         } catch (err) {
-          console.error("Failed to parse WS message:", err);
+          console.error(`WS handler failed for "${String(data?.type)}" message:`, err);
         }
       };
 

@@ -14,6 +14,7 @@ const h = {
   checks: 0, downloads: 0, relaunches: 0,
   check: null as null | (() => Promise<any>), install: null as null | (() => Promise<void>),
   restart: null as null | (() => Promise<void>), event: null as null | ((event: any) => void),
+  jobs: null as null | (() => Promise<any>), jobQueries: 0,
   state(initial: any) {
     const i = this.cursor++;
     if (!(i in this.states)) this.states[i] = typeof initial === "function" ? initial() : initial;
@@ -33,6 +34,7 @@ const hooks = registerHooks({
         "../lib/runtime": "export const IS_TAURI=true;",
         "../lib/i18n": "export const t=h.t;export const useT=()=>h.t;",
         "../stores/logStore": "export const addLog=(...args)=>h.logs.push(args);",
+        "../lib/api": "export const getActiveJobs=async()=>{h.jobQueries++;return h.jobs?h.jobs():{translation:null,patches:[]};};",
         "@tauri-apps/plugin-updater": "export const check=async()=>{h.checks++;return h.check?h.check():{version:'9.0.0',body:'Release notes',downloadAndInstall:async event=>{h.downloads++;h.event=event;await h.install?.();}};};",
         "@tauri-apps/plugin-process": "export const relaunch=async()=>{h.relaunches++;await h.restart?.();};",
       };
@@ -47,6 +49,7 @@ beforeEach(() => {
   h.states = []; h.cursor = 0; h.effects = []; h.logs = [];
   h.checks = 0; h.downloads = 0; h.relaunches = 0;
   h.check = null; h.install = null; h.restart = null; h.event = null;
+  h.jobs = null; h.jobQueries = 0;
   setLocale("en");
 });
 function render(): any {
@@ -258,4 +261,48 @@ test("every update notice control uses the accent focus ring", async () => {
   h.check = async () => null;
   await requestUpdateCheck();
   assertRings(render());
+});
+
+for (const locale of ["en", "es"] as const) {
+  test(`${locale}: a running translation holds the install until it ends, then retry installs`, async () => {
+    setLocale(locale);
+    const tree = await available();
+    h.jobs = async () => ({ translation: "job-1", patches: [] });
+    await button(tree, t("update.download")).props.onClick();
+    const held = render();
+    const guidance = locale === "es"
+      ? "Hay una traducción o un parche en curso. Termínelo o cancélelo y luego instale la actualización."
+      : "A translation or patch job is running. Finish or cancel it, then install the update.";
+    assert.ok(text(held).includes(guidance));
+    assert.ok(text(held).includes(t("update.waiting" as any)));
+    assert.equal(h.checks, 1, "only the mount check ran; nothing was downloaded");
+    assert.equal(h.downloads, 0);
+    assert.equal(h.relaunches, 0);
+    h.jobs = null;
+    await button(held, t("common.retry")).props.onClick();
+    assert.equal(h.downloads, 1);
+    assert.equal(h.relaunches, 1);
+  });
+}
+
+test("a running patch job holds a restart retry without reinstalling", async () => {
+  h.restart = async () => { throw new Error("restart blocked"); };
+  await button(await available(), t("update.download")).props.onClick();
+  h.restart = null;
+  h.jobs = async () => ({ translation: null, patches: ["patch-1"] });
+  await button(render(), t("update.restart" as any)).props.onClick();
+  assert.ok(text(render()).includes(t("update.jobRunning" as any)));
+  assert.equal(h.relaunches, 1, "the held retry did not relaunch");
+  h.jobs = null;
+  await button(render(), t("update.restart" as any)).props.onClick();
+  assert.equal(h.downloads, 1);
+  assert.equal(h.relaunches, 2);
+});
+
+test("an unreachable backend does not block installing the update", async () => {
+  h.jobs = async () => { throw new Error("backend down"); };
+  await button(await available(), t("update.download")).props.onClick();
+  assert.ok(h.jobQueries >= 1);
+  assert.equal(h.downloads, 1);
+  assert.equal(h.relaunches, 1);
 });
