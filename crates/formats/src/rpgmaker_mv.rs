@@ -1460,8 +1460,17 @@ impl RpgMakerMvPlugin {
         // Both engines consume the entire 401/405 run: Show Text paginates at
         // the window height, and Scrolling Text renders all lines. Keep that
         // behaviour rather than truncating a translation to four commands.
-        let lines = preserve_blank_line_layout(&source_lines.join("\n"), translation, wrap)
-            .unwrap_or_else(|| wrap(translation));
+        // A speaker line stays on its own line above the wrapped dialogue.
+        let source_text = source_lines.join("\n");
+        let (speaker, source_body, body) = match split_speaker_line(&source_text, translation) {
+            Some((speaker, body)) => (Some(speaker), source_lines[1..].join("\n"), body),
+            None => (None, source_text, translation),
+        };
+        let mut lines =
+            preserve_blank_line_layout(&source_body, body, wrap).unwrap_or_else(|| wrap(body));
+        if let Some(speaker) = speaker {
+            lines.insert(0, speaker);
+        }
 
         let template = list[cmd_idx].clone();
         let new_cmds: Vec<serde_json::Value> = lines
@@ -1776,6 +1785,16 @@ pub(crate) fn rewrap_to_source_width(source: &str, translation: &str) -> String 
     if width == 0 {
         return translation.to_string();
     }
+    if let Some((speaker, body)) = split_speaker_line(source, translation) {
+        let source_body = source.split_once('\n').map_or("", |(_, rest)| rest);
+        return format!("{speaker}\n{}", rewrap_lines(source_body, body, width));
+    }
+    rewrap_lines(source, translation, width)
+}
+
+/// Re-wrap `translation` to `width` unless it already fits, keeping the
+/// source's blank-line paragraph layout when both sides have it.
+fn rewrap_lines(source: &str, translation: &str, width: usize) -> String {
     if let Some(lines) = preserve_blank_line_layout(source, translation, |paragraph| {
         if paragraph.lines().all(|l| visible_len(l) <= width) {
             paragraph.split('\n').map(str::to_string).collect()
@@ -1790,6 +1809,77 @@ pub(crate) fn rewrap_to_source_width(source: &str, translation: &str) -> String 
     }
     let flat = translation.split_whitespace().collect::<Vec<_>>().join(" ");
     wrap_message(&flat, width).join("\n")
+}
+
+/// Games without a name-box plugin write the speaker alone on the first
+/// message line ("Karen", then "\"Hello\""). When the translation kept that
+/// line too, return it, with the source's leading capital, and the dialogue
+/// below it, so wrapping never glues the name into the dialogue.
+pub(crate) fn split_speaker_line<'a>(
+    source: &str,
+    translation: &'a str,
+) -> Option<(String, &'a str)> {
+    if !locust_core::message_layout::has_speaker_line(source) {
+        return None;
+    }
+    let (label, body) = translation.split_once('\n')?;
+    if !locust_core::message_layout::is_speaker_label(label) || body.trim().is_empty() {
+        return None;
+    }
+    let source_label = source.split('\n').next().unwrap_or_default();
+    Some((match_leading_case(source_label, label.trim()), body))
+}
+
+/// Machine translators lowercase names they see as fragments ("karen").
+/// Restore an uppercase first visible letter when the source label had one.
+fn match_leading_case(source_label: &str, label: &str) -> String {
+    match (first_visible_char(source_label), first_visible_char(label)) {
+        (Some((_, source_first)), Some((at, first)))
+            if source_first.is_uppercase() && first.is_lowercase() =>
+        {
+            let mut out = String::with_capacity(label.len() + 2);
+            out.push_str(&label[..at]);
+            out.extend(first.to_uppercase());
+            out.push_str(&label[at + first.len_utf8()..]);
+            out
+        }
+        _ => label.to_string(),
+    }
+}
+
+/// Byte offset and value of the first character `visible_len` would count.
+fn first_visible_char(s: &str) -> Option<(usize, char)> {
+    let mut chars = s.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        if c != '\\' {
+            return Some((at, c));
+        }
+        let mut had_letters = false;
+        while chars.peek().is_some_and(|(_, c)| c.is_ascii_alphabetic()) {
+            chars.next();
+            had_letters = true;
+        }
+        if chars.peek().is_some_and(|(_, c)| *c == '[') {
+            for (_, c) in chars.by_ref() {
+                if c == ']' {
+                    break;
+                }
+            }
+        } else if had_letters && chars.peek().is_some_and(|(_, c)| *c == '<') {
+            for (_, c) in chars.by_ref() {
+                if c == '>' {
+                    break;
+                }
+            }
+        } else if !had_letters
+            && chars
+                .peek()
+                .is_some_and(|(_, c)| "{}$.|!><^\\".contains(*c))
+        {
+            chars.next();
+        }
+    }
+    None
 }
 
 /// Empty (including whitespace-only) lines separate nonempty paragraphs; a
@@ -2217,9 +2307,14 @@ impl FormatPlugin for RpgMakerMvPlugin {
                 let mut map = serde_json::Map::new();
                 for entry in entries {
                     if let Some(ref translation) = entry.translation {
+                        // Language files are shown as written, like Iavra packs:
+                        // restore the source's line width and speaker line.
                         map.insert(
                             entry.id.clone(),
-                            serde_json::Value::String(translation.clone()),
+                            serde_json::Value::String(rewrap_to_source_width(
+                                &entry.source,
+                                translation,
+                            )),
                         );
                         strings_written += 1;
                     } else {
@@ -2241,7 +2336,10 @@ impl FormatPlugin for RpgMakerMvPlugin {
                     if let Some(ref translation) = entry.translation {
                         strings_map.insert(
                             entry.source.clone(),
-                            serde_json::Value::String(translation.clone()),
+                            serde_json::Value::String(rewrap_to_source_width(
+                                &entry.source,
+                                translation,
+                            )),
                         );
                         strings_written += 1;
                     } else {
@@ -4319,6 +4417,73 @@ mod tests {
     }
 
     #[test]
+    fn test_rewrap_keeps_speaker_line_and_restores_its_capital() {
+        let src =
+            "Karen\n\"Hello. If there are little trailing edge,\nYou are here to work today.\"";
+        let width = src.lines().map(visible_len).max().unwrap();
+        let body =
+            "\"Hola. Si hay poco borde de salida, estás aquí para trabajar hoy, ¿verdad que sí?\"";
+        let out = rewrap_to_source_width(src, &format!("karen\n{body}"));
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "Karen", "{out:?}");
+        assert!(lines.len() > 2, "dialogue should be re-wrapped: {out:?}");
+        for line in &lines[1..] {
+            assert!(visible_len(line) <= width, "line over budget: {line:?}");
+        }
+        assert_eq!(lines[1..].join(" "), body);
+
+        // A fitting translation keeps its layout; only the name's capital returns.
+        assert_eq!(
+            rewrap_to_source_width("Jenny\n\"Huh, again?\"", "jenny\n\"¿Otra vez?\""),
+            "Jenny\n\"¿Otra vez?\""
+        );
+        assert_eq!(
+            rewrap_to_source_width("\\C[6]Karen\\C[0]\n\"Hi.\"", "\\C[6]karen\\C[0]\n\"Hola.\""),
+            "\\C[6]Karen\\C[0]\n\"Hola.\""
+        );
+        // A lowercase source label keeps the translator's case.
+        assert_eq!(
+            rewrap_to_source_width("girl\n\"Hi.\"", "niña\n\"Hola.\""),
+            "niña\n\"Hola.\""
+        );
+    }
+
+    #[test]
+    fn test_message_block_keeps_speaker_line_apart_from_dialogue() {
+        let line = |text: &str| serde_json::json!({"code": 401, "indent": 0, "parameters": [text]});
+        let lines_of = |list: &[serde_json::Value]| -> Vec<String> {
+            list.iter()
+                .take_while(|c| c["code"] == 401)
+                .map(|c| c["parameters"][0].as_str().unwrap().to_string())
+                .collect()
+        };
+        let end = serde_json::json!({"code": 0, "indent": 0, "parameters": []});
+        let body = "\"Bueno, bien. Vine aquí para quedar embarazada. Otra cuestión es si eres hijo de tu marido.\"";
+        let mut list = vec![
+            line("Man"),
+            line("\"Well, good. I came here to be pregnant."),
+            line("It's another matter whether you're your husband's child.\""),
+            end.clone(),
+        ];
+        RpgMakerMvPlugin::apply_message_block(&mut list, 0, &format!("hombre\n{body}"));
+        let lines = lines_of(&list);
+        assert_eq!(lines[0], "Hombre", "{lines:?}");
+        assert!(lines.len() > 2, "{lines:?}");
+        assert_eq!(lines[1..].join(" "), body);
+        assert_eq!(list.last(), Some(&end));
+
+        // Without a speaker line the whole box still flows as one paragraph.
+        let mut list = vec![line("Hello there,"), line("my friend."), end.clone()];
+        RpgMakerMvPlugin::apply_message_block(&mut list, 0, "Hola\nallí, amigo mío.");
+        assert_eq!(lines_of(&list), vec!["Hola allí, amigo mío."]);
+
+        // A translator that merged the name into the dialogue is wrapped as before.
+        let mut list = vec![line("Karen"), line("\"Hi.\""), end];
+        RpgMakerMvPlugin::apply_message_block(&mut list, 0, "Karen: \"Hola, ¿cómo estás?\"");
+        assert_eq!(lines_of(&list), vec!["Karen: \"Hola, ¿cómo estás?\""]);
+    }
+
+    #[test]
     fn test_replace_inject_rewraps_multiline_description() {
         // Replace mode writes database fields verbatim, so a flat provider
         // reply used to ship a single overlong line into a wrapped field.
@@ -4620,6 +4785,55 @@ mod tests {
         let content = fs::read_to_string(&lang_file).unwrap();
         let json: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert!(!json.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn inject_add_language_files_rewrap_messages_to_source_width() {
+        let source =
+            "Karen\n\"The old man who lived next to the river\nwas very kind to everyone.\"";
+        let width = source.lines().map(visible_len).max().unwrap();
+        let translation = "karen\n\"El anciano que vivía al lado del río era muy amable con todos y siempre nos ayudaba.\"";
+        let plugin = RpgMakerMvPlugin::new();
+        for mv in [false, true] {
+            let game_dir_guard = temp_game_dir();
+            let game_dir = game_dir_guard.path().to_path_buf();
+            if mv {
+                fs::create_dir_all(game_dir.join("js")).unwrap();
+                fs::write(game_dir.join("js").join("rpg_core.js"), "").unwrap();
+            }
+            let mut entry = StringEntry::new(
+                "Map001.json#0#event_1#page_0#cmd_3#msg",
+                source,
+                game_dir.join("data").join("Map001.json"),
+            );
+            entry.translation = Some(translation.into());
+            plugin
+                .inject_add(&game_dir, "es", std::slice::from_ref(&entry))
+                .unwrap();
+            let (lang_file, key) = if mv {
+                let file = game_dir
+                    .join("www")
+                    .join("data")
+                    .join("i18n")
+                    .join("es.json");
+                (
+                    file,
+                    format!("/strings/{}", source.replace('~', "~0").replace('/', "~1")),
+                )
+            } else {
+                let file = game_dir.join("data").join("Languages").join("es.json");
+                (file, format!("/{}", entry.id))
+            };
+            let json: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&lang_file).unwrap()).unwrap();
+            let value = json.pointer(&key).and_then(|v| v.as_str()).unwrap();
+            let lines: Vec<&str> = value.lines().collect();
+            assert_eq!(lines[0], "Karen", "mv={mv}: {value:?}");
+            assert!(lines.len() > 2, "mv={mv}: {value:?}");
+            for line in &lines[1..] {
+                assert!(visible_len(line) <= width, "mv={mv}: {line:?}");
+            }
+        }
     }
 
     #[test]

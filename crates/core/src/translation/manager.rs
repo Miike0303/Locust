@@ -1307,6 +1307,7 @@ impl TranslationManager {
                     std::collections::HashMap::new();
                 let mut budgets_by_id: std::collections::HashMap<String, SlotBudget> =
                     std::collections::HashMap::new();
+                let source_only_mt = !self.provider.supports_instructions();
                 let mut requests: Vec<TranslationRequest> = chunk
                     .iter()
                     .map(|entry| {
@@ -1363,6 +1364,15 @@ impl TranslationManager {
                         } else {
                             SpeakerArgumentTrace::default()
                         };
+                        // Source-only MT translates each line as its own sentence.
+                        // MV/MZ message boxes are re-wrapped on injection, so send
+                        // their soft wraps joined; offsets above stay valid.
+                        if source_only_mt
+                            && entry.id.ends_with("#msg")
+                            && has_mv_mz_provenance(entry)
+                        {
+                            sanitized = crate::message_layout::join_soft_wraps(&sanitized);
+                        }
                         if has_mv_mz_provenance(entry) && !nameboxes.is_empty() {
                             let positions = nameboxes
                                 .iter()

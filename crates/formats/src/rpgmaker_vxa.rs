@@ -1596,23 +1596,34 @@ impl RpgMakerVxaPlugin {
             return;
         }
 
-        let mut max_width = cmd_first_str(&list[cmd_idx])
-            .map(|t| crate::rpgmaker_mv::visible_len(&t))
-            .unwrap_or(0);
+        let mut source_lines = vec![cmd_first_str(&list[cmd_idx]).unwrap_or_default()];
         let mut end = cmd_idx + 1;
         while let Some(next) = list.get(end) {
             if cmd_code(next) != Some(401) {
                 break;
             }
-            if let Some(t) = cmd_first_str(next) {
-                max_width = max_width.max(crate::rpgmaker_mv::visible_len(&t));
-            }
+            source_lines.push(cmd_first_str(next).unwrap_or_default());
             end += 1;
         }
+        let max_width = source_lines
+            .iter()
+            .map(|t| crate::rpgmaker_mv::visible_len(t))
+            .max()
+            .unwrap_or(0);
 
         let width = max_width.max(40);
-        let flat = translation.split_whitespace().collect::<Vec<_>>().join(" ");
-        let mut lines = crate::rpgmaker_mv::wrap_message(&flat, width).into_iter();
+        // A speaker line stays on its own line above the wrapped dialogue.
+        let (speaker, body) =
+            match crate::rpgmaker_mv::split_speaker_line(&source_lines.join("\n"), translation) {
+                Some((speaker, body)) => (Some(speaker), body),
+                None => (None, translation),
+            };
+        let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut lines = speaker
+            .into_iter()
+            .chain(crate::rpgmaker_mv::wrap_message(&flat, width))
+            .collect::<Vec<_>>()
+            .into_iter();
 
         // First line goes into the anchor command itself
         let first = lines.next().unwrap_or_default();
@@ -2497,6 +2508,52 @@ mod tests {
         assert!(!partial.complete);
         assert_eq!(partial.warnings.len(), 1);
         assert!(partial.warnings[0].contains("Map999.rvdata2"));
+    }
+
+    #[test]
+    fn message_block_keeps_speaker_line_apart_from_dialogue() {
+        let line = |text: &str| make_cmd(401, vec![MarshalValue::Str(text.into())]);
+        let lines_of = |list: &[MarshalValue]| -> Vec<String> {
+            list.iter()
+                .take_while(|c| cmd_code(c) == Some(401))
+                .filter_map(cmd_first_str)
+                .collect()
+        };
+        let body = "\"Bueno, bien. Vine aquí para quedar embarazada. Otra cuestión es si eres hijo de tu marido.\"";
+        let mut list = vec![
+            line("Man"),
+            line("\"Well, good. I came here to be pregnant."),
+            line("It's another matter whether you're your husband's child.\""),
+            make_cmd(0, vec![]),
+        ];
+        let mut next_object_id = 100;
+        RpgMakerVxaPlugin::apply_message_block(
+            &mut list,
+            0,
+            &format!("hombre\n{body}"),
+            Message101Role::FaceHeader,
+            &mut next_object_id,
+        );
+        let lines = lines_of(&list);
+        assert_eq!(lines[0], "Hombre", "{lines:?}");
+        assert!(lines.len() > 2, "{lines:?}");
+        assert_eq!(lines[1..].join(" "), body);
+        assert_eq!(cmd_code(list.last().unwrap()), Some(0));
+
+        // Without a speaker line the whole box still flows as one paragraph.
+        let mut list = vec![
+            line("Hello there,"),
+            line("my friend."),
+            make_cmd(0, vec![]),
+        ];
+        RpgMakerVxaPlugin::apply_message_block(
+            &mut list,
+            0,
+            "Hola\nallí, amigo mío.",
+            Message101Role::FaceHeader,
+            &mut next_object_id,
+        );
+        assert_eq!(lines_of(&list), vec!["Hola allí, amigo mío."]);
     }
 
     fn make_cmd(code: i64, params: Vec<MarshalValue>) -> MarshalValue {

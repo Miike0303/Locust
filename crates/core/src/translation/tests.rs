@@ -5748,3 +5748,116 @@ async fn translation_completed_counts_only_pending_inside_selected_entries() {
         .translation
         .is_none());
 }
+
+/// Records every request source a provider receives under the chosen id.
+struct SourceCapture {
+    id: &'static str,
+    sources: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl TranslationProvider for SourceCapture {
+    fn id(&self) -> &str {
+        self.id
+    }
+    fn name(&self) -> &str {
+        "Source Capture"
+    }
+    fn is_free(&self) -> bool {
+        true
+    }
+    fn requires_api_key(&self) -> bool {
+        false
+    }
+    async fn translate(&self, requests: &[TranslationRequest]) -> Result<Vec<TranslationResult>> {
+        self.sources
+            .lock()
+            .unwrap()
+            .extend(requests.iter().map(|r| r.source.clone()));
+        Ok(requests
+            .iter()
+            .map(|r| TranslationResult {
+                entry_id: r.entry_id.clone(),
+                translation: format!("T:{}", r.source),
+                detected_source_lang: None,
+                provider: self.id.to_string(),
+                tokens_used: None,
+                input_tokens: None,
+                output_tokens: None,
+                cost_usd: None,
+            })
+            .collect())
+    }
+    async fn estimate_cost(&self, _: usize, _: &str) -> Option<f64> {
+        None
+    }
+    async fn health_check(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+async fn captured_sources(provider_id: &'static str, entry: StringEntry) -> Vec<String> {
+    let (db, glossary) = setup();
+    db.save_entries(std::slice::from_ref(&entry)).unwrap();
+    let provider = Arc::new(SourceCapture {
+        id: provider_id,
+        sources: Mutex::new(Vec::new()),
+    });
+    let manager = TranslationManager::new(provider.clone(), db, glossary);
+    let (tx, mut rx) = mpsc::channel(100);
+    manager
+        .translate_entries(
+            vec![entry],
+            scoped_options(),
+            tx,
+            "line-joins".into(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    rx.close();
+    while rx.recv().await.is_some() {}
+    let sources = provider.sources.lock().unwrap().clone();
+    sources
+}
+
+#[tokio::test]
+async fn source_only_mt_receives_mv_message_soft_wraps_joined() {
+    let source = "Karen\n\"I will wait for you\nat the station tonight.\"";
+    let message = StringEntry::new(
+        "Map001.json#0#event_1#page_0#cmd_3#msg",
+        source,
+        PathBuf::from("Map001.json"),
+    )
+    .with_format_id("rpgmaker-mv");
+    assert_eq!(
+        captured_sources("google", message.clone()).await,
+        vec!["Karen\n\"I will wait for you at the station tonight.\"".to_string()]
+    );
+    // Instruction-following providers keep the author's lines.
+    assert_eq!(
+        captured_sources("ctx", message).await,
+        vec![source.to_string()]
+    );
+    // Other formats, and MV fields that are not message boxes, keep their breaks.
+    let credits = StringEntry::new(
+        "Game.locres#credits",
+        "Lead programmer\nJohn Smith",
+        PathBuf::from("Game.locres"),
+    )
+    .with_format_id("unreal");
+    assert_eq!(
+        captured_sources("google", credits).await,
+        vec!["Lead programmer\nJohn Smith".to_string()]
+    );
+    let description = StringEntry::new(
+        "Items.json#3#description",
+        "A sword forged\nin dragon fire",
+        PathBuf::from("Items.json"),
+    )
+    .with_format_id("rpgmaker-mv");
+    assert_eq!(
+        captured_sources("google", description).await,
+        vec!["A sword forged\nin dragon fire".to_string()]
+    );
+}

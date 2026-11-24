@@ -1,5 +1,9 @@
 # Current task index
 
+## Google MT line joins and speaker lines (2026-11-24)
+
+Owner **"quiero mejorar el traductor, porque el otro dia hice uno, con google automatico, pero salio muy mal, como que se cortaba, no se enviaba toda la cadena"**, then **"si, hazlo"**. Small task on branch `fix/mt-message-line-joins` (no separate ledger). Diagnosis on the owner's MV project (1009 Google rows): DB translations were not truncated. A live probe showed Google translates every `\n` line as its own sentence, and injection glued the speaker-name line into the dialogue (404 of 708 boxes). Fix: source-only MT (google/deepl/argos) receives MV/MZ `#msg` soft wraps joined (`locust_core::message_layout`); MV/MZ, VX Ace and YU-RIS keep a speaker line on its own line and restore its leading capital; MV/MZ non-Iavra Add language files now re-wrap like Iavra packs (independent verifier finding). Evidence: real-game differential of 25 files, 0 unexpected diffs; live Google re-translation of 4 wrapped messages; local gates are recorded in the commit report. Not verified: in-game rendering, DeepL/Argos live behavior. The owner's project still needs re-translation and re-injection to benefit.
+
 ## Next session: UI/UX fixes (queued 2026-11-09)
 
 Owner **"todo eso guardalo para la siguiente sesion"**: 36 findings from the Fable 5.2 UI/UX check are owned by [UI/UX check 2026-11-09](tasks/ui-ux-fable-2026-11-09.md); nothing is fixed yet. Start with S1 (tabbing through a saved API key field deletes the key). Open release and backend follow-ups stay in [cycle 2026-11-01](tasks/cycle-2026-11-01.md).

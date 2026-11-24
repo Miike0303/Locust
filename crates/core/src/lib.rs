@@ -13,6 +13,7 @@ pub mod fuzzy;
 pub mod glossary;
 pub mod injection_transaction;
 pub mod language_code;
+pub mod message_layout;
 pub mod model_policy;
 pub mod models;
 pub mod patch;
