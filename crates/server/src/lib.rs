@@ -248,6 +248,19 @@ where
     .await
 }
 
+/// Run synchronous extraction, filesystem or SQLite work on tokio's blocking
+/// pool, so it cannot stall the runtime threads that serve other requests (or,
+/// in the desktop app, its other async commands). A panic becomes an error.
+pub async fn run_blocking<T, F>(work: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| format!("background task failed: {e}"))
+}
+
 /// Maximum retained frames, including initial/latest state and the terminal.
 /// Older informational history yields to these snapshots; see JOB-RETENTION.md.
 const JOB_REPLAY_LIMIT: usize = 256;
@@ -1095,6 +1108,22 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&game_a);
         let _ = std::fs::remove_dir_all(&game_b);
+    }
+
+    #[tokio::test]
+    async fn run_blocking_runs_off_the_runtime_thread_and_reports_panics() {
+        // `#[tokio::test]` is a current-thread runtime: blocking work run inline
+        // would occupy the only thread that serves every other task.
+        let runtime_thread = std::thread::current().id();
+        let (worker_thread, value) = run_blocking(|| (std::thread::current().id(), 42))
+            .await
+            .unwrap();
+        assert_ne!(worker_thread, runtime_thread);
+        assert_eq!(value, 42);
+        let error = run_blocking(|| -> u8 { panic!("extraction blew up") })
+            .await
+            .unwrap_err();
+        assert!(error.starts_with("background task failed"), "{error}");
     }
 
     #[tokio::test]

@@ -9,9 +9,19 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::{
-    err, remember_open_project, run_owned_project_operation, try_project_operation, ApiError,
-    AppState, ProjectInfo,
+    err, remember_open_project, run_blocking, run_owned_project_operation, try_project_operation,
+    ApiError, AppState, ProjectInfo,
 };
+
+/// Project open/preflight extract or scan the whole game: keep that off the
+/// async runtime. A failed background task is a 500 like other internal faults.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, ApiError> {
+    run_blocking(work)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
 
 #[derive(Deserialize)]
 pub(crate) struct OpenProjectRequest {
@@ -101,11 +111,14 @@ pub(crate) async fn project_preflight(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ProjectPreflightRequest>,
 ) -> Result<Json<project::ProjectOpenPreflight>, ApiError> {
-    project::preflight_project_open(
-        &state.format_registry,
-        Path::new(&req.game_path),
-        req.format.as_deref(),
-    )
+    blocking(move || {
+        project::preflight_project_open(
+            &state.format_registry,
+            Path::new(&req.game_path),
+            req.format.as_deref(),
+        )
+    })
+    .await?
     .map(Json)
     .map_err(map_open_err)
 }
@@ -116,13 +129,17 @@ pub(crate) async fn project_resume(
 ) -> Result<Json<ProjectOpenResponse>, ApiError> {
     let guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
     run_owned_project_operation(guard, async move {
-        let outcome = project::open_verified_saved_project(
-            &state.db,
-            &state.format_registry,
-            Path::new(&req.database_path),
-            Path::new(&req.game_path),
-            &req.format_id,
-        )
+        let open_state = state.clone();
+        let outcome = blocking(move || {
+            project::open_verified_saved_project(
+                &open_state.db,
+                &open_state.format_registry,
+                Path::new(&req.database_path),
+                Path::new(&req.game_path),
+                &req.format_id,
+            )
+        })
+        .await?
         .map_err(map_open_err)?;
         finish_project_open(&state, outcome).await
     })
@@ -144,22 +161,26 @@ async fn project_open_owned(
     state: Arc<AppState>,
     req: OpenProjectRequest,
 ) -> Result<Json<ProjectOpenResponse>, ApiError> {
-    let raw_path = PathBuf::from(&req.path);
-    let outcome = if req.prefer_saved {
-        project::open_recent_project(
-            &state.db,
-            &state.format_registry,
-            &raw_path,
-            req.format_id.as_deref(),
-        )
-    } else {
-        project::open_project(
-            &state.db,
-            &state.format_registry,
-            &raw_path,
-            req.format_id.as_deref(),
-        )
-    }
+    let open_state = state.clone();
+    let outcome = blocking(move || {
+        let raw_path = PathBuf::from(&req.path);
+        if req.prefer_saved {
+            project::open_recent_project(
+                &open_state.db,
+                &open_state.format_registry,
+                &raw_path,
+                req.format_id.as_deref(),
+            )
+        } else {
+            project::open_project(
+                &open_state.db,
+                &open_state.format_registry,
+                &raw_path,
+                req.format_id.as_deref(),
+            )
+        }
+    })
+    .await?
     .map_err(map_open_err)?;
 
     finish_project_open(&state, outcome).await
@@ -227,13 +248,17 @@ async fn project_open_db_owned(
     state: Arc<AppState>,
     req: OpenProjectDbRequest,
 ) -> Result<Json<ProjectOpenResponse>, ApiError> {
-    let outcome = project::open_project_db(
-        &state.db,
-        &state.format_registry,
-        Path::new(&req.database_path),
-        Path::new(&req.game_path),
-        &req.format_id,
-    )
+    let open_state = state.clone();
+    let outcome = blocking(move || {
+        project::open_project_db(
+            &open_state.db,
+            &open_state.format_registry,
+            Path::new(&req.database_path),
+            Path::new(&req.game_path),
+            &req.format_id,
+        )
+    })
+    .await?
     .map_err(map_open_db_err)?;
 
     finish_project_open(&state, outcome).await

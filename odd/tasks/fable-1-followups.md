@@ -9,7 +9,7 @@ Source text, verbatim from the cycle ledger: "Follow-ups from FABLE-1 (open, ran
 
 - S1 (item 1): the release ships only installers the updater manifest can update. Decision (reversible, standing grant): trim bundle targets to MSI, app/dmg and AppImage instead of adding unverified installer-specific manifest keys.
 - S2 (item 2): the desktop app's backend trusts only the desktop webview origins (plus the Vite dev origin in debug builds). `locust server` keeps loopback-origin trust for browser mode; RELEASE-SECURITY documents both.
-- S3 (item 3): `preflight_project_open` and `get_backups` stop running on the Tauri main thread; project open/resume/preflight, catalog import/export and string listing handlers move blocking work off the async runtime.
+- S3 (item 3): `preflight_project_open` and `get_backups` stop running on the Tauri main thread; project open/resume/open-db/preflight (HTTP and desktop) run extraction on the blocking pool. Narrowed 2026-11-24 (L4): catalog import/export and string listing stay inline.
 - S4 (item 4): a second desktop launch focuses the running window instead of starting a second process.
 - S5 (item 5): HTTP import endpoints accept bodies up to a documented limit above 2 MiB.
 - S6 (item 6): a refreshed xAI token pair survives a failed token-file write for the rest of the process, and the failure is reported.
@@ -20,11 +20,11 @@ Source text, verbatim from the cycle ledger: "Follow-ups from FABLE-1 (open, ran
 
 ## Tasks
 
-- T1 | S10 | inline | pending |
-- T2 | S8 | inline | pending |
-- T3 | S5 | inline | pending |
-- T4 | S6 | inline | pending |
-- T5 | S3 | inline | pending |
+- T1 | S10 | inline | done | 71a8530. Mv branch writes `data_dir.join("i18n")`. RED 1 (inject_add_root_layout_mv_writes_next_to_root_data) -> GREEN; 2 pinned tests updated (an empty www/data no longer wins over the root data/); rpgmaker_mv 88/0.
+- T2 | S8 | inline | done | e598ab4. `GET /api/jobs/active` (`ActiveJobs { translation, patches }`); UpdateChecker holds install and restart while a job runs (`update.jobRunning`, title `update.waiting`), unreachable backend does not block; `lib/externalUrl.ts` shared by GrokSubCard and the font download link (error toast `validate.fontDownloadFailed`); ws.ts parse vs handler errors. RED: updater 4/25, ws 1/12; GREEN server 2/0, FE 1835/0 + externalUrl 2/0, build OK.
+- T3 | S5 | inline | done | 4104fa6. `IMPORT_BODY_LIMIT` 64 MiB on the five import routes; other routes keep 2 MB (test asserts both sides). RED: 3 MiB preview aborted -> GREEN. Documented in docs/ARCHITECTURE.md.
+- T4 | S6 | inline | done | 038c797. Failed write keeps the pair in `UNSAVED_TOKENS` (warn log); `delegate` reads `current_tokens()` (later expiry wins over the file); next successful write clears it. RED 1 (rotated_tokens_survive_a_failed_token_file_write_for_this_process) -> GREEN; xai_oauth 21/0, clippy clean.
+- T5 | S3 | inline | done | `run_blocking` in locust-server (spawn_blocking, panic -> error) used by 4 HTTP project handlers and 3 desktop paths; both Tauri commands async. Test run_blocking_runs_off_the_runtime_thread_and_reports_panics; call sites have no behavioural test (risk item 6, for V1). Server+desktop 407/0/7, clippy clean.
 - T6 | S4 | inline | pending |
 - T7 | S2 | inline | pending |
 - T8 | S1 | inline | pending |
@@ -39,3 +39,4 @@ Route evidence: all tasks inline (no parallel writers: parallel cargo builds fro
 - L1 (2026-11-24, owner): "haz los pendientess" (after the report that listed the release follow-ups in `odd/tasks/cycle-2026-11-01.md` as the queue).
 - L2 (2026-11-24): explorer confirmed all ten items still present on 24ecf1e. Key sites: tauri.conf.json:29-30, generate-updater-manifest.py:16-22, release-gate.py:96; server lib.rs:559-597 origin_allowed; commands.rs:69-81, :974-980; routes/project.rs:100-165, io.rs:292-440, strings.rs:31-250; Cargo.toml (no single-instance); io.rs import handlers take String/Json under axum 0.7's 2 MB default; xai_oauth.rs:485-492; ci.yml no top-level permissions, actions on tags; UpdateChecker.tsx:88-118, ValidationResultsModal.tsx:146, ws.ts:105-146; generate-updater-manifest.py:53-70 shape/key-id only; rpgmaker_mv.rs:2329-2332 hard-codes www/data/i18n.
 - L3 (2026-11-24): decisions taken under the standing grant for reversible decisions: S1 trim targets (no manifest keys for installers whose updater support was not verified); S2 narrow origins for the desktop app only, keep browser-mode loopback trust documented.
+- L4 (2026-11-24): S3 narrowed. Catalog import/preview/apply and exports parse and hash bounded request bodies inside the plan-token flow; moving them risks the stale-plan guarantees for a smaller gain than the extraction paths. String listing is paged. Recorded as not changed.

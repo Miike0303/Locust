@@ -11,7 +11,7 @@ use locust_core::project;
 use locust_core::translation::TranslationOptionsRequest;
 use locust_core::validation::Validator;
 use locust_server::{
-    cancel_translation_job, poll_xai_device_login, remember_open_project,
+    cancel_translation_job, poll_xai_device_login, remember_open_project, run_blocking,
     run_owned_project_operation, spawn_translation_job, start_xai_device_login,
     try_project_operation, update_app_config, AppState, ProjectInfo, XaiAuthPollResponse,
     XaiAuthStartResponse, INJECT_EMPTY_LANGUAGES_MESSAGE,
@@ -66,17 +66,19 @@ pub struct ProjectOpenResponse {
 }
 
 /// Advisory verification only; confirmation revalidates under the source lock.
+/// Async + blocking pool: a synchronous command would scan the game folder on
+/// the main thread and freeze the window.
 #[tauri::command]
-pub fn preflight_project_open(
+pub async fn preflight_project_open(
     game_path: String,
     format: Option<String>,
     state: State<'_, AppStateWrapper>,
 ) -> Result<project::ProjectOpenPreflight, String> {
-    project::preflight_project_open(
-        &state.0.format_registry,
-        Path::new(&game_path),
-        format.as_deref(),
-    )
+    let registry = state.0.format_registry.clone();
+    run_blocking(move || {
+        project::preflight_project_open(&registry, Path::new(&game_path), format.as_deref())
+    })
+    .await?
     .map_err(|e| e.to_string())
 }
 
@@ -109,12 +111,17 @@ async fn apply_open_project(
     let s = s.clone();
     let exclusive = try_project_operation(&s)?;
     run_owned_project_operation(exclusive, async move {
-        let raw_path = PathBuf::from(&path);
-        let outcome = if prefer_saved {
-            project::open_recent_project(&s.db, &s.format_registry, &raw_path, format_id.as_deref())
-        } else {
-            project::open_project(&s.db, &s.format_registry, &raw_path, format_id.as_deref())
-        }
+        let open_state = s.clone();
+        let outcome = run_blocking(move || {
+            let raw_path = PathBuf::from(&path);
+            let (db, registry) = (&open_state.db, &open_state.format_registry);
+            if prefer_saved {
+                project::open_recent_project(db, registry, &raw_path, format_id.as_deref())
+            } else {
+                project::open_project(db, registry, &raw_path, format_id.as_deref())
+            }
+        })
+        .await?
         .map_err(|e| e.to_string())?;
 
         let persistence_warning = remember_open_project(&s, &outcome, true).await;
@@ -176,13 +183,17 @@ async fn apply_saved_project(
         } else {
             project::open_project_db
         };
-        let outcome = open(
-            &s.db,
-            &s.format_registry,
-            Path::new(&database_path),
-            Path::new(&game_path),
-            &format_id,
-        )
+        let open_state = s.clone();
+        let outcome = run_blocking(move || {
+            open(
+                &open_state.db,
+                &open_state.format_registry,
+                Path::new(&database_path),
+                Path::new(&game_path),
+                &format_id,
+            )
+        })
+        .await?
         .map_err(|e| e.to_string())?;
 
         let persistence_warning = remember_open_project(&s, &outcome, true).await;
@@ -971,12 +982,14 @@ pub async fn save_config(
 
 // ─── Backups & Glossary ─────────────────────────────────────────────────────
 
+/// Reads every backup manifest from disk: async + blocking pool, not the main thread.
 #[tauri::command]
-pub fn get_backups(
-    state: State<AppStateWrapper>,
+pub async fn get_backups(
+    state: State<'_, AppStateWrapper>,
     report: Option<bool>,
 ) -> Result<serde_json::Value, String> {
-    backup_response(&state.0.backup_manager, report.unwrap_or(false))
+    let manager = state.0.backup_manager.clone();
+    run_blocking(move || backup_response(&manager, report.unwrap_or(false))).await?
 }
 
 fn backup_response(
