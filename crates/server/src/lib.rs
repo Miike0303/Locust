@@ -599,11 +599,34 @@ fn create_test_state_inner(db: Arc<Database>) -> Arc<AppState> {
 // hides responses, so "simple" requests (for example text/plain import) would
 // still run. Refuse the request itself.
 
-fn origin_allowed(origin: &str) -> bool {
-    matches!(
-        origin,
-        "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost"
-    ) || loopback_http_origin(origin)
+/// Which browser origins may call the API (requests without `Origin` are
+/// non-browser clients and are judged by the Host check alone).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OriginPolicy {
+    /// `locust server`: the desktop webview origins plus any loopback HTTP
+    /// origin with an explicit port, so a browser UI served from this machine
+    /// works. Another local web app is trusted too (see RELEASE-SECURITY).
+    Loopback,
+    /// Desktop app: only its own webview origins; `dev_server` also admits the
+    /// Vite dev server (`tauri dev`, port 1420) in debug builds.
+    DesktopWebview { dev_server: bool },
+}
+
+impl OriginPolicy {
+    pub fn allows(self, origin: &str) -> bool {
+        let webview = matches!(
+            origin,
+            "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost"
+        );
+        match self {
+            OriginPolicy::Loopback => webview || loopback_http_origin(origin),
+            OriginPolicy::DesktopWebview { dev_server } => {
+                webview
+                    || (dev_server
+                        && matches!(origin, "http://localhost:1420" | "http://127.0.0.1:1420"))
+            }
+        }
+    }
 }
 
 fn loopback_http_origin(origin: &str) -> bool {
@@ -688,27 +711,31 @@ fn is_tcp_port(port: &str) -> bool {
         && port.parse::<u16>().is_ok()
 }
 
-fn local_cors() -> CorsLayer {
+fn local_cors(policy: OriginPolicy) -> CorsLayer {
     // Same origin predicate as the guard. Methods are unrestricted; headers
     // include content-type (PO/XLIFF import is text/plain, JSON is application/json).
     // The desktop client reads response bodies only (`res.text()`), never
     // response headers, so nothing is exposed beyond the CORS-safelisted set.
     CorsLayer::new()
-        .allow_origin(AllowOrigin::predicate(|origin, _| {
-            origin.to_str().is_ok_and(origin_allowed)
+        .allow_origin(AllowOrigin::predicate(move |origin, _| {
+            origin.to_str().is_ok_and(|origin| policy.allows(origin))
         }))
         .allow_methods(Any)
         .allow_headers(Any)
 }
 
-async fn guard_local_client(request: axum::extract::Request, next: Next) -> Response {
+async fn guard_local_client(
+    policy: OriginPolicy,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
     if let Some(host) = request.headers().get(axum::http::header::HOST) {
         if !host.to_str().is_ok_and(host_allowed) {
             return StatusCode::FORBIDDEN.into_response();
         }
     }
     if let Some(origin) = request.headers().get(axum::http::header::ORIGIN) {
-        if !origin.to_str().is_ok_and(origin_allowed) {
+        if !origin.to_str().is_ok_and(|origin| policy.allows(origin)) {
             return StatusCode::FORBIDDEN.into_response();
         }
     }
@@ -725,7 +752,12 @@ fn import_body_limit() -> axum::extract::DefaultBodyLimit {
     axum::extract::DefaultBodyLimit::max(IMPORT_BODY_LIMIT)
 }
 
+/// Router for `locust server` and tests: loopback origin policy.
 pub fn create_router(state: Arc<AppState>) -> Router {
+    create_router_with_origins(state, OriginPolicy::Loopback)
+}
+
+pub fn create_router_with_origins(state: Arc<AppState>, origins: OriginPolicy) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/api/formats", get(list_formats))
@@ -813,8 +845,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // CORS is inner so allowed preflights are answered here. The guard is
         // the last layer, so axum runs it first and refuses foreign Origin/Host
         // before a handler (or this CORS layer) can run.
-        .layer(local_cors())
-        .layer(middleware::from_fn(guard_local_client))
+        .layer(local_cors(origins))
+        .layer(middleware::from_fn(move |request, next| {
+            guard_local_client(origins, request, next)
+        }))
         .with_state(state)
 }
 
@@ -840,7 +874,17 @@ pub async fn start_server_with_listener(
     state: Arc<AppState>,
     listener: tokio::net::TcpListener,
 ) -> anyhow::Result<()> {
-    let app = create_router(state);
+    start_server_with_listener_and_origins(state, listener, OriginPolicy::Loopback).await
+}
+
+/// Serve an already-bound listener under an explicit origin policy (the
+/// desktop app admits only its webview).
+pub async fn start_server_with_listener_and_origins(
+    state: Arc<AppState>,
+    listener: tokio::net::TcpListener,
+    origins: OriginPolicy,
+) -> anyhow::Result<()> {
+    let app = create_router_with_origins(state, origins);
     tracing::info!("Server listening on {}", listener.local_addr()?);
     axum::serve(listener, app).await?;
     Ok(())
@@ -1236,6 +1280,90 @@ mod tests {
     }
 
     #[test]
+    fn desktop_origin_policy_trusts_only_the_webview_and_the_dev_server() {
+        let webview = [
+            "tauri://localhost",
+            "http://tauri.localhost",
+            "https://tauri.localhost",
+        ];
+        let dev = ["http://localhost:1420", "http://127.0.0.1:1420"];
+        let other_local_apps = [
+            "http://localhost:3000",
+            "http://127.0.0.1:7842",
+            "http://[::1]:1420",
+            "http://localhost:14200",
+        ];
+        let release = OriginPolicy::DesktopWebview { dev_server: false };
+        let debug = OriginPolicy::DesktopWebview { dev_server: true };
+        for origin in webview {
+            assert!(release.allows(origin), "{origin}");
+            assert!(debug.allows(origin), "{origin}");
+            assert!(OriginPolicy::Loopback.allows(origin), "{origin}");
+        }
+        for origin in dev {
+            assert!(!release.allows(origin), "{origin}");
+            assert!(debug.allows(origin), "{origin}");
+        }
+        for origin in other_local_apps {
+            assert!(!release.allows(origin), "{origin}");
+            assert!(!debug.allows(origin), "{origin}");
+            // `locust server` keeps serving a browser UI from any local port.
+            assert!(OriginPolicy::Loopback.allows(origin), "{origin}");
+        }
+        for origin in ["https://example.com", "null", "http://localhost"] {
+            assert!(!release.allows(origin), "{origin}");
+            assert!(!OriginPolicy::Loopback.allows(origin), "{origin}");
+        }
+    }
+
+    #[tokio::test]
+    async fn desktop_router_refuses_other_local_origins_before_any_handler() {
+        let state = create_test_state();
+        let app = create_router_with_origins(
+            state.clone(),
+            OriginPolicy::DesktopWebview { dev_server: false },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let patch = |origin: &'static str| {
+            client
+                .patch(format!("{url}/api/config"))
+                .header("origin", origin)
+                .json(&serde_json::json!({ "providers": { "openai": { "base_url": "http://127.0.0.1:9/v1" } } }))
+                .send()
+        };
+        let refused = patch("http://localhost:3000").await.unwrap();
+        assert_eq!(refused.status(), reqwest::StatusCode::FORBIDDEN);
+        let config = state.config.read().await;
+        assert_ne!(
+            config
+                .providers
+                .get("openai")
+                .and_then(|p| p.base_url.as_deref()),
+            Some("http://127.0.0.1:9/v1"),
+            "a refused origin must not reach the config handler"
+        );
+        drop(config);
+        let health = client
+            .get(format!("{url}/api/jobs/active"))
+            .header("origin", "http://tauri.localhost")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            health
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("http://tauri.localhost")
+        );
+        server.abort();
+    }
+
+    #[test]
     fn origin_and_host_allow_lists() {
         for origin in [
             "tauri://localhost",
@@ -1248,7 +1376,7 @@ mod tests {
             "http://[::1]:1420",
             "http://[::1]:80",
         ] {
-            assert!(origin_allowed(origin), "{origin}");
+            assert!(OriginPolicy::Loopback.allows(origin), "{origin}");
         }
         for origin in [
             "https://evil.example",
@@ -1265,7 +1393,7 @@ mod tests {
             "http://localhost",
             "tauri://evil.example",
         ] {
-            assert!(!origin_allowed(origin), "{origin}");
+            assert!(!OriginPolicy::Loopback.allows(origin), "{origin}");
         }
 
         for host in [

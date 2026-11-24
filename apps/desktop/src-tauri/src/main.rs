@@ -109,7 +109,15 @@ fn start_backend_with_state(
                 // this signal. Drop the idle serve future, then the runtime,
                 // releasing the listener and state before joining the thread.
                 tokio::select! {
-                    result = locust_server::start_server_with_listener(state_for_server, listener) => {
+                    // Only the webview (and `tauri dev`'s Vite server in debug
+                    // builds) may call this backend; other local web apps may not.
+                    result = locust_server::start_server_with_listener_and_origins(
+                        state_for_server,
+                        listener,
+                        locust_server::OriginPolicy::DesktopWebview {
+                            dev_server: cfg!(debug_assertions),
+                        },
+                    ) => {
                         if let Err(error) = &result {
                             tracing::error!("Server error: {}", error);
                         }
