@@ -2326,8 +2326,9 @@ impl FormatPlugin for RpgMakerMvPlugin {
                 files_written.push(lang_file);
             }
             MvMzVersion::Mv => {
-                // MV Iavra format: www/data/i18n/{lang}.json
-                let i18n_dir = game_root.join("www").join("data").join("i18n");
+                // MV Iavra format: <data>/i18n/{lang}.json, next to the game's
+                // own data (www/data on deployed games, data/ on root layouts).
+                let i18n_dir = data_dir.join("i18n");
                 std::fs::create_dir_all(&i18n_dir)?;
                 let lang_file = i18n_dir.join(format!("{}.json", lang));
 
@@ -4811,11 +4812,7 @@ mod tests {
                 .inject_add(&game_dir, "es", std::slice::from_ref(&entry))
                 .unwrap();
             let (lang_file, key) = if mv {
-                let file = game_dir
-                    .join("www")
-                    .join("data")
-                    .join("i18n")
-                    .join("es.json");
+                let file = game_dir.join("data").join("i18n").join("es.json");
                 (
                     file,
                     format!("/strings/{}", source.replace('~', "~0").replace('/', "~1")),
@@ -4834,6 +4831,36 @@ mod tests {
                 assert!(visible_len(line) <= width, "mv={mv}: {line:?}");
             }
         }
+    }
+
+    #[test]
+    fn inject_add_root_layout_mv_writes_next_to_root_data() {
+        let game_dir_guard = temp_game_dir();
+        let game_dir = game_dir_guard.path().to_path_buf();
+        // MV with js/ and data/ at the root (no www/): the language file
+        // belongs next to the game's own data, not in a new www/ tree.
+        fs::create_dir_all(game_dir.join("js")).unwrap();
+        fs::write(game_dir.join("js").join("rpg_core.js"), "").unwrap();
+
+        let plugin = RpgMakerMvPlugin::new();
+        let mut entries = plugin.extract(&game_dir).unwrap();
+        assert!(!entries.is_empty());
+        for entry in &mut entries {
+            entry.translation = Some(format!("[es] {}", entry.source));
+        }
+
+        let report = plugin.inject_add(&game_dir, "es", &entries).unwrap();
+
+        let lang_file = game_dir.join("data").join("i18n").join("es.json");
+        assert!(lang_file.exists());
+        assert_eq!(report.files_modified, 1);
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&lang_file).unwrap()).unwrap();
+        assert!(json.get("strings").is_some());
+        assert!(
+            !game_dir.join("www").exists(),
+            "Add must not create a www/ tree for a root-layout MV game"
+        );
     }
 
     #[test]
@@ -4874,6 +4901,7 @@ mod tests {
         // Create MV marker
         fs::create_dir_all(game_dir.join("js")).unwrap();
         fs::write(game_dir.join("js").join("rpg_core.js"), "").unwrap();
+        // An empty www/data must not win over the root data/ holding the game.
         fs::create_dir_all(game_dir.join("www").join("data")).unwrap();
 
         let plugin = RpgMakerMvPlugin::new();
@@ -4884,12 +4912,9 @@ mod tests {
 
         plugin.inject_add(&game_dir, "es", &entries).unwrap();
 
-        let lang_file = game_dir
-            .join("www")
-            .join("data")
-            .join("i18n")
-            .join("es.json");
+        let lang_file = game_dir.join("data").join("i18n").join("es.json");
         assert!(lang_file.exists());
+        assert!(!game_dir.join("www").join("data").join("i18n").exists());
         let content = fs::read_to_string(&lang_file).unwrap();
         let json: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert!(json.get("strings").is_some());
