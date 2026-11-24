@@ -128,6 +128,16 @@ fn start_backend_with_state(
     })
 }
 
+/// Bring the running instance forward when the user launches Locust again.
+fn focus_main_window(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
 fn main() {
     // Branch before panic dialogs, tracing output, or any Tauri/GTK setup.
     // A self-test failure must never wait for a native error dialog.
@@ -149,6 +159,12 @@ fn main() {
     let backend = start_backend().unwrap_or_else(|error| exit_with_startup_error(error));
 
     tauri::Builder::default()
+        // First plugin: a second launch hands over to the running window and
+        // exits during setup, before it opens a window or serves any request,
+        // so two processes never edit config.json side by side.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            focus_main_window(app)
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
