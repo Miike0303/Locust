@@ -31,6 +31,7 @@ export default function ProvidersSection() {
   if (providers.length === 0) return <SectionState title={t("settings.providers.title")} state="empty" message={t("settings.providers.empty")} />;
 
   const handleTest = async (id: string) => {
+    if (testing[id]) return;
     setTesting((p) => ({ ...p, [id]: true }));
     try {
       const r = await checkProviderHealth(id);
@@ -42,7 +43,16 @@ export default function ProvidersSection() {
   };
 
   const saveKey = async (providerId: string, key: string, value: string) => {
-    await saveSettings({ providers: { [providerId]: { [key]: value } } });
+    return saveSettings({ providers: { [providerId]: { [key]: value } } });
+  };
+
+  // A saved key comes back redacted, so its field starts empty. Leaving the
+  // field empty must keep that key; only typed text replaces it, and removing
+  // it is an explicit action (an empty api_key clears it in the backend).
+  const saveTypedApiKey = async (providerId: string, target: { value: string }) => {
+    const value = target.value.trim();
+    if (!value) return;
+    if (await saveKey(providerId, "api_key", value)) target.value = "";
   };
 
   const grokSub = providers?.find((p) => p.id === GROK_SUB_PROVIDER_ID);
@@ -56,6 +66,8 @@ export default function ProvidersSection() {
       <GrokSubCard provider={grokSub} model={config?.providers?.[GROK_SUB_PROVIDER_ID]?.model} onModelChange={(model) => void saveKey(GROK_SUB_PROVIDER_ID, "model", model)} onTest={() => handleTest(GROK_SUB_PROVIDER_ID)} testing={!!testing[GROK_SUB_PROVIDER_ID]} testResult={results[GROK_SUB_PROVIDER_ID]} />
       {providers?.filter((p) => p.id !== GROK_SUB_PROVIDER_ID).map((p) => {
         const readiness = resolveProviderReadiness(p.id, providers, config);
+        const savedKey = !!config?.providers?.[p.id]?.api_key;
+        const fieldId = (field: string) => `provider-${p.id}-${field}`;
         return (
         <div key={p.id} className="border border-border bg-surface rounded-xl p-5">
           <div className="flex flex-wrap items-center gap-2 mb-3">
@@ -82,21 +94,32 @@ export default function ProvidersSection() {
 
           {p.requires_api_key && (
             <div className="mb-3">
-              <label className="text-body text-text-muted">{t("settings.providers.apiKey")}</label>
-              <input
-                type="password"
-                defaultValue={config?.providers?.[p.id]?.api_key === "***" ? "" : config?.providers?.[p.id]?.api_key || ""}
-                onBlur={(e) => saveKey(p.id, "api_key", e.target.value)}
-                placeholder={t("settings.providers.enterApiKey")}
-                className={`mt-1 ${SETTINGS_INPUT_CLASS}`}
-              />
+              <label htmlFor={fieldId("api-key")} className="text-body text-text-muted">{t("settings.providers.apiKey")}</label>
+              <div className="mt-1 flex flex-wrap items-center gap-2">
+                <input
+                  id={fieldId("api-key")}
+                  type="password"
+                  autoComplete="off"
+                  defaultValue=""
+                  onBlur={(e) => saveTypedApiKey(p.id, e.target)}
+                  placeholder={savedKey ? t("settings.providers.savedKeyPlaceholder") : t("settings.providers.enterApiKey")}
+                  className={`min-w-0 flex-1 ${SETTINGS_INPUT_CLASS}`}
+                />
+                {savedKey && (
+                  <button type="button" onClick={() => saveKey(p.id, "api_key", "")}
+                    className="px-3 py-2 border border-border bg-surface-muted hover:bg-surface text-danger rounded-md text-body font-medium">
+                    {t("settings.providers.removeKey")}
+                  </button>
+                )}
+              </div>
             </div>
           )}
 
           {(p.id === "argos" || p.id === "ollama") && (
             <div className="mb-3">
-              <label className="text-body text-text-muted">{t("settings.providers.baseUrl")}</label>
+              <label htmlFor={fieldId("base-url")} className="text-body text-text-muted">{t("settings.providers.baseUrl")}</label>
               <input
+                id={fieldId("base-url")}
                 defaultValue={config?.providers?.[p.id]?.base_url || (p.id === "argos" ? "http://localhost:5000" : "http://localhost:11434")}
                 onBlur={(e) => saveKey(p.id, "base_url", e.target.value)}
                 className={`mt-1 ${SETTINGS_INPUT_CLASS}`}
@@ -106,8 +129,9 @@ export default function ProvidersSection() {
 
           {p.id === "ollama" && (
             <div className="mb-3">
-              <label className="text-body text-text-muted">{t("settings.providers.model")}</label>
+              <label htmlFor={fieldId("model")} className="text-body text-text-muted">{t("settings.providers.model")}</label>
               <input
+                id={fieldId("model")}
                 defaultValue={config?.providers?.[p.id]?.model || "llama3.2"}
                 onBlur={(e) => saveKey(p.id, "model", e.target.value)}
                 className={`mt-1 ${SETTINGS_INPUT_CLASS}`}
@@ -126,8 +150,9 @@ export default function ProvidersSection() {
           )}
           {(p.id === "openai" || p.id === "claude") && (
             <div className="mb-3">
-              <label className="text-body text-text-muted">{t("settings.providers.model")}</label>
+              <label htmlFor={fieldId("model")} className="text-body text-text-muted">{t("settings.providers.model")}</label>
               <select
+                id={fieldId("model")}
                 defaultValue={config?.providers?.[p.id]?.model || ""}
                 onChange={(e) => saveKey(p.id, "model", e.target.value)}
                 className={`mt-1 ${SETTINGS_INPUT_CLASS}`}
@@ -147,14 +172,16 @@ export default function ProvidersSection() {
           )}
 
           <div className="flex flex-wrap items-center gap-3">
-            <button onClick={() => handleTest(p.id)}
-              className="px-3 py-2 border border-border bg-surface-muted hover:bg-surface text-text rounded-md text-body font-medium">
+            <button type="button" onClick={() => handleTest(p.id)} data-provider-test={p.id}
+              disabled={!!testing[p.id]} aria-busy={!!testing[p.id]}
+              aria-label={testing[p.id] ? t("settings.providers.testConnection") : undefined}
+              className="px-3 py-2 border border-border bg-surface-muted hover:bg-surface text-text rounded-md text-body font-medium disabled:opacity-60 disabled:cursor-wait">
               {testing[p.id] ? <Loader size={14} className="animate-spin" /> : t("settings.providers.testConnection")}
             </button>
             {results[p.id] && (
-              <span className={clsx("flex items-center gap-1 text-body break-words", results[p.id].ok ? "text-success" : "text-danger")}>
-                {results[p.id].ok ? <CheckCircle size={14} /> : <XCircle size={14} />}
-                {results[p.id].ok ? t("settings.providers.connected") : results[p.id].message.slice(0, 60)}
+              <span className={clsx("flex min-w-0 items-center gap-1 text-body break-words", results[p.id].ok ? "text-success" : "text-danger")}>
+                {results[p.id].ok ? <CheckCircle size={14} className="shrink-0" /> : <XCircle size={14} className="shrink-0" />}
+                <span className="min-w-0 break-words">{results[p.id].ok ? t("settings.providers.connected") : results[p.id].message}</span>
               </span>
             )}
           </div>

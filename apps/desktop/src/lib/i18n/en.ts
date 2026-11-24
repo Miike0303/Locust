@@ -684,6 +684,8 @@ export const en = {
   "settings.providers.needsApiKey": "Needs API key",
   "settings.providers.apiKey": "API Key",
   "settings.providers.enterApiKey": "Enter API key...",
+  "settings.providers.savedKeyPlaceholder": "Key saved (hidden). Type a new key to replace it.",
+  "settings.providers.removeKey": "Remove key",
   "settings.providers.baseUrl": "Base URL",
   "settings.providers.model": "Model",
   "settings.providers.testConnection": "Test Connection",

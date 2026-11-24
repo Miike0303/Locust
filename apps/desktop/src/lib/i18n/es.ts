@@ -677,6 +677,8 @@ export const es: Record<keyof typeof en, string> = {
   "settings.providers.needsApiKey": "Falta la clave API",
   "settings.providers.apiKey": "Clave API",
   "settings.providers.enterApiKey": "Introduzca la clave API...",
+  "settings.providers.savedKeyPlaceholder": "Clave guardada (oculta). Escriba una nueva para reemplazarla.",
+  "settings.providers.removeKey": "Quitar clave",
   "settings.providers.baseUrl": "URL base",
   "settings.providers.model": "Modelo",
   "settings.providers.testConnection": "Probar conexión",

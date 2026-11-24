@@ -1,6 +1,6 @@
 # UI/UX check with Fable 5.2 (2026-11-09): findings queued for the next session
 
-Objective: fix the UI/UX findings below. Status: **nothing fixed yet**; owner 2026-11-09: "todo eso guardalo para la siguiente sesion".
+Objective: fix the UI/UX findings below. Status: in progress on branch `fix/ui-ux-fable-2026-11-09` (owner 2026-11-24: "haz eso"); see Tasks.
 Source: three read-only Fable 5.2 reviewers on the 0.3.0 release build (`main` code `777998c`). Two looked at 44 real production captures (`tools/capture_ui.mjs`, 11 scenarios x EN/ES x 1440x900 and 1024x700); the third read the code of the views without captures. Nobody ran the app. Not reviewed: Pivot modal, Patch Pack tab internals; Translate, Inject, Patch and Queue modals at 900x600; expanded sidebar.
 Paths are under `apps/desktop/src/` unless stated. Line numbers are as of `777998c`; re-check before editing.
 
@@ -57,12 +57,12 @@ Export modal in both languages and sizes; no unreachable content or action at 10
 
 ## Tasks
 
-- T1 | S1 | inline | pending | API key blur fix with a RED test first.
+- T1 | S1, S34 | inline | done (commit below) | API key blur keeps the saved key, explicit Remove key, labelled inputs, Test disabled while testing, full error text. RED 5/6 -> GREEN 6/6 (`ProvidersSection.test.tsx`); frontend 1713/0, build ok. Pinned handler hash in `settingsDesign.test.ts` updated on purpose.
 - T2 | S2, S3, S6, S10, S24 | inline | pending | Import dialog.
 - T3 | S4, S5, S7, S8, S11, S12, S27, S29, S30 | inline | pending | Editor chrome and compact layout.
 - T4 | S13, S14, S32, S33 | inline | pending | Keyboard and shortcuts.
 - T5 | S15, S16, S19, S21, S22 | inline | pending | Destructive actions and dialogs.
-- T6 | S9, S17, S18, S20, S23, S25, S26, S28, S31, S34, S35, S36 | inline | pending | Remaining views, i18n and polish.
+- T6 | S9, S17, S18, S20, S23, S25, S26, S28, S31, S35, S36 | inline | pending | Remaining views, i18n and polish.
 
 After each task: `npm --prefix apps/desktop run build`, `npm run test:unit` in `apps/desktop`, then `node tools/capture_ui.mjs` with the release or debug CLI to re-capture and compare.
 
@@ -71,3 +71,4 @@ After each task: `npm --prefix apps/desktop run build`, `npm run test:unit` in `
 - L1 (owner, 2026-11-09): "haz una checada nuevva con fable, del ui ux, vistas, resonsibe, etc"
 - L2 (owner, 2026-11-09, after the findings were reported): "todo eso guardalo para la siguiente sesion"
 - L3: Captures were generated with `target/release/locust.exe` (0.3.0): 44/44 captures, runner success. They lived in the session scratchpad and were not kept.
+- L4 (owner, 2026-11-24, after the queue was proposed starting with S1): "haz eso". S34 moved into T1 because it lives in the same file. Captures are deferred to the end of the queue instead of after each task (one capture run covers all views).
