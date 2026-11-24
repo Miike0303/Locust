@@ -1496,6 +1496,9 @@ export const en = {
   "hotkeys.navReview": "Go to Review",
   "hotkeys.navMemory": "Go to Memory",
   "hotkeys.navSettings": "Go to Settings",
+  "hotkeys.navQa": "Go to QA",
+  "hotkeys.navSpeakers": "Go to Speakers",
+  "hotkeys.reviewEdit": "Edit translation",
 
   // ── workflow ────────────────────────────────────────────────────────────
   "workflow.guideAria": "Workflow guide",

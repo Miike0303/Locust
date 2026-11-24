@@ -160,6 +160,18 @@ for (const locale of ["en", "es"] as const) {
   });
 }
 
+for (const locale of ["en", "es"] as const) {
+  test(`${locale}: the icon-only dismiss button on an error has an accessible name and still dismisses`, async () => {
+    setLocale(locale);
+    h.install = async () => { throw new Error("install failed"); };
+    await button(await available(), t("update.download")).props.onClick();
+    const dismiss = nodes(render()).find(node => node.type === "button" && node.props["aria-label"] === t("common.dismiss"));
+    assert.ok(dismiss, "error notice exposes a named dismiss button");
+    dismiss.props.onClick();
+    assert.equal(render(), null);
+  });
+}
+
 test("silent check failures stay in the activity log and a later check can succeed", async () => {
   h.check = async () => { throw new Error("offline"); };
   render(); await flush();

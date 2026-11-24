@@ -1471,6 +1471,9 @@ export const es: Record<keyof typeof en, string> = {
   "hotkeys.navReview": "Ir a Revisión",
   "hotkeys.navMemory": "Ir a Memoria",
   "hotkeys.navSettings": "Ir a Ajustes",
+  "hotkeys.navQa": "Ir a Calidad",
+  "hotkeys.navSpeakers": "Ir a Personajes",
+  "hotkeys.reviewEdit": "Editar traducción",
 
   "workflow.guideAria": "Guía de flujo de trabajo",
   "workflow.title": "Guía de flujo de trabajo",

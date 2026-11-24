@@ -216,10 +216,12 @@ export default function UpdateChecker() {
             )}
           </div>
           <button
+            type="button"
             onClick={() => setState({ kind: "idle" })}
+            aria-label={t("common.dismiss")}
             className="text-text-muted hover:text-text"
           >
-            ✕
+            <span aria-hidden="true">✕</span>
           </button>
         </div>
       )}

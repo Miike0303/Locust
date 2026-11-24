@@ -10,7 +10,7 @@ import { placeholderParts, placeholderCheck } from "../lib/placeholders";
 import { buildReviewContextIndex, type ReviewContextIndex } from "../lib/reviewContext";
 import DiffView from "../components/DiffView";
 import EmptyState from "../components/EmptyState";
-import { shouldHandleEscape, shouldRunActionHotkey } from "../lib/hotkeyPolicy";
+import { REVIEW_KEYS, reviewKeyAction, shouldHandleEscape, shouldRunActionHotkey } from "../lib/hotkeyPolicy";
 import { useProjectStore } from "../stores/projectStore";
 import { acknowledgeDraft, draftEntryKey, editDraft, loadLatestDraft, saveDraft, useDraftStore } from "../stores/draftStore";
 import { draftProjectKey, isProjectScopedQueryEnabled } from "../lib/projectScope";
@@ -404,10 +404,11 @@ export default function Review() {
         overlayOpen: !!document.querySelector("[data-hotkey-overlay]"),
         target: e.target as HTMLElement | null,
       })) return;
-      if (e.key === "a" || (e.ctrlKey && e.key === "Enter")) { e.preventDefault(); void handleApprove(); }
-      if (e.key === "s") handleSkip();
-      if (e.key === "p") handlePrev();
-      if (e.key === "e") document.querySelector<HTMLTextAreaElement>("#review-textarea")?.focus();
+      const action = reviewKeyAction(e);
+      if (action === "approve") { e.preventDefault(); void handleApprove(); }
+      if (action === "skip") handleSkip();
+      if (action === "previous") handlePrev();
+      if (action === "edit") document.querySelector<HTMLTextAreaElement>("#review-textarea")?.focus();
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
@@ -647,15 +648,15 @@ export default function Review() {
       <div className="p-4 border-t border-border flex justify-center gap-3">
         <button onClick={handlePrev} disabled={approving || queue.index === 0}
           className="flex items-center gap-1.5 px-4 py-2 bg-surface-muted hover:bg-surface rounded text-body font-medium disabled:opacity-50">
-          <ArrowLeft size={16} /> {t("review.previous")} <kbd className="text-caption text-text-muted ml-1">P</kbd>
+          <ArrowLeft size={16} /> {t("review.previous")} <kbd className="text-caption text-text-muted ml-1">{REVIEW_KEYS.previous.toUpperCase()}</kbd>
         </button>
         <button onClick={handleSkip} disabled={approving}
           className="flex items-center gap-1.5 px-4 py-2 bg-surface-muted hover:bg-surface rounded text-body font-medium disabled:opacity-50">
-          <SkipForward size={16} /> {t("review.skip")} <kbd className="text-caption text-text-muted ml-1">S</kbd>
+          <SkipForward size={16} /> {t("review.skip")} <kbd className="text-caption text-text-muted ml-1">{REVIEW_KEYS.skip.toUpperCase()}</kbd>
         </button>
         <button onClick={() => { void handleApprove(); }} disabled={approving || !!draft?.saving || !!draft?.conflict}
           className="flex items-center gap-1.5 px-6 py-2 bg-accent hover:bg-accent-hover text-white rounded text-body font-medium disabled:opacity-50">
-          <Check size={16} /> {t("review.approve")} <kbd className="text-caption text-white/70 ml-1">A</kbd>
+          <Check size={16} /> {t("review.approve")} <kbd className="text-caption text-white/70 ml-1">{REVIEW_KEYS.approve.toUpperCase()}</kbd>
         </button>
       </div>
     </div>

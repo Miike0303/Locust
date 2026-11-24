@@ -3,8 +3,11 @@ import { useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   HELP_ACTIONS,
+  HOTKEY_MAP,
   shouldHandleEscape,
   shouldRunActionHotkey,
+  type HotkeyActionId,
+  type HotkeyBinding,
 } from "./hotkeyPolicy";
 import {
   completeOpenProject,
@@ -22,52 +25,22 @@ import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
 import { t } from "./i18n";
 
-export interface HotkeyBinding {
-  key: string;
-  ctrl?: boolean;
-  shift?: boolean;
-  alt?: boolean;
-  meta?: boolean;
-  description: string;
-  group: "Navigation" | "Editor" | "Review" | "General";
-}
+// Pure bindings live in hotkeyPolicy.ts so views can show them without loading these hooks.
+export { HOTKEY_MAP, formatKey } from "./hotkeyPolicy";
+export type { HotkeyActionId, HotkeyBinding } from "./hotkeyPolicy";
 
-export const HOTKEY_MAP = {
-  openProject:    { key: "o", ctrl: true, description: "Open project", group: "General" },
-  translate:      { key: "t", ctrl: true, description: "Start translation", group: "Editor" },
-  inject:         { key: "i", ctrl: true, description: "Inject translations", group: "Editor" },
-  applyPatch:     { key: "p", ctrl: true, shift: true, description: "Apply patch zip", group: "Editor" },
-  exportFile:     { key: "e", ctrl: true, description: "Export translations", group: "Editor" },
-  validate:       { key: "v", ctrl: true, shift: true, description: "Validate translations", group: "Editor" },
-  search:         { key: "f", ctrl: true, description: "Focus search / filter", group: "Editor" },
-  searchReplace:  { key: "f", ctrl: true, shift: true, description: "Search & replace", group: "Editor" },
-  reviewMode:     { key: "r", ctrl: true, shift: true, description: "Open review mode", group: "Navigation" },
-  settings:       { key: "s", ctrl: true, shift: true, description: "Open settings", group: "Navigation" },
-  memory:         { key: "m", ctrl: true, shift: true, description: "Translation memory", group: "Navigation" },
-  closePanel:     { key: "Escape", description: "Close panel / modal", group: "General" },
-  showHelp:       { key: "?", description: "Show keyboard shortcuts", group: "General" },
-  showHelpF1:     { key: "F1", description: "Show keyboard shortcuts", group: "General" },
-  navHome:        { key: "1", alt: true, description: "Go to Home", group: "Navigation" },
-  navEditor:      { key: "2", alt: true, description: "Go to Editor", group: "Navigation" },
-  navReview:      { key: "3", alt: true, description: "Go to Review", group: "Navigation" },
-  navMemory:      { key: "4", alt: true, description: "Go to Memory", group: "Navigation" },
-  navSettings:    { key: "5", alt: true, description: "Go to Settings", group: "Navigation" },
-  navDashboard:   { key: "6", alt: true, description: "Go to Dashboard", group: "Navigation" },
-} as const satisfies Record<string, HotkeyBinding>;
-
-export type HotkeyActionId = keyof typeof HOTKEY_MAP;
-
-function matchesEvent(e: KeyboardEvent, binding: HotkeyBinding): boolean {
+export function matchesEvent(e: KeyboardEvent, binding: HotkeyBinding): boolean {
   const isMac = navigator.platform.includes("Mac");
   const ctrl = isMac ? (binding.meta ?? binding.ctrl ?? false) : (binding.ctrl ?? false);
 
   if (ctrl !== (isMac ? e.metaKey : e.ctrlKey)) return false;
-  if ((binding.shift ?? false) !== e.shiftKey) return false;
   if ((binding.alt ?? false) !== e.altKey) return false;
 
   if (binding.key === "?") {
+    // Most layouts need Shift to type "?", so Shift is not compared here.
     return e.key === "?" || (e.shiftKey && e.key === "/");
   }
+  if ((binding.shift ?? false) !== e.shiftKey) return false;
   return e.key.toLowerCase() === binding.key.toLowerCase();
 }
 
@@ -161,33 +134,18 @@ export function useGlobalHotkeys(onShowHelp: () => void) {
     })();
   });
   useHotkey("navHome", () => navigate("/"));
+  useHotkey("navDashboard", () => navigate("/dashboard"));
   useHotkey("navEditor", () => navigate("/editor"));
   useHotkey("navReview", () => navigate("/review"));
+  useHotkey("navQa", () => navigate("/qa"));
+  useHotkey("navSpeakers", () => navigate("/speakers"));
   useHotkey("navMemory", () => navigate("/memory"));
   useHotkey("navSettings", () => navigate("/settings"));
-  useHotkey("navDashboard", () => navigate("/dashboard"));
   useHotkey("reviewMode", () => navigate("/review"));
   useHotkey("settings", () => navigate("/settings"));
   useHotkey("memory", () => navigate("/memory"));
   useHotkey("showHelp", onShowHelp);
   useHotkey("showHelpF1", onShowHelp);
-}
-
-export function formatKey(binding: HotkeyBinding): string {
-  const isMac = navigator.platform.includes("Mac");
-  const parts: string[] = [];
-  if (binding.ctrl) parts.push(isMac ? "\u2318" : "Ctrl");
-  if (binding.shift) parts.push(isMac ? "\u21E7" : "Shift");
-  if (binding.alt) parts.push(isMac ? "\u2325" : "Alt");
-
-  let key = binding.key;
-  if (key === "Escape") key = "Esc";
-  else if (key === "?") key = "?";
-  else if (key === "F1") key = "F1";
-  else key = key.toUpperCase();
-
-  parts.push(key);
-  return parts.join(isMac ? "" : "+");
 }
 
 export function getGroupedHotkeys(): Record<string, { action: string; binding: HotkeyBinding }[]> {

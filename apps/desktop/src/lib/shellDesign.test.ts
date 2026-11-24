@@ -45,6 +45,26 @@ test("body uses tokens without changing the white light and recessed dark bases"
   assert.match(css, /body\s*\{\s*@apply bg-surface text-text dark:bg-surface-muted;\s*\}/);
 });
 
+test("sidebar shortcuts come from the hotkey map, one Alt action per item in sidebar order", () => {
+  const source = readFileSync(new URL("../components/Layout.tsx", import.meta.url), "utf8");
+  const navItems = source.match(/const navItems = \[([\s\S]*?)\] as const;/);
+  assert.ok(navItems, "navItems retains its authored list");
+  const items = [...navItems[1].matchAll(/\{ to: "([^"]+)"[^}]*hotkey: "(\w+)"[^}]*\}/g)].map(([, to, hotkey]) => [to, hotkey]);
+  // hotkeys.test.ts proves navX opens its route with Alt+1..Alt+8 in this same order.
+  assert.deepEqual(items, [
+    ["/", "navHome"],
+    ["/dashboard", "navDashboard"],
+    ["/editor", "navEditor"],
+    ["/review", "navReview"],
+    ["/qa", "navQa"],
+    ["/speakers", "navSpeakers"],
+    ["/memory", "navMemory"],
+    ["/settings", "navSettings"],
+  ]);
+  assert.doesNotMatch(source, /"Alt\+\d"/, "no hard-coded Alt labels");
+  assert.match(source, /formatKey\(HOTKEY_MAP\[hotkey\]\)/);
+});
+
 test("collapsed sidebar is a 64px rail with hover and keyboard-focus tooltips", () => {
   const source = readFileSync(new URL("../components/Layout.tsx", import.meta.url), "utf8");
   assert.match(source, /data-\[collapsed=true\]:w-16/);

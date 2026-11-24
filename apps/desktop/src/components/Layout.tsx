@@ -18,6 +18,7 @@ import {
 } from "lucide-react";
 import clsx from "clsx";
 import { useGlobalHotkeys } from "../lib/hotkeys";
+import { formatKey, HOTKEY_MAP } from "../lib/hotkeyPolicy";
 import HotkeyHelp from "./HotkeyHelp";
 import RouteErrorBoundary from "./RouteErrorBoundary";
 import ToastContainer from "./ToastContainer";
@@ -32,15 +33,16 @@ import { useQuery } from "@tanstack/react-query";
 import { getConfig } from "../lib/api";
 import { isCompactLayout, isNarrowLayout, readSidebarCollapsed, saveSidebarCollapsed, subscribeCompactLayout, subscribeNarrowLayout } from "../lib/layoutPrefs";
 
+// Alt+N opens the Nth item; the keys live in HOTKEY_MAP (lib/hotkeys.ts).
 const navItems = [
-	{ to: "/", icon: Home, labelKey: "nav.home", shortcut: "Alt+1" },
-	{ to: "/dashboard", icon: LayoutDashboard, labelKey: "nav.dashboard", shortcut: "Alt+6" },
-	{ to: "/editor", icon: FileText, labelKey: "nav.editor", shortcut: "Alt+2" },
-	{ to: "/review", icon: BookCheck, labelKey: "nav.review", shortcut: "Alt+3" },
-	{ to: "/qa", icon: ShieldCheck, labelKey: "nav.qa", shortcut: null },
-	{ to: "/speakers", icon: Users, labelKey: "nav.speakers", shortcut: null },
-	{ to: "/memory", icon: Database, labelKey: "nav.memory", shortcut: "Alt+4" },
-	{ to: "/settings", icon: Settings, labelKey: "nav.settings", shortcut: "Alt+5" },
+	{ to: "/", icon: Home, labelKey: "nav.home", hotkey: "navHome" },
+	{ to: "/dashboard", icon: LayoutDashboard, labelKey: "nav.dashboard", hotkey: "navDashboard" },
+	{ to: "/editor", icon: FileText, labelKey: "nav.editor", hotkey: "navEditor" },
+	{ to: "/review", icon: BookCheck, labelKey: "nav.review", hotkey: "navReview" },
+	{ to: "/qa", icon: ShieldCheck, labelKey: "nav.qa", hotkey: "navQa" },
+	{ to: "/speakers", icon: Users, labelKey: "nav.speakers", hotkey: "navSpeakers" },
+	{ to: "/memory", icon: Database, labelKey: "nav.memory", hotkey: "navMemory" },
+	{ to: "/settings", icon: Settings, labelKey: "nav.settings", hotkey: "navSettings" },
 ] as const;
 
 export default function Layout() {
@@ -102,7 +104,7 @@ export default function Layout() {
 				</div>
 
 				<nav className="flex-1 px-2 space-y-1">
-					{navItems.map(({ to, icon: Icon, labelKey, shortcut }) => (
+					{navItems.map(({ to, icon: Icon, labelKey, hotkey }) => (
 						<NavLink
 							key={to}
 							to={to}
@@ -122,9 +124,9 @@ export default function Layout() {
 							<Icon size={18} className="shrink-0" aria-hidden="true" />
 							{!collapsed && <span className="flex-1">{t(labelKey)}</span>}
 							{tooltip(t(labelKey))}
-							{!collapsed && shortcut && (
+							{!collapsed && (
 								<kbd className="text-caption opacity-0 group-hover:opacity-100 transition-opacity">
-									{shortcut}
+									{formatKey(HOTKEY_MAP[hotkey])}
 								</kbd>
 							)}
 						</NavLink>

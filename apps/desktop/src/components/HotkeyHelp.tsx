@@ -41,11 +41,19 @@ const ACTION_LABEL: Record<HotkeyActionId, MessageKey> = {
 	showHelp: "hotkeys.showHelp",
 	showHelpF1: "hotkeys.showHelp",
 	navHome: "hotkeys.navHome",
+	navDashboard: "hotkeys.navDashboard",
 	navEditor: "hotkeys.navEditor",
 	navReview: "hotkeys.navReview",
+	navQa: "hotkeys.navQa",
+	navSpeakers: "hotkeys.navSpeakers",
 	navMemory: "hotkeys.navMemory",
 	navSettings: "hotkeys.navSettings",
-	navDashboard: "hotkeys.navDashboard",
+	reviewApprove: "review.approve",
+	reviewApproveCtrl: "review.approve",
+	reviewSkip: "review.skip",
+	reviewPrevious: "review.previous",
+	reviewEdit: "hotkeys.reviewEdit",
+	reviewExit: "review.returnToEditor",
 };
 
 export default function HotkeyHelp({ open, onClose }: Props) {
@@ -72,10 +80,12 @@ export default function HotkeyHelp({ open, onClose }: Props) {
 						{t("hotkeys.title")}
 					</h2>
 					<button
+						type="button"
 						onClick={onClose}
+						aria-label={t("common.close")}
 						className="text-text-muted hover:text-text"
 					>
-						<X size={18} />
+						<X size={18} aria-hidden="true" />
 					</button>
 				</header>
 

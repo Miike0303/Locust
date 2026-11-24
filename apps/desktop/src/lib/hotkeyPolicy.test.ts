@@ -57,11 +57,19 @@ const wiredHelpActions = [
   "closePanel",
   "showHelp",
   "navHome",
+  "navDashboard",
   "navEditor",
   "navReview",
+  "navQa",
+  "navSpeakers",
   "navMemory",
   "navSettings",
-  "navDashboard",
+  "reviewApprove",
+  "reviewApproveCtrl",
+  "reviewSkip",
+  "reviewPrevious",
+  "reviewEdit",
+  "reviewExit",
 ].sort();
 
 assert.deepEqual(

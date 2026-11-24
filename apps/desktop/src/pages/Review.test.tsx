@@ -677,6 +677,23 @@ test("review shortcuts and key hints remain available and ignore textarea typing
   assert.deepEqual(h.navigations, ["/editor"]);
 });
 
+test("review single-key actions ignore Ctrl, Meta and Alt combinations; Ctrl+Enter still approves", async () => {
+  const key = (value: string, modifiers: { ctrlKey?: boolean; metaKey?: boolean; altKey?: boolean }) =>
+    h.keydown?.({ key: value, target: null, preventDefault() {}, ...modifiers });
+  for (const modifiers of [{ ctrlKey: true }, { metaKey: true }, { altKey: true }]) {
+    for (const value of ["a", "s", "p", "e"]) key(value, modifiers);
+    key("Enter", { ...modifiers, ctrlKey: false });
+  }
+  await settle();
+  assert.equal(textarea().props.value, "Translation A");
+  assert.equal(h.focused, 0);
+  assert.equal(h.writes.length, 0);
+  key("Enter", { ctrlKey: true });
+  await settle();
+  assert.deepEqual(h.writes.map(write => write.id), ["A"]);
+  assert.equal(textarea().props.value, "Translation B");
+});
+
 test("pending context shows loading and ignores a late response after moving to another file", async () => {
   let finish!: () => void;
   h.contextWaits["dialogue.json"] = new Promise<void>(resolve => { finish = resolve; });
