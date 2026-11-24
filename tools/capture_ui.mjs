@@ -237,15 +237,21 @@ async function scenarios(viewport, locale) {
     await waitFor(`!!document.querySelector('[role=dialog] table tbody tr')`, 'replace preview table');
     await focus('[role=dialog] input[type=radio]:checked');
     await snap('import-replace', { keepExisting: false, summary: await evaluate(`document.querySelector(${q(summary)}).textContent`) });
+    // The replacement table scrolls with the modal body (one scroller), not in its own box.
     const region = '[role=dialog] [role=region]';
-    await focus(region);
-    await evaluate(`document.querySelector(${q(region)}).scrollTop = document.querySelector(${q(region)}).scrollHeight`);
+    await focus('[role=dialog] input[type=radio]:checked');
+    await evaluate(`document.querySelector(${q(region)}).scrollIntoView({block:'end'})`);
+    // Keep a visible keyboard focus: the footer stays put while the body scrolls.
+    const previewText = es ? 'Vista previa de importación' : 'Preview import';
+    await evaluate(`Array.from(${dialog}.querySelectorAll('button')).find(el => el.textContent.trim() === ${q(previewText)}).focus()`);
     await snap('import-replace-table', { keepExisting: false, tableScroll: 'bottom' });
 
     const affected = f.seeded.find(row => row.translation && row.source !== 'Welcome traveler!');
     await api(`/api/strings/${encodeURIComponent(affected.id)}`, 'PATCH', { translation: 'Changed after the preview was computed.' });
     const beforeApply = (await api('/api/strings?limit=100')).entries;
-    const applyText = es ? 'Aplicar importación' : 'Apply import';
+    // Replace mode names the replaced count ("Replace 2 translations") on the same Apply button.
+    const applyPattern = es ? '^(Aplicar importación|Reemplazar \\d+ traducci(ón|ones))$' : '^(Apply import|Replace \\d+ translations?)$';
+    const applyText = await evaluate(`Array.from(${dialog}.querySelectorAll('button')).map(el => el.textContent.trim()).find(text => new RegExp(${q(applyPattern)}).test(text)) ?? ${q(es ? 'Aplicar importación' : 'Apply import')}`);
     // ExportModal's labelled acknowledgement is optional and resets per preview.
     const confirmationText = es ? 'Idioma sin declarar — importar de todos modos' : 'Language not declared — import anyway';
     const confirmationLabel = `Array.from(${dialog}.querySelectorAll('label')).find(el => el.textContent.trim() === ${q(confirmationText)})`;
@@ -267,7 +273,10 @@ async function scenarios(viewport, locale) {
     await waitFor(`!!document.querySelector('[role=dialog] [role=alert]')`, 'stale plan error');
     assert(manifest.requests.slice(requestOffset).some(request => request.url.includes('/api/import/po/apply') && request.status === 409), 'Expected genuine stale-plan HTTP 409');
     assert.deepEqual((await api('/api/strings?limit=100')).entries, beforeApply, 'Stale apply must not change rows');
-    await focus('[role=dialog] [role=alert] button');
+    // A stale preview has one way forward: the footer button, relabelled "Preview again".
+    const againText = es ? 'Repetir vista previa' : 'Preview again';
+    await waitFor(`Array.from(${dialog}.querySelectorAll('button')).some(el => el.textContent.trim() === ${q(againText)})`, 'stale preview action');
+    await evaluate(`Array.from(${dialog}.querySelectorAll('button')).find(el => el.textContent.trim() === ${q(againText)}).focus()`);
     await snap('import-stale', { httpStatus: 409, rowsUnchanged: true });
 
     await api('/api/validate', 'POST');
