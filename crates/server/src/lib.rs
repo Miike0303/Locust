@@ -704,6 +704,14 @@ async fn guard_local_client(request: axum::extract::Request, next: Next) -> Resp
 
 // ─── Router ────────────────────────────────────────────────────────────────
 
+/// Request body cap for catalog imports (PO/XLIFF/TMX text sent by the browser UI).
+/// Whole-project catalogs outgrow axum's 2 MB default; every other route keeps it.
+pub const IMPORT_BODY_LIMIT: usize = 64 << 20;
+
+fn import_body_limit() -> axum::extract::DefaultBodyLimit {
+    axum::extract::DefaultBodyLimit::max(IMPORT_BODY_LIMIT)
+}
+
 pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -758,14 +766,26 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/glossary", get(get_glossary).post(add_glossary))
         .route("/api/glossary/:term", delete(delete_glossary))
         .route("/api/export/po", get(export_po))
-        .route("/api/import/po", post(import_po))
+        .route("/api/import/po", post(import_po).layer(import_body_limit()))
         .route("/api/export/xliff", get(export_xliff))
         .route("/api/export/tmx", get(export_tmx))
         .route("/api/export/source-language", get(export_source_language))
-        .route("/api/import/xliff", post(import_xliff))
-        .route("/api/import/tmx", post(import_tmx))
-        .route("/api/import/:format/preview", post(preview_import))
-        .route("/api/import/:format/apply", post(apply_import_preview))
+        .route(
+            "/api/import/xliff",
+            post(import_xliff).layer(import_body_limit()),
+        )
+        .route(
+            "/api/import/tmx",
+            post(import_tmx).layer(import_body_limit()),
+        )
+        .route(
+            "/api/import/:format/preview",
+            post(preview_import).layer(import_body_limit()),
+        )
+        .route(
+            "/api/import/:format/apply",
+            post(apply_import_preview).layer(import_body_limit()),
+        )
         .route("/api/auth/xai/start", post(auth_xai_start))
         .route("/api/auth/xai/poll", post(auth_xai_poll))
         .route("/api/config", get(get_config).patch(patch_config))
@@ -1135,6 +1155,55 @@ mod tests {
             json,
             serde_json::json!({ "translation": "t-live", "patches": [] })
         );
+    }
+
+    #[tokio::test]
+    async fn catalog_imports_accept_bodies_above_the_default_limit_up_to_their_own() {
+        let state = create_test_state();
+        let (url, server) = start_test_server(state).await;
+        let client = reqwest::Client::new();
+        let post = |path: &str, bytes: usize| {
+            let body = serde_json::json!({
+                "content": "x".repeat(bytes),
+                "keep_existing": true,
+            })
+            .to_string();
+            client
+                .post(format!("{url}{path}"))
+                .header("content-type", "application/json")
+                .body(body)
+                .send()
+        };
+        // A body the server refuses early shows up as 413, or (Windows) as a
+        // connection the server closed while the client was still uploading.
+        let too_large = |result: reqwest::Result<reqwest::Response>| match result {
+            Ok(response) => response.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+            Err(error) => error.is_request(),
+        };
+        // Above axum's 2 MB default: reaches the handler (which refuses the
+        // content for its own reasons), never a size refusal.
+        for path in ["/api/import/po/preview", "/api/import/xliff/preview"] {
+            assert!(!too_large(post(path, 3 << 20).await), "{path}");
+        }
+        let raw = client
+            .post(format!("{url}/api/import/po"))
+            .body("x".repeat(3 << 20))
+            .send()
+            .await;
+        assert!(!too_large(raw), "/api/import/po");
+        // The import limit itself still applies.
+        assert!(too_large(
+            post("/api/import/po/preview", IMPORT_BODY_LIMIT + 1).await
+        ));
+        // Other routes keep the default.
+        let config = client
+            .patch(format!("{url}/api/config"))
+            .header("content-type", "application/json")
+            .body(format!("{{\"pad\":\"{}\"}}", "x".repeat(3 << 20)))
+            .send()
+            .await;
+        assert!(too_large(config), "/api/config");
+        server.abort();
     }
 
     #[test]
