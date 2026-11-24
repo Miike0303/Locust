@@ -154,7 +154,7 @@ export const en = {
   "speakers.reopen": "Reopen this project to load its database identity before editing speaker notes.",
   "speakers.empty": "No rows in this project",
   "nav.qa": "QA",
-  "qa.title": "Quality assurance",
+  "qa.title": "QA",
   "qa.run": "Run validation",
   "qa.running": "Validating…",
   "qa.filterKind": "Filter by issue kind",

@@ -71,7 +71,7 @@ for (const [locale, catalog] of [["en", en], ["es", es]] as const) {
       ? "Inconsistent translation" : "Traducción incoherente");
     assert.equal(validationKindHint("InconsistentTranslation", t), locale === "en"
       ? "Same source translated differently — review for consistency"
-      : "Mismo texto original con traducciones distintas: revisa la coherencia");
+      : es["validate.kind.inconsistentHint"]);
     assert.equal(validationKindHint("FutureValidationKind", t), undefined);
   });
 
@@ -133,7 +133,7 @@ const messageCases: [ValidationKind, string, string][] = [
   [{ ExceedsBinarySlot: { actual: 16, limit: 8, encoding: "utf16le" } }, "16 > 8 bytes (utf16le)", "16 > 8 bytes (utf16le)"],
   [{ UnencodableTranslation: { encoding: "Shift-JIS" } },
     "The translation contains characters that cannot be encoded as Shift-JIS. Injection is refused; the original game and saved translation remain unchanged.",
-    "La traducción contiene caracteres que no se pueden codificar en Shift-JIS. Se rechaza la inserción; el juego original y la traducción guardada permanecen intactos."],
+    "La traducción contiene caracteres que no se pueden codificar en Shift-JIS. Se rechaza la inyección; el juego original y la traducción guardada permanecen intactos."],
   ["EmptyTranslation", "Translation is empty.", "La traducción está vacía."],
   ["IdenticalToSource", "Translation is identical to the source.", "La traducción es idéntica al original."],
   [{ InconsistentTranslation: { variants: 2, common: "Guardar" } },
@@ -141,49 +141,49 @@ const messageCases: [ValidationKind, string, string][] = [
     "El mismo texto original tiene 2 traducciones distintas; la más común: «Guardar»"],
   ["StaleTranslation",
     "Translate this entry again or mark it reviewed/approved before injecting or pivoting it.",
-    "Traduce esta entrada de nuevo o márcala como revisada/aprobada antes de insertarla o pivotarla."],
+    "Traduzca esta entrada de nuevo o márquela como revisada/aprobada antes de inyectarla o de usarla en un proyecto puente."],
   [{ InvalidInjectionProvenance: { reason: { MalformedMetadata: { field: "locust_injection_source" } } } },
     "Injection metadata “locust_injection_source” is invalid. Extract this entry again before injection.",
-    "Los metadatos de inserción «locust_injection_source» no son válidos. Extrae esta entrada de nuevo antes de insertarla."],
+    "Los metadatos de inyección «locust_injection_source» no son válidos. Extraiga esta entrada de nuevo antes de inyectarla."],
   [{ InvalidInjectionProvenance: { reason: { MissingMetadata: { field: "textasset_group_capacity" } } } },
     "Injection metadata “textasset_group_capacity” is missing. Extract this entry again before injection.",
-    "Faltan los metadatos de inserción «textasset_group_capacity». Extrae esta entrada de nuevo antes de insertarla."],
+    "Faltan los metadatos de inyección «textasset_group_capacity». Extraiga esta entrada de nuevo antes de inyectarla."],
   [{ InvalidInjectionProvenance: { reason: { InvalidCapacity: { encoding: "utf8", capacity: 0 } } } },
     "The recorded injection capacity (0 bytes, utf8) is invalid. Extract this entry again.",
-    "La capacidad de inserción registrada (0 bytes, utf8) no es válida. Extrae esta entrada de nuevo."],
+    "La capacidad de inyección registrada (0 bytes, utf8) no es válida. Extraiga esta entrada de nuevo."],
   [{ InvalidInjectionProvenance: { reason: { ConflictingEncodings: { slot_encoding: "utf8", capacity_encoding: "utf16le" } } } },
     "The binary slot uses utf8, but its recorded capacity uses utf16le. Extract this entry again.",
-    "El hueco binario usa utf8, pero su capacidad registrada usa utf16le. Extrae esta entrada de nuevo."],
+    "El hueco binario usa utf8, pero su capacidad registrada usa utf16le. Extraiga esta entrada de nuevo."],
   [{ InvalidInjectionProvenance: { reason: { CapacitySourceMismatch: { encoding: "utf8", capacity: 100 } } } },
     "The recorded capacity (100 bytes, utf8) does not match the physical source. Extract this entry again.",
-    "La capacidad registrada (100 bytes, utf8) no coincide con el original físico. Extrae esta entrada de nuevo."],
+    "La capacidad registrada (100 bytes, utf8) no coincide con el original físico. Extraiga esta entrada de nuevo."],
   [{ InvalidInjectionProvenance: { reason: { UnencodableSource: { encoding: "sjis" } } } },
     "The physical source cannot be encoded as sjis. Check its encoding and extract this entry again.",
-    "El original físico no se puede codificar en sjis. Comprueba su codificación y extrae esta entrada de nuevo."],
+    "El original físico no se puede codificar en sjis. Compruebe su codificación y extraiga esta entrada de nuevo."],
   [{ InvalidInjectionProvenance: { reason: { UnsupportedTextAssetLayout: { layout: "future_layout" } } } },
     "The TextAsset layout “future_layout” is unsupported. Extract it with a supported layout before injection.",
-    "El formato de TextAsset «future_layout» no es compatible. Extráelo con un formato compatible antes de insertarlo."],
+    "El formato de TextAsset «future_layout» no es compatible. Extráigalo con un formato compatible antes de inyectarlo."],
   [{ InvalidInjectionProvenance: { reason: "ConflictingTextAssetMetadata" } },
     "This TextAsset has conflicting metadata. Extract the TextAsset again.",
-    "Este TextAsset tiene metadatos contradictorios. Extrae el TextAsset de nuevo."],
+    "Este TextAsset tiene metadatos contradictorios. Extraiga el TextAsset de nuevo."],
   [{ InvalidInjectionProvenance: { reason: { TextAssetGroupTooLarge: { max_members: 16384, max_original_bytes: 1048576 } } } },
     "Automatic TextAsset reconstruction supports at most 16384 entries and 1048576 original bytes. Use a supported smaller group; this is a shared limit.",
-    "La reconstrucción automática de TextAsset admite como máximo 16384 entradas y 1048576 bytes originales. Usa un grupo más pequeño compatible; este límite es compartido."],
+    "La reconstrucción automática de TextAsset admite como máximo 16384 entradas y 1048576 bytes originales. Use un grupo más pequeño compatible; este límite es compartido."],
   [{ InvalidInjectionProvenance: { reason: "MissingTextAssetOriginal" } },
     "The original shared TextAsset is missing. Reload its project database or extract it again.",
-    "Falta el TextAsset original compartido. Vuelve a cargar la base de datos de su proyecto o extráelo de nuevo."],
+    "Falta el TextAsset original compartido. Vuelva a cargar la base de datos de su proyecto o extráigalo de nuevo."],
   [{ InvalidInjectionProvenance: { reason: "TextAssetOriginalMismatch" } },
     "The original shared TextAsset does not match its recorded digest or length. Reload its project database or extract it again.",
-    "El TextAsset original compartido no coincide con su resumen criptográfico o longitud registrados. Vuelve a cargar la base de datos de su proyecto o extráelo de nuevo."],
+    "El TextAsset original compartido no coincide con su resumen criptográfico o longitud registrados. Vuelva a cargar la base de datos de su proyecto o extráigalo de nuevo."],
   [{ InvalidInjectionProvenance: { reason: { TextAssetOriginalExceedsCapacity: { actual: 25, capacity: 20 } } } },
     "The original TextAsset uses 25 bytes, exceeding its recorded capacity of 20 bytes. Extract it again.",
-    "El TextAsset original ocupa 25 bytes y supera su capacidad registrada de 20 bytes. Extráelo de nuevo."],
+    "El TextAsset original ocupa 25 bytes y supera su capacidad registrada de 20 bytes. Extráigalo de nuevo."],
   [{ InvalidInjectionProvenance: { reason: { InvalidTextAssetOverhead: { overhead: 30, original_bytes: 25 } } } },
     "The recorded TextAsset overhead (30 bytes) exceeds the original blob (25 bytes). Extract it again.",
-    "La sobrecarga registrada del TextAsset (30 bytes) supera el bloque original (25 bytes). Extráelo de nuevo."],
+    "La sobrecarga registrada del TextAsset (30 bytes) supera el bloque original (25 bytes). Extráigalo de nuevo."],
   [{ InvalidInjectionProvenance: { reason: { UnsupportedTextAssetReconstruction: { layout: "loc_line" } } } },
     "The translation cannot be reconstructed into the TextAsset layout “loc_line”. Remove unsupported separators or line breaks.",
-    "La traducción no se puede reconstruir en el formato de TextAsset «loc_line». Elimina los separadores o saltos de línea incompatibles."],
+    "La traducción no se puede reconstruir en el formato de TextAsset «loc_line». Elimine los separadores o saltos de línea incompatibles."],
 ];
 
 for (const [locale, catalog, expectedIndex] of [["en", en, 1], ["es", es, 2]] as const) {
@@ -260,7 +260,7 @@ for (const [locale, catalog, expectedIndex] of [["en", en, 1], ["es", es, 2]] as
         : `El mismo texto original tiene 3 traducciones distintas; la más común: «${common}»`);
     assert.equal(validationMessage({ kind: { InvalidInjectionProvenance: { reason: { MalformedMetadata: { field: common } } } }, message }, t),
       locale === "en" ? `Injection metadata “${common}” is invalid. Extract this entry again before injection.`
-        : `Los metadatos de inserción «${common}» no son válidos. Extrae esta entrada de nuevo antes de insertarla.`);
+        : `Los metadatos de inyección «${common}» no son válidos. Extraiga esta entrada de nuevo antes de inyectarla.`);
   });
 }
 
@@ -274,7 +274,7 @@ const numericCatalogs = {
   },
   es: {
     "validate.kind.numberMismatchLabel": "Cifras distintas",
-    "validate.kind.numberMismatchHint": "Las cifras enteras visibles difieren del original. Revísalas; este aviso no impide la inserción.",
+    "validate.kind.numberMismatchHint": "Las cifras enteras visibles difieren del original. Revíselas; este aviso no impide la inyección.",
     "validate.message.numberMismatch": "Las cifras enteras visibles difieren. Faltan: {missing}. Sobran: {extra}.",
     "validate.message.numberMismatchNone": "ninguna",
   },

@@ -22,7 +22,7 @@ For an older YU-RIS project without verified literal metadata, obtain a **fresh,
 ## 2. Finish Japanese → English, then pivot
 
 1. In “Translate” / “Traducir”, explicitly select Japanese as source and English as target, and choose your configured provider. Review errors and unfinished rows; a job ending is not proof that every row translated.
-2. Review the English text and protected controls. Finish every extracted row before selecting “Pivot” / “Pivotar” → “Create project…” / “Crear proyecto…”. Save to a **new** database filename.
+2. Review the English text and protected controls. Finish every extracted row before selecting “Pivot” / “Idioma puente” → “Create project…” / “Crear proyecto…”. Save to a **new** database filename.
 3. Native Pivot requires a nonempty project with a nonblank translation on every row, translated/reviewed/approved status, current source and preserved protected controls. It refuses incomplete work before creating the output database. The displayed status count is informational, not a substitute for this gate; correct rejected rows rather than dropping them to force completion.
 4. Choose “Open this project” / “Abrir este proyecto”. This opens the pivot database **without re-extracting**. English becomes its semantic source; the physical Japanese injection baseline and locators remain preserved. The Japanese → English database is retained separately.
 5. In the pivot project's Translate dialog, explicitly select **English → Spanish**. Do not reopen the game folder to start this stage: that is an extraction path, not the saved pivot. On a later session, open the pivot database instead.

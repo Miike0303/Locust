@@ -234,7 +234,7 @@ assert.equal(
 );
 assert.equal(
 	localizeApiError("no translated entries in C:\\x.locust.db to pivot from"),
-	"No hay traducciones para pivotar. Traduzca o importe primero.",
+	t("api.error.noTranslatedToPivot"),
 );
 assert.equal(localizeApiError("import file is empty"), "El archivo de importación está vacío.");
 assert.equal(
@@ -309,7 +309,7 @@ const recoveryErrors = [
 		name: "multiple injection target languages",
 		body: "One project database can inject only one target language. Use a separate pivot database for each target language.",
 		en: "One project database can inject only one target language. Use a separate pivot database for each target language.",
-		es: "Una base de datos de proyecto solo puede inyectar un idioma de destino. Use un proyecto intermedio con su propia base de datos para cada idioma de destino.",
+		es: "Una base de datos de proyecto solo puede inyectar un idioma de destino. Use un proyecto puente con su propia base de datos para cada idioma de destino.",
 	},
 ] as const;
 
@@ -581,7 +581,7 @@ const batch3Errors: readonly {
 		name: "existing pivot output",
 		body: String.raw`IO error: refusing to overwrite existing file: C:\private\pivot.locust.db`,
 		prefix: "IO error: refusing to overwrite existing file: ",
-		es: "Ya existe un archivo en el destino del proyecto intermedio. Elija otro nombre o ubicación para guardar la nueva base de datos.",
+		es: "Ya existe un archivo en el destino del proyecto puente. Elija otro nombre o ubicación para guardar la nueva base de datos.",
 		nearMiss: "IO error: refusing to overwrite existing directory: private",
 	},
 	{

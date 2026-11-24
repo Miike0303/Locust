@@ -103,7 +103,7 @@ for (const locale of ["en", "es"] as const) {
 
 test("Spanish labels for the new navigation and Review entries", () => {
   setLocale("es");
-  assert.equal(t("hotkeys.navQa" as any), "Ir a Calidad");
+  assert.equal(t("hotkeys.navQa" as any), `Ir a ${t("nav.qa" as any)}`);
   assert.equal(t("hotkeys.navSpeakers" as any), "Ir a Personajes");
   assert.equal(t("hotkeys.reviewEdit" as any), "Editar traducción");
 });

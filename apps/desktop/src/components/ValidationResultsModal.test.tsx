@@ -88,7 +88,7 @@ function textOf(node: any): string {
 
 for (const [locale, catalog, expected] of [
   ["en", en, "The translation contains characters that cannot be encoded as Shift-JIS. Injection is refused; the original game and saved translation remain unchanged."],
-  ["es", es, "La traducción contiene caracteres que no se pueden codificar en Shift-JIS. Se rechaza la inserción; el juego original y la traducción guardada permanecen intactos."],
+  ["es", es, "La traducción contiene caracteres que no se pueden codificar en Shift-JIS. Se rechaza la inyección; el juego original y la traducción guardada permanecen intactos."],
 ] as const) {
   test(`encoding refusal renders clear localized details and no opaque excerpt (${locale})`, () => {
     (globalThis as any).__encodingTranslate = (key: string, vars?: any) => translate(catalog, locale, key, vars);

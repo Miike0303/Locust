@@ -2,7 +2,7 @@
 
 Las inserciones Direct (`inject --direct`) y Add preparan sus cambios en una copia independiente y conservan un plan de recuperación antes de modificar los archivos del juego. Si el proceso termina a mitad, consulta el estado y recupera esa operación antes de volver a insertar, instalar/revertir un ZIP o restaurar un respaldo sobre el mismo juego.
 
-Desde la aplicación, usa **Inicio → Recuperar inserción**. Puedes indicar una carpeta o archivo sin abrir su proyecto. Pulsa **Revisar recuperación** para consultar la operación; si hay conflictos, el panel enumera los archivos y exige confirmar que se guarden copias antes de reemplazarlos. La interfaz muestra las rutas de esas copias al terminar. Al fallar una apertura por inserción pendiente también se ofrece este panel.
+Desde la aplicación, use **Inicio → Recuperar inyección**. Puede indicar una carpeta o archivo sin abrir su proyecto. Pulse **Revisar recuperación** para consultar la operación; si hay conflictos, el panel enumera los archivos y exige confirmar que se guarden copias antes de reemplazarlos. La interfaz muestra las rutas de esas copias al terminar. Al fallar una apertura por inyección pendiente también se ofrece este panel.
 
 La recuperación desde la interfaz queda vinculada al ID de la operación revisada. Si otra operación la sustituye, debes volver a consultar el estado antes de continuar. Cambiar de ruta, cerrar o recibir un error descarta la confirmación de conflictos.
 

@@ -57,9 +57,10 @@ function seed(issues: StoredValidationIssue[] = [issue], total = issues.length, 
   }
 }
 
-for (const [locale, heading] of [["en", "Quality assurance"], ["es", "Control de calidad"]] as const) {
+for (const locale of ["en", "es"] as const) {
   test(`${locale}: QA renders localized headings, chips, issue actions and relative paths`, () => {
     setLocale(locale);
+    const heading = t("qa.title");
     seed([issue, { ...issue, id: 2, ignored: true }], 51);
     const html = render();
     assert.match(html, new RegExp(`<h1[^>]*>${heading}</h1>`));
