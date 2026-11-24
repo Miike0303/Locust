@@ -372,6 +372,10 @@ async function main() {
   stage = 'rollback';
   const rollbackOffset = requests.length;
   await button('Rollback', dialog);
+  // Rollback asks for a destructive confirmation; confirm it in the topmost dialog.
+  const confirmation = 'Array.from(document.querySelectorAll("[role=dialog]")).at(-1)';
+  await waitFor('document.querySelectorAll("[role=dialog]").length > 1', 'rollback confirmation dialog');
+  await button('Rollback', confirmation);
   const rolledBack = (await completedRequest('/api/patch/rollback', rollbackOffset)).body;
   assert(rolledBack.restored > 0 && !rolledBack.aborted_edited?.length, 'Rollback did not restore the consumer');
   assert.deepEqual(await fingerprint(consumer), pristine, 'Rollback must restore exact original paths and SHA-256 hashes');
