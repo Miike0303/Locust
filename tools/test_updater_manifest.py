@@ -33,6 +33,20 @@ def signature(seed, algorithm=b"ED"):
     return base64.b64encode(wire.encode()).decode()
 
 
+class BundleTargetTests(unittest.TestCase):
+    def test_release_ships_only_installers_the_manifest_can_update(self):
+        # An installer kind without a manifest entry would be updated with
+        # another kind's payload (for example an MSI over an NSIS install).
+        conf = json.loads((ROOT / "apps/desktop/src-tauri/tauri.conf.json").read_text(encoding="utf-8"))
+        targets = conf["bundle"]["targets"]
+        self.assertIsInstance(targets, list, "'all' would also build NSIS, deb and rpm")
+        self.assertEqual(sorted(targets), ["app", "appimage", "dmg", "msi"])
+        self.assertTrue(conf["bundle"]["createUpdaterArtifacts"])
+        payloads = {"msi": r"\.msi$", "app": r"\.app\.tar\.gz$", "appimage": r"\.AppImage$"}
+        for target, suffix in payloads.items():
+            self.assertTrue(any(pattern.endswith(suffix) for pattern in m.PATTERNS.values()), target)
+
+
 class ManifestTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=ROOT / "tools", prefix="locust-manifest-tests-")

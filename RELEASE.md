@@ -8,6 +8,11 @@ manifest job is **not** proof that every desktop or CLI platform shipped.
 - Use the existing Node/Rust/Python toolchains and release workflow. Manifest
   generation needs Python 3, `gh` and `curl`; the release gate needs Python 3.11+.
   No `jq` dependency is required.
+- Tauri `bundle.targets` lists only installers the updater manifest can update:
+  `msi`, `app` (the macOS `.app.tar.gz` update payload), `dmg` and `appimage`.
+  NSIS, deb and rpm are not built: `latest.json` has no entry for them, so their
+  installs would receive another installer's payload. `tools/test_updater_manifest.py`
+  pins this list.
 - Tauri `bundle.createUpdaterArtifacts` must be `true`. Updater signing uses the
   existing `TAURI_SIGNING_PRIVATE_KEY` and optional
   `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` GitHub Actions secrets, with the public key
