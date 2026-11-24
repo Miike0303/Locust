@@ -3,7 +3,7 @@ import { registerHooks } from "node:module";
 import { after, beforeEach, test } from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { BackupRestoreReport } from "../../lib/api.ts";
-import { setLocale, t, type TranslateKey } from "../../lib/i18n/index.ts";
+import { getLocale, setLocale, t, type TranslateKey } from "../../lib/i18n/index.ts";
 
 const backup = {
   id: "before injection", path: "/backups/before injection", source_path: "/games/Demo",
@@ -16,8 +16,9 @@ const report: BackupRestoreReport = {
 };
 const label = (key: string, params?: Record<string, string | number>) => t(key as TranslateKey, params);
 const h = {
-  t, slots: [] as any[], cursor: 0, calls: [] as { url: string; method: string }[], toasts: [] as unknown[][],
+  t, getLocale, slots: [] as any[], cursor: 0, calls: [] as { url: string; method: string }[], toasts: [] as unknown[][],
   preview: report, failure: "", restoreFailure: "", wait: null as Promise<void> | null,
+  query: null as Record<string, unknown> | null,
   setTauri: (_value: boolean) => {},
   state(initial: any) {
     const index = h.cursor++;
@@ -42,8 +43,8 @@ const hooks = registerHooks({
     if (context.parentURL?.endsWith("/settings/DataSection.tsx")) {
       const stubs: Record<string, string> = {
         react: "export const useState=h.state;export const useRef=x=>h.state(()=>({current:x}))[0];",
-        "@tanstack/react-query": `export const useQuery=()=>({data:{entries:[${JSON.stringify(backup)}],unreadable:[]},isPending:false,isError:false,refetch:()=>{}});`,
-        "../../lib/i18n": "export const useT=()=>h.t;",
+        "@tanstack/react-query": `export const useQuery=()=>h.query??({data:{entries:[${JSON.stringify(backup)}],unreadable:[]},isPending:false,isError:false,refetch:()=>{}});`,
+        "../../lib/i18n": "export const useT=()=>h.t;export const useLocale=()=>({locale:h.getLocale(),setLocale(){}});",
         "../../stores/toastStore": "export const addToast=(...args)=>h.toasts.push(args);",
       };
       if (stubs[specifier]) return { shortCircuit: true, url: `data:text/javascript,${encodeURIComponent("const h=globalThis.__dataPreviewTest;" + stubs[specifier])}` };
@@ -97,8 +98,27 @@ function writes() { return h.calls.filter(call => call.url.endsWith("/restore"))
 
 beforeEach(() => {
   h.slots = []; h.calls = []; h.toasts = []; h.preview = report; h.failure = ""; h.restoreFailure = ""; h.wait = null;
-  h.setTauri(true); setLocale("en");
+  h.query = null; h.setTauri(true); setLocale("en");
 });
+
+for (const locale of ["en", "es"] as const) {
+  test(`${locale} a failed backup list shows its error with a Retry that reloads it`, () => {
+    setLocale(locale);
+    let refetches = 0;
+    h.query = {
+      data: undefined, isPending: false, isError: true,
+      error: new Error("backup root unavailable"), refetch: () => { refetches++; },
+    };
+    const html = markup();
+    assert.ok(html.includes(label("settings.data.loadFailed", { error: "backup root unavailable" })), html);
+    assert.match(html, /role="alert"/);
+    assert.ok(!html.includes(label("settings.data.noBackups")));
+    const retry = nodes(tree()).find(node => node.type === "button" && node.props.children === t("common.retry"));
+    assert.ok(retry, "the failed backup list needs a Retry action");
+    retry.props.onClick();
+    assert.equal(refetches, 1);
+  });
+}
 after(() => {
   hooks.deregister(); globalThis.fetch = originalFetch;
   if (windowDescriptor) Object.defineProperty(globalThis, "window", windowDescriptor);

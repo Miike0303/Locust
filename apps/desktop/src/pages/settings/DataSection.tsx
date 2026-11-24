@@ -5,7 +5,8 @@ import ConfirmDialog from "../../components/ConfirmDialog";
 import type { BackupRestoreReport } from "../../lib/api";
 import { deleteBackup, getBackupsReport, previewBackupRestore, restoreBackup } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
-import { useT } from "../../lib/i18n";
+import { formatDateTime } from "../../lib/dates";
+import { useLocale, useT } from "../../lib/i18n";
 import {
   useModalA11y, MODAL_BACKDROP_CLASS, MODAL_HEADER_CLASS,
   MODAL_BODY_CLASS, MODAL_FOOTER_CLASS, modalPanelClass,
@@ -93,6 +94,7 @@ function RestoreConfirmation({ open, action, preview, onConfirm, onCancel, onRet
 
 export default function DataSection() {
   const t = useT();
+  const { locale } = useLocale();
   const { data: listing, isPending, isError, error, refetch } = useQuery({
     queryKey: ["backups", "report"], queryFn: getBackupsReport,
   });
@@ -198,9 +200,13 @@ export default function DataSection() {
         {isPending ? (
           <p className="text-body text-text-muted" role="status">{t("common.loading")}</p>
         ) : isError ? (
-          <p className="text-body text-danger" role="alert">
-            {t("settings.data.loadFailed", { error: error.message })}
-          </p>
+          <div role="alert" className="space-y-3 text-body">
+            <p className="text-danger break-words">{t("settings.data.loadFailed", { error: error.message })}</p>
+            <button type="button" onClick={() => { void refetch(); }}
+              className="px-3 py-2 border border-border bg-surface-muted hover:bg-surface text-text rounded-md text-body font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg">
+              {t("common.retry")}
+            </button>
+          </div>
         ) : backups.length === 0 && unreadable.length === 0 ? (
           <p className="text-body text-text-muted">{t("settings.data.noBackups")}</p>
         ) : backups.length > 0 ? (
@@ -228,7 +234,7 @@ export default function DataSection() {
                       ) : null}
                     </td>
                     <td className="px-3 py-2 font-mono text-caption">{b.id}</td>
-                    <td className="px-3 py-2 whitespace-nowrap">{new Date(b.created_at).toLocaleString()}</td>
+                    <td className="px-3 py-2 whitespace-nowrap">{formatDateTime(b.created_at, locale)}</td>
                     <td className="px-3 py-2 tabular-nums">{b.file_count}</td>
                     <td className="px-3 py-2 flex gap-2">
                       <button onClick={() => openRestore({ kind: "restore", ...pending })} className="inline-flex items-center justify-center rounded-md p-2 text-accent-fg hover:bg-accent-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg" title={t("settings.data.restore")}><RotateCcw size={14} /></button>

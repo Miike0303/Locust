@@ -152,14 +152,20 @@ export default function Welcome() {
 	const queryClient = useQueryClient();
 	const setProject = useProjectStore((s) => s.setProject);
 	const setFilter = useEditorStore((s) => s.setFilter);
-	const { data: formats } = useQuery({
+	const formatsQuery = useQuery({
 		queryKey: ["formats"],
 		queryFn: getFormats,
 	});
-	const { data: config } = useQuery({
+	const configQuery = useQuery({
 		queryKey: ["config"],
 		queryFn: getConfig,
 	});
+	const formats = formatsQuery.data;
+	const config = configQuery.data;
+	const retryFailedHomeData = () => {
+		if (formatsQuery.isError) void formatsQuery.refetch();
+		if (configQuery.isError) void configQuery.refetch();
+	};
 	const { data: providers } = useQuery({
 		queryKey: ["providers"],
 		queryFn: getProviders,
@@ -492,6 +498,28 @@ export default function Welcome() {
 			</div>
 
 			</section>
+
+			{(formatsQuery.isError || configQuery.isError) && (
+				<div role="alert" className="p-4 rounded-lg border border-danger bg-danger-muted space-y-3 [@media(max-height:760px)]:p-3">
+					{formatsQuery.isError && (
+						<p className="text-body text-danger break-words">
+							{t("welcome.loadFailed.formats", { error: formatsQuery.error.message })}
+						</p>
+					)}
+					{configQuery.isError && (
+						<p className="text-body text-danger break-words">
+							{t("welcome.loadFailed.config", { error: configQuery.error.message })}
+						</p>
+					)}
+					<button
+						type="button"
+						onClick={retryFailedHomeData}
+						className="px-3 py-2 border border-border bg-surface-muted hover:bg-surface text-text rounded-md text-body font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg"
+					>
+						{t("common.retry")}
+					</button>
+				</div>
+			)}
 
 			{showProviderHint && (
 				<div className="p-4 rounded-lg border border-border bg-warning-muted [@media(max-height:760px)]:p-3">

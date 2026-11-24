@@ -197,6 +197,25 @@ for (const [locale, catalog, hints] of [
   }
 }
 
+for (const [locale, catalog] of [["en", en], ["es", es]] as const) {
+  test(`${locale} history without an open project shows the project hint, not an empty run list`, () => {
+    setLocale(locale);
+    glossary.project = null;
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, retryOnMount: false, gcTime: Infinity } },
+    });
+    try {
+      const html = renderToStaticMarkup(createElement(QueryClientProvider, { client },
+        createElement(MemoryRouter, { initialEntries: ["/settings?section=history"] },
+          createElement(Settings))));
+      assert.ok(html.includes(catalog["settings.history.noProject"]), html);
+      assert.ok(!html.includes(catalog["settings.history.empty"]), "no project must not read as no runs");
+      assert.ok(!html.includes(catalog["settings.history.loading"]));
+      assertSemanticPalette(html);
+    } finally { client.clear(); }
+  });
+}
+
 const healthyBackup = {
   id: "healthy", path: "/backups/healthy", source_path: "/games/Demo",
   created_at: "2026-01-01T00:00:00Z", file_count: 2, size_bytes: 16,
@@ -433,4 +452,15 @@ for (const [locale, catalog] of [["en", en], ["es", es]] as const) {
       assertSemanticPalette(html);
     });
   }
+
+  test(`${locale} history and backup dates follow the interface language`, async () => {
+    setLocale(locale);
+    // Computed with Intl directly so the assertion does not depend on the helper under test.
+    const runDate = new Date("2026-01-01T00:00:00Z").toLocaleString(locale, {
+      year: "numeric", month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit",
+    });
+    const backupDate = new Date(healthyBackup.created_at).toLocaleString(locale);
+    assert.ok((await renderPopulatedSection("history")).includes(runDate), `history date in ${locale}: ${runDate}`);
+    assert.ok((await renderPopulatedSection("data")).includes(backupDate), `backup date in ${locale}: ${backupDate}`);
+  });
 }

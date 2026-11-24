@@ -227,6 +227,15 @@ for (const locale of ["en", "es"] as const) {
     assert.ok(!html.includes(t("memory.globalEntries", { count: 0 })));
   });
 
+  test(`${locale}: last-used dates follow the interface language`, () => {
+    setLocale(locale);
+    h.project = project("/projects/dates.locust.db");
+    render();
+    seedMemory();
+    const lastUsed = new Date("2026-01-01").toLocaleString(locale);
+    assert.ok(render().includes(lastUsed), `expected ${lastUsed}`);
+  });
+
   test(`${locale}: only successful empty reads render zero counts and the empty state`, () => {
     setLocale(locale);
     h.project = project("/projects/empty.locust.db");

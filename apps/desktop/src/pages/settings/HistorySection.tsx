@@ -5,25 +5,18 @@ import { Loader } from "lucide-react";
 import { useMemo } from "react";
 import type { TranslationRun } from "../../lib/api";
 import { getTranslationRuns } from "../../lib/api";
-import { useT, type TranslateFn } from "../../lib/i18n";
+import { formatDateTime } from "../../lib/dates";
+import { useLocale, useT, type TranslateFn } from "../../lib/i18n";
 import { settingsQueryState } from "../../lib/settingsQueryState";
 import { formatObservedCost } from "../../lib/translationCost";
 
-function formatRunDate(iso: string): string {
-  if (!iso) return "—";
-  // Prefer local short form; fall back to first 16 chars of ISO.
-  const d = new Date(iso);
-  if (!Number.isNaN(d.getTime())) {
-    return d.toLocaleString(undefined, {
-      year: "numeric",
-      month: "short",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-  }
-  return iso.length >= 16 ? iso.slice(0, 16) : iso;
-}
+const RUN_DATE_FORMAT: Intl.DateTimeFormatOptions = {
+  year: "numeric",
+  month: "short",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+};
 
 function formatDuration(secs: number, t: TranslateFn): string {
   const s = Math.max(0, Math.floor(secs));
@@ -44,6 +37,7 @@ function formatDuration(secs: number, t: TranslateFn): string {
 
 export default function HistorySection() {
   const t = useT();
+  const { locale } = useLocale();
   const project = useProjectStore(state => state.project);
   const projectKey = project ? draftProjectKey(project) : "";
   const scopedEnabled = useProjectScopedQueryEnabled(projectKey);
@@ -52,7 +46,9 @@ export default function HistorySection() {
     enabled: scopedEnabled,
     queryFn: projectScopedQueryFn(projectKey, () => getTranslationRuns()),
   });
-  const queryState = isError ? settingsQueryState(error) : null;
+  // Without an open project the query never runs; say so instead of "no runs".
+  const queryState = !project ? "no_project" : isError ? settingsQueryState(error) : null;
+  const showRuns = queryState === null && !isLoading;
 
   const totals = useMemo(() => {
     const list = runs ?? [];
@@ -109,13 +105,13 @@ export default function HistorySection() {
         </div>
       )}
 
-      {!isLoading && !isError && (runs?.length ?? 0) === 0 && (
+      {showRuns && (runs?.length ?? 0) === 0 && (
         <div className="border border-dashed border-border bg-surface rounded-xl p-8 text-center text-body text-text-muted">
           {t("settings.history.empty")}
         </div>
       )}
 
-      {!isLoading && !isError && (runs?.length ?? 0) > 0 && (
+      {showRuns && (runs?.length ?? 0) > 0 && (
         <div className="overflow-x-auto border border-border bg-surface rounded-xl">
           <table className="w-full min-w-[56rem] text-body">
             <thead>
@@ -135,7 +131,7 @@ export default function HistorySection() {
               {runs!.map((r: TranslationRun) => (
                 <tr key={r.id} className="hover:bg-surface-muted">
                   <td className="px-3 py-2 whitespace-nowrap text-text">
-                    {formatRunDate(r.started_at)}
+                    {formatDateTime(r.started_at, locale, RUN_DATE_FORMAT)}
                   </td>
                   <td className="px-3 py-2 font-mono text-caption" title={r.provider}>
                     {r.provider}

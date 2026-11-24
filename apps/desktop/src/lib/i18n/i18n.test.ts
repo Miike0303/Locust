@@ -242,6 +242,65 @@ for (const [locale, catalog] of [["en", en], ["es", es]] as const) {
   });
 }
 
+// S31 wording: one formal register and one name per concept.
+const placeholderSet = (value: string) => [...value.matchAll(/\{(\w+)\}/g)].map(match => match[1]).sort();
+// Unambiguous second-person (tú) forms: possessives, 2nd-person verbs and tú imperatives.
+const TU_FORM = /(?:^|[^\p{L}])(?:[Tt]u|[Tt]us|[Pp]uedes|[Pp]uedas|[Cc]ompartes|Mantén|Abre|Elige|[Ss]elecciona|Introduce|Revisa|Reintenta|Habilita|Restaura|Exporta|Cierra|Vuelve|Configúralo|Restáuralas|Corrígelos|Termínala|cancélala|Revísalos|Revísalas|déjalo|sal|pulsa|Repara|Extrae|[Ee]xtráelo|Elimina|Comprueba|Traduce|márcala|Crea|Usa)(?=$|[^\p{L}])/u;
+// Still tú because lib/validationLabels.test.ts pins their exact Spanish text (outside this change).
+const TU_PINNED_ELSEWHERE = new Set([
+  "validate.kind.inconsistentHint", "validate.kind.staleDetail",
+  "validate.provenance.malformedMetadata", "validate.provenance.missingMetadata",
+  "validate.provenance.invalidCapacity", "validate.provenance.conflictingEncodings",
+  "validate.provenance.capacitySourceMismatch", "validate.provenance.unencodableSource",
+  "validate.provenance.unsupportedLayout", "validate.provenance.conflictingMetadata",
+  "validate.provenance.groupTooLarge", "validate.provenance.missingOriginal",
+  "validate.provenance.originalMismatch", "validate.provenance.originalExceedsCapacity",
+  "validate.provenance.invalidOverhead", "validate.provenance.unsupportedReconstruction",
+]);
+// Third-person descriptions that share a spelling with a tú imperative ("Locust uses…", "Replace creates…").
+const THIRD_PERSON_DESCRIPTIONS = new Set(["fastWorkflow.description", "estimate.scope", "inject.hint.replace"]);
+
+test("Spanish catalog addresses the user as usted", () => {
+  const tuForms = Object.entries(es)
+    .filter(([key, value]) => !TU_PINNED_ELSEWHERE.has(key) && !THIRD_PERSON_DESCRIPTIONS.has(key) && TU_FORM.test(value))
+    .map(([key, value]) => `${key}: ${value}`);
+  assert.deepEqual(tuForms, []);
+  // Third-person entries are exempt from the word scan only; they must not address the user as tú.
+  for (const key of THIRD_PERSON_DESCRIPTIONS) {
+    assert.doesNotMatch(es[key as keyof typeof es], /(?:^|[^\p{L}])(?:tu|tus|puedes|puedas)(?=$|[^\p{L}])/u, key);
+  }
+});
+
+test("recovery and injection copy say inject, never insertion", () => {
+  for (const key of enKeys.filter(key => key.startsWith("recovery.")) as (keyof typeof en)[]) {
+    assert.doesNotMatch(en[key], /insert/i, `en ${key}`);
+    assert.doesNotMatch(es[key], /inser/i, `es ${key}`);
+  }
+  for (const key of ["inject.hint.direct", "patch.pristineHint", "patch.injectionBackup"] as const) {
+    assert.doesNotMatch(es[key], /inserci/i, key);
+  }
+});
+
+test("Spanish uses idioma puente instead of the calque Pivotar", () => {
+  // These two keep "pivotar" because other tests pin their exact Spanish text.
+  const pinned = new Set(["validate.kind.staleDetail", "api.error.noTranslatedToPivot"]);
+  assert.ok(Object.values(es).every(value => !value.includes("Pivotar")));
+  const calques = Object.entries(es).filter(([key, value]) => !pinned.has(key) && /pivot/i.test(value)).map(([key]) => key);
+  assert.deepEqual(calques, []);
+  assert.match(es["editor.pivot"], /idioma puente/i);
+  assert.match(es["pivot.title"], /idioma puente/i);
+});
+
+test("each page keeps one name for Speakers", () => {
+  assert.equal(en["speakers.title"], en["nav.speakers"]);
+  assert.equal(es["speakers.title"], es["nav.speakers"]);
+});
+
+test("S31 wording keeps placeholders identical between languages", () => {
+  const keys = enKeys.filter(key => /^(recovery|pivot|activity\.pivot|fastWorkflow|estimate|export|detail|fontPatch|settings\.field)\./.test(key)) as (keyof typeof en)[];
+  for (const key of keys) assert.deepEqual(placeholderSet(es[key]), placeholderSet(en[key]), key);
+});
+
 test("Rule95 publishing strings have catalog and placeholder parity", () => {
   const keys = ["patch.publish.title", "patch.publish.rjCode", "patch.publish.noDetect", "patch.publish.gameVersion", "patch.publish.createEntry", "patch.publish.entryPath", "patch.publish.saveEntry", "patch.publish.entryFilter", "patch.publish.chooseEntry", "patch.publish.identity", "patch.publish.noCode", "patch.publish.commandHint", "patch.publish.copyFailed"] as const;
   for (const key of keys) {

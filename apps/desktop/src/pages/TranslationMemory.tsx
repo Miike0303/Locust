@@ -7,7 +7,8 @@ import EmptyState from "../components/EmptyState";
 import { addToast } from "../stores/toastStore";
 import { useProjectStore } from "../stores/projectStore";
 import { ApiError } from "../lib/apiError";
-import { useT } from "../lib/i18n";
+import { formatDateTime } from "../lib/dates";
+import { useLocale, useT } from "../lib/i18n";
 
 import { memoryPageOffset, MEMORY_PAGE_SIZE as PAGE_SIZE } from "../lib/memoryPagination";
 
@@ -24,6 +25,7 @@ export default function TranslationMemory() {
 
 function ProjectTranslationMemory({ projectScope }: { projectScope: string | null }) {
   const t = useT();
+  const { locale } = useLocale();
   const qc = useQueryClient();
   const [search, setSearch] = useState("");
   const [langPair, setLangPair] = useState<string | undefined>();
@@ -264,7 +266,7 @@ function ProjectTranslationMemory({ projectScope }: { projectScope: string | nul
                   </td>
                   <td className="px-4 py-2 text-center text-text-muted">{entry.uses}</td>
                   <td className="px-4 py-2 text-text-muted text-caption">
-                    {new Date(entry.last_used).toLocaleString()}
+                    {formatDateTime(entry.last_used, locale)}
                   </td>
                   <td className="px-4 py-2">
                     <button

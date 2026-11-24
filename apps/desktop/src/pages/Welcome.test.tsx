@@ -248,6 +248,51 @@ for (const locale of ["en", "es"] as const) {
   });
 }
 
+for (const locale of ["en", "es"] as const) {
+  for (const failed of [["formats"], ["config"], ["formats", "config"]] as const) {
+    test(`${locale}: Home reports a failed ${failed.join(" and ")} load with a Retry`, async () => {
+      setLocale(locale);
+      actions.buttons = [];
+      const client = new QueryClient({
+        defaultOptions: { queries: { retry: false, retryOnMount: false, gcTime: Infinity } },
+      });
+      try {
+        for (const key of ["formats", "config"] as const) {
+          if ((failed as readonly string[]).includes(key)) {
+            await assert.rejects(client.fetchQuery({ queryKey: [key], queryFn: async () => { throw new Error(`${key} backend down`); } }));
+          } else if (key === "formats") {
+            client.setQueryData(["formats"], formats);
+          } else {
+            client.setQueryData(["config"], {
+              providers: {}, default_provider: null, default_source_lang: "ja", default_target_lang: "en",
+              default_batch_size: 20, default_cost_limit: null, recent_projects: [],
+              ui: { theme: "dark", font_size: 18, show_source_column: true, table_row_height: 36 },
+            } satisfies AppConfig);
+          }
+        }
+        client.setQueryData(["providers"], readyProviders);
+        const html = renderToStaticMarkup(createElement(QueryClientProvider, { client },
+          createElement(MemoryRouter, { initialEntries: ["/"] }, createElement(Welcome))));
+        assert.match(html, /role="alert"/);
+        for (const key of ["formats", "config"] as const) {
+          const message = t(key === "formats" ? "welcome.loadFailed.formats" : "welcome.loadFailed.config", { error: `${key} backend down` });
+          assert.equal(hasText(html, message), (failed as readonly string[]).includes(key), `${key} error visibility`);
+        }
+        const retries = actions.buttons.filter(props => props.children === t("common.retry"));
+        assert.equal(retries.length, 1, "one Retry for the failed Home data");
+        retries[0].onClick();
+        for (const key of ["formats", "config"] as const) {
+          const state = client.getQueryCache().find({ queryKey: [key] })!.state;
+          assert.equal(state.fetchStatus, (failed as readonly string[]).includes(key) ? "fetching" : "idle", `${key} refetch`);
+        }
+        await Promise.allSettled(client.getQueryCache().getAll().map(query => query.promise));
+      } finally {
+        client.clear();
+      }
+    });
+  }
+}
+
 test("recent row activation reuses saved-folder and database open flows", async () => {
   renderWelcome("recent");
   actions.opens = []; actions.databases = [];
