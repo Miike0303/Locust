@@ -92,14 +92,16 @@ The release owner performs these steps after candidate verification:
    It checks draft/tag/source SHA, all five manifest platform keys, asset URLs,
    signature shape/equality and changelog-derived notes. It also refuses any
    signature whose key id differs from the public key in `tauri.conf.json`
-   (a wrong or regenerated signing key). It then alone publishes
+   (a wrong or regenerated signing key). Before writing `latest.json` it
+   downloads the five updater artifacts and `scripts/verify-updater-signatures.py`
+   verifies each Ed25519 signature (and its trusted comment) against that public
+   key; a mismatch refuses publication. It then alone publishes
    the draft and marks it latest. Any build, download or verification failure
    leaves the draft unpublished; the existing public latest is unchanged.
    Inspect the resulting release body/assets and record the finalizer outcome.
-5. Verify signatures against the configured public key using supported updater
-   tooling before claiming signing-key correspondence. The key-id check and the
-   offline shape/equality tests do not prove cryptographic validity or that
-   installed apps can update.
+5. The publish job's cryptographic check proves each artifact matches the
+   configured public key; it does not prove that installed apps can update.
+   Exercise an update from an older installation before claiming that.
 6. Record source SHA, CI runs, release runs and observed assets separately.
    Recovery from a failed run may reuse only the matching draft at the same
    candidate SHA. Never move an existing tag or bypass the final inventory gate.

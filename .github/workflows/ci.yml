@@ -80,7 +80,9 @@ jobs:
       - name: Offline updater manifest tests
         env:
           PYTHONDONTWRITEBYTECODE: '1'
-        run: python tools/test_updater_manifest.py
+        run: |
+          python tools/test_updater_manifest.py
+          python tools/test_updater_signatures.py
 
       - name: Browser runner helper tests
         run: node --test tools/test_ui_browser_helpers.mjs
@@ -242,7 +244,9 @@ jobs:
       - name: Offline updater manifest tests
         env:
           PYTHONDONTWRITEBYTECODE: '1'
-        run: python tools/test_updater_manifest.py
+        run: |
+          python tools/test_updater_manifest.py
+          python tools/test_updater_signatures.py
 
       - name: Browser runner helper tests
         run: node --test tools/test_ui_browser_helpers.mjs

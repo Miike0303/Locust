@@ -233,6 +233,16 @@ jobs:
           gh release view "$RELEASE_TAG" --json tagName,targetCommitish,isDraft,isPrerelease > release.json
           python scripts/release-gate.py draft --tag "$RELEASE_TAG" --sha "$RELEASE_SHA" --metadata release.json
 
+      - name: Verify updater signatures cryptographically
+        # Ed25519 against the shipped public key, before latest.json names any artifact.
+        run: |
+          mkdir updater-artifacts
+          gh release download "$RELEASE_TAG" --dir updater-artifacts \
+            --pattern '*_en-US.msi' --pattern '*_en-US.msi.sig' \
+            --pattern '*.app.tar.gz' --pattern '*.app.tar.gz.sig' \
+            --pattern '*.AppImage' --pattern '*.AppImage.sig'
+          python scripts/verify-updater-signatures.py apps/desktop/src-tauri/tauri.conf.json updater-artifacts
+
       - name: Generate and upload strict five-platform manifest
         env:
           # Refuse signatures made with a key other than the shipped public key.
