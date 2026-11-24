@@ -9,6 +9,10 @@ signature must verify with the `plugins.updater.pubkey` in tauri.conf.json:
 Ed25519 over BLAKE2b-512 of the file for prehashed ("ED") signatures, over the
 file itself for legacy ("Ed") ones, plus the global signature over the trusted
 comment. Pure standard library: no package install on the release runner.
+
+Deliberately not checked: the trusted comment's `file:` name (GitHub renames
+assets on upload, for example spaces become dots, so it would refuse genuine
+releases) and legacy "Ed" signatures stay accepted, as the Tauri client does.
 """
 import base64
 import binascii

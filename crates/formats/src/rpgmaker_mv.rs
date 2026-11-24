@@ -2328,7 +2328,21 @@ impl FormatPlugin for RpgMakerMvPlugin {
             MvMzVersion::Mv => {
                 // MV Iavra format: <data>/i18n/{lang}.json, next to the game's
                 // own data (www/data on deployed games, data/ on root layouts).
-                let i18n_dir = data_dir.join("i18n");
+                // With no data folder on disk, a deployed game (www/js) still
+                // gets www/data, never a new top-level data/ outside www/.
+                let i18n_dir = match Self::find_data_dir(game_root) {
+                    Some(dir) => dir,
+                    None if game_root
+                        .join("www")
+                        .join("js")
+                        .join("rpg_core.js")
+                        .is_file() =>
+                    {
+                        game_root.join("www").join("data")
+                    }
+                    None => data_dir.clone(),
+                }
+                .join("i18n");
                 std::fs::create_dir_all(&i18n_dir)?;
                 let lang_file = i18n_dir.join(format!("{}.json", lang));
 
@@ -4861,6 +4875,34 @@ mod tests {
             !game_dir.join("www").exists(),
             "Add must not create a www/ tree for a root-layout MV game"
         );
+    }
+
+    #[test]
+    fn inject_add_deployed_mv_without_data_folder_stays_inside_www() {
+        let game_dir_guard = temp_game_dir();
+        let game_dir = game_dir_guard.path().to_path_buf();
+        fs::create_dir_all(game_dir.join("www").join("js")).unwrap();
+        fs::write(game_dir.join("www").join("js").join("rpg_core.js"), "").unwrap();
+        fs::remove_dir_all(game_dir.join("data")).unwrap();
+        let mut entry = StringEntry::new(
+            "Map001.json#0#event_1#page_0#cmd_3#msg",
+            "Hello there.",
+            game_dir.join("www").join("data").join("Map001.json"),
+        );
+        entry.translation = Some("Hola.".into());
+
+        let plugin = RpgMakerMvPlugin::new();
+        plugin
+            .inject_add(&game_dir, "es", std::slice::from_ref(&entry))
+            .unwrap();
+
+        assert!(game_dir
+            .join("www")
+            .join("data")
+            .join("i18n")
+            .join("es.json")
+            .is_file());
+        assert!(!game_dir.join("data").exists());
     }
 
     #[test]

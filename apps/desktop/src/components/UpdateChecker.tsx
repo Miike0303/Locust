@@ -120,7 +120,9 @@ export default function UpdateChecker() {
 
       let totalBytes = 0;
       let downloaded = 0;
-      await update.downloadAndInstall((ev) => {
+      // Download and install separately: a job may start while the download
+      // runs, and installing (an MSI exits Locust) would cut it short.
+      await update.download((ev) => {
         if (ev.event === "Started") {
           totalBytes = ev.data.contentLength ?? 0;
         } else if (ev.event === "Progress") {
@@ -131,6 +133,11 @@ export default function UpdateChecker() {
           setState({ kind: "installing" });
         }
       });
+      if (await jobIsRunning()) {
+        setState({ kind: "error", messageKey: "update.jobRunning", retry: "install" });
+        return;
+      }
+      await update.install();
 
       installed = true;
       setState({ kind: "installed" });

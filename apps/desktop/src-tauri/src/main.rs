@@ -168,8 +168,9 @@ fn main() {
 
     tauri::Builder::default()
         // First plugin: a second launch hands over to the running window and
-        // exits during setup, before it opens a window or serves any request,
-        // so two processes never edit config.json side by side.
+        // exits during setup, before it opens a window. Its backend has only
+        // opened the databases by then (startup writes no config), so two
+        // processes never edit config.json side by side.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             focus_main_window(app)
         }))

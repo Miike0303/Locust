@@ -1336,6 +1336,30 @@ mod tests {
         };
         let refused = patch("http://localhost:3000").await.unwrap();
         assert_eq!(refused.status(), reqwest::StatusCode::FORBIDDEN);
+        // CORS preflight and WebSocket upgrade from that origin are refused too.
+        let preflight = client
+            .request(reqwest::Method::OPTIONS, format!("{url}/api/config"))
+            .header("origin", "http://localhost:3000")
+            .header("access-control-request-method", "PATCH")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(preflight.status(), reqwest::StatusCode::FORBIDDEN);
+        assert!(preflight
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none());
+        let upgrade = client
+            .get(format!("{url}/api/translate/ws/job-x"))
+            .header("origin", "http://localhost:3000")
+            .header("connection", "upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(upgrade.status(), reqwest::StatusCode::FORBIDDEN);
         let config = state.config.read().await;
         assert_ne!(
             config

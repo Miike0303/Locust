@@ -11,7 +11,7 @@ function deferred<T>() {
 }
 const h = {
   t, states: [] as any[], cursor: 0, effects: [] as (() => void)[], logs: [] as any[],
-  checks: 0, downloads: 0, relaunches: 0,
+  checks: 0, downloads: 0, installs: 0, relaunches: 0,
   check: null as null | (() => Promise<any>), install: null as null | (() => Promise<void>),
   restart: null as null | (() => Promise<void>), event: null as null | ((event: any) => void),
   jobs: null as null | (() => Promise<any>), jobQueries: 0,
@@ -35,7 +35,7 @@ const hooks = registerHooks({
         "../lib/i18n": "export const t=h.t;export const useT=()=>h.t;",
         "../stores/logStore": "export const addLog=(...args)=>h.logs.push(args);",
         "../lib/api": "export const getActiveJobs=async()=>{h.jobQueries++;return h.jobs?h.jobs():{translation:null,patches:[]};};",
-        "@tauri-apps/plugin-updater": "export const check=async()=>{h.checks++;return h.check?h.check():{version:'9.0.0',body:'Release notes',downloadAndInstall:async event=>{h.downloads++;h.event=event;await h.install?.();}};};",
+        "@tauri-apps/plugin-updater": "export const check=async()=>{h.checks++;return h.check?h.check():{version:'9.0.0',body:'Release notes',download:async event=>{h.downloads++;h.event=event;await h.install?.();},install:async()=>{h.installs++;}};};",
         "@tauri-apps/plugin-process": "export const relaunch=async()=>{h.relaunches++;await h.restart?.();};",
       };
       if (stubs[specifier]) return { shortCircuit: true, url: `data:text/javascript,${encodeURIComponent("const h=globalThis.__updater;" + stubs[specifier])}` };
@@ -47,7 +47,7 @@ const { default: UpdateChecker, triggerUpdateCheck, requestUpdateCheck } = await
 after(() => { hooks.deregister(); Reflect.deleteProperty(globalThis, "__updater"); setLocale("en"); });
 beforeEach(() => {
   h.states = []; h.cursor = 0; h.effects = []; h.logs = [];
-  h.checks = 0; h.downloads = 0; h.relaunches = 0;
+  h.checks = 0; h.downloads = 0; h.installs = 0; h.relaunches = 0;
   h.check = null; h.install = null; h.restart = null; h.event = null;
   h.jobs = null; h.jobQueries = 0;
   setLocale("en");
@@ -89,7 +89,7 @@ test("repeated clicks synchronously claim one operation before the second check 
   await flush();
   const checks = h.checks;
   const busyText = text(render());
-  pending.resolve({ downloadAndInstall: async () => { h.downloads++; } });
+  pending.resolve({ download: async () => { h.downloads++; }, install: async () => { h.installs++; } });
   await Promise.all(operations);
   assert.equal(checks, 2, "one mount check and one download check");
   assert.ok(busyText.includes(t("update.downloading")));
@@ -297,6 +297,23 @@ test("a running patch job holds a restart retry without reinstalling", async () 
   await button(render(), t("update.restart" as any)).props.onClick();
   assert.equal(h.downloads, 1);
   assert.equal(h.relaunches, 2);
+});
+
+test("a job that starts during the download holds the install and nothing is installed", async () => {
+  let queries = 0;
+  h.jobs = async () => (++queries === 1
+    ? { translation: null, patches: [] }
+    : { translation: "started-during-download", patches: [] });
+  await button(await available(), t("update.download")).props.onClick();
+  assert.equal(h.downloads, 1);
+  assert.equal(h.installs, 0, "the downloaded update was not installed");
+  assert.equal(h.relaunches, 0);
+  const held = render();
+  assert.ok(text(held).includes(t("update.jobRunning" as any)));
+  h.jobs = null;
+  await button(held, t("common.retry")).props.onClick();
+  assert.equal(h.installs, 1);
+  assert.equal(h.relaunches, 1);
 });
 
 test("an unreachable backend does not block installing the update", async () => {

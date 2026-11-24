@@ -395,6 +395,8 @@ async fn poll_for_token_with_timeout(
                 expires_at: now_secs() + tr.expires_in,
             };
             save_tokens(&store)?;
+            // A new login supersedes any pair kept from a failed refresh write.
+            *UNSAVED_TOKENS.lock().unwrap_or_else(|e| e.into_inner()) = None;
             return Ok(PollOutcome::Complete(store));
         }
 
@@ -804,6 +806,20 @@ mod tests {
         }
         let loaded = load_tokens().expect("tokens persisted");
         assert_eq!(loaded.access_token, "access-xyz");
+
+        // A pair kept from a failed refresh write never outranks a new login,
+        // even when it would expire later.
+        *UNSAVED_TOKENS.lock().unwrap() = Some(TokenStore {
+            access_token: "stale-unsaved-access".into(),
+            refresh_token: "stale-unsaved-refresh".into(),
+            expires_at: now_secs() + 86_400,
+        });
+        assert!(matches!(
+            poll_for_token_at(&token_url, &ok).await.unwrap(),
+            PollOutcome::Complete(_)
+        ));
+        assert!(unsaved_tokens().is_none());
+        assert_eq!(current_tokens().unwrap().access_token, "access-xyz");
         set_token_path_override(None);
     }
 
