@@ -1,6 +1,6 @@
 # UI/UX check with Fable 5.2 (2026-11-09): findings queued for the next session
 
-Objective: fix the UI/UX findings below. Status: in progress on branch `fix/ui-ux-fable-2026-11-09` (owner 2026-11-24: "haz eso"); see Tasks.
+Objective: fix the UI/UX findings below. Status: **done**, delivered to `main` at `c901045` after CI 45472800819 (owner 2026-11-24: "haz eso"); see Tasks and Log.
 Source: three read-only Fable 5.2 reviewers on the 0.3.0 release build (`main` code `777998c`). Two looked at 44 real production captures (`tools/capture_ui.mjs`, 11 scenarios x EN/ES x 1440x900 and 1024x700); the third read the code of the views without captures. Nobody ran the app. Not reviewed: Pivot modal, Patch Pack tab internals; Translate, Inject, Patch and Queue modals at 900x600; expanded sidebar.
 Paths are under `apps/desktop/src/` unless stated. Line numbers are as of `777998c`; re-check before editing.
 
@@ -75,3 +75,4 @@ After each task: `npm --prefix apps/desktop run build`, `npm run test:unit` in `
 - L4 (owner, 2026-11-24, after the queue was proposed starting with S1): "haz eso". S34 moved into T1 because it lives in the same file. Captures are deferred to the end of the queue instead of after each task (one capture run covers all views).
 - L5 (2026-11-24): all six tasks committed. `node tools/capture_ui.mjs` (debug CLI, production frontend build) first failed on the import scenario because T2 changed the dialog on purpose (Apply reads "Replace N translations", one scroller, the stale action moved to the footer); the runner was updated to match. Rerun: 44/44 captures, 132/132 checks, EN and ES, 1440x900 and 1024x700. Parent visually checked the ES import-replace and warning-toast captures. Not verified: native Tauri window, real games.
 - L6 (2026-11-24): CI 45467048903 on `466a0c0` failed only `Production browser lifecycle` on both platforms ("Timed out: UI response /api/patch/rollback"): S15 made Rollback ask for a destructive confirmation, which `tools/ui_release_lifecycle.mjs` did not click. Runner updated to confirm in the topmost dialog; local run passed all 10 stages. Steps after that one did not run in CI and are covered by the rerun.
+- L7 (2026-11-24): CI 45472800819 on `c901045` passed check, check-windows and dependency-audit; `main` fast-forwarded to `c901045` (non-force, remote readback matches). Owner asked to update the local app: release `target/release/locust-desktop.exe` (desktop shortcut target) rebuilt from `466a0c0` (app code identical to `c901045`), startup self-test passed.
