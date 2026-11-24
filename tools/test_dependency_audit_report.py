@@ -127,5 +127,19 @@ class WorkflowPolicyTests(unittest.TestCase):
             self.assertEqual(required.count(f"- name: {gate}\n"), 2, gate)
 
 
+    def test_actions_are_pinned_to_commits_and_ci_token_is_read_only(self):
+        workflows = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
+        self.assertTrue(workflows)
+        for workflow in workflows:
+            for line in workflow.read_text(encoding="utf-8").splitlines():
+                if "uses:" not in line:
+                    continue
+                # A tag or branch can be moved to new code; a full commit SHA cannot.
+                self.assertRegex(line.strip(), r"^(- )?uses: [\w.-]+/[\w.-]+@[0-9a-f]{40} # \S+$",
+                                 f"{workflow.name}: {line.strip()}")
+        ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        top_level = ci.split("\njobs:\n", 1)[0]
+        self.assertIn("\npermissions:\n  contents: read\n", top_level)
+
 if __name__ == "__main__":
     unittest.main()
