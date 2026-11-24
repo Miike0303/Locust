@@ -494,6 +494,25 @@ async function click(label: string) {
   control.props.onClick();
   await flush();
 }
+function buttonWithText(label: string) {
+  const control = nodes(render()).find(node => node.type === "button" && text(node) === label);
+  assert.ok(control, label);
+  return control;
+}
+/** Apply import, whichever label it shows: replace mode names the replaced count. */
+function applyButton() {
+  const labels = [t("export.preview.apply"), ...[1, 2, 3].map(count => t("export.preview.applyReplace", { count }))];
+  const control = nodes(render()).find(node => node.type === "button" && labels.includes(text(node)));
+  assert.ok(control, "apply import");
+  return control;
+}
+/** Preview counts as rendered: [label, value, className of the value]. */
+function previewCounts(tree: any) {
+  const all = nodes(tree);
+  const values = all.filter(node => node.type === "dd");
+  return all.filter(node => node.type === "dt").map((dt, index) =>
+    [text(dt), text(values[index]), String(values[index]?.props.className ?? "")]);
+}
 function radio(keep: boolean) {
   const label = nodes(render()).find(node => node.type === "label" && text(node) === t(keep ? "export.preview.keep" : "export.preview.replace"));
   assert.ok(label);
@@ -525,12 +544,17 @@ for (const locale of ["en", "es"] as const) {
         await click("export.preview.action");
         assert.equal(h.imported, 0);
         assert.equal(h.closed, 0);
-        assert.ok(text(render()).includes(t("export.preview.kept", { count: 1 })));
         assert.ok(text(render()).includes(t("export.preview.staleSources", { count: 4 })));
         const live = nodes(render()).find(node => node.props?.["aria-live"] === "polite");
         assert.equal(live.props["aria-atomic"], "true");
-        assert.ok(text(live).includes(t("export.preview.summary", { fill: 1, replace: 0, unchanged: 2, unknown: 3 })));
+        // Each count is labelled on its own row instead of one cryptic sentence.
+        assert.deepEqual(previewCounts([live]).map(([label, value]) => [label, value]), [
+          [t("export.preview.count.fill"), "1"], [t("export.preview.count.replace"), "0"],
+          [t("export.preview.count.unchanged"), "2"], [t("export.preview.count.unknown"), "3"],
+          [t("export.preview.count.kept"), "1"],
+        ]);
         assert.equal(button("export.preview.apply").props.disabled, false);
+        assert.ok(!button("export.preview.apply").props.className.includes("bg-danger"));
         radio(false).props.onChange();
         assert.equal(button("export.preview.apply").props.disabled, true);
         await flush();
@@ -539,11 +563,21 @@ for (const locale of ["en", "es"] as const) {
         assert.ok(text(tree).includes("Reviewer replacement"));
         assert.ok(text(tree).includes("scenarios/Scene 1_日本語.rpy"));
         assert.ok(text(tree).includes(t("export.preview.truncated", { count: 1 })));
-        assert.ok(!text(tree).includes(t("export.preview.kept", { count: 1 })));
+        assert.ok(!previewCounts(tree).some(([label]) => label === t("export.preview.count.kept")));
+        // Replacing existing work is flagged as destructive.
+        const [, replaced, replacedClass] = previewCounts(tree).find(([label]) => label === t("export.preview.count.replace"))!;
+        assert.equal(replaced, "1");
+        assert.ok(replacedClass.includes("text-warning"), replacedClass);
+        const applyReplace = buttonWithText(t("export.preview.applyReplace", { count: 1 }));
+        assert.ok(applyReplace.props.className.includes("bg-danger"), applyReplace.props.className);
         assert.ok(nodes(tree).some(node => node.props?.status === "reviewed"));
         assert.ok(nodes(tree).some(node => node.type === "thead" && node.props.className.includes("sticky")));
-        assert.ok(nodes(tree).some(node => node.props?.role === "region" && node.props.tabIndex === 0 && node.props.className.includes("max-h-64")));
-        await click("export.preview.apply");
+        // One scroller: the modal body. The replacement table no longer nests its own.
+        const region = nodes(tree).find(node => node.props?.role === "region");
+        assert.ok(region);
+        assert.equal(region.props.tabIndex, undefined);
+        assert.ok(!/max-h-|overflow-(auto|y-auto|scroll)/.test(region.props.className), region.props.className);
+        applyReplace.props.onClick(); await flush();
         assert.equal(h.imported, 1);
         assert.equal(h.closed, 1);
         if (native) {
@@ -579,15 +613,24 @@ for (const locale of ["en", "es"] as const) {
         const checkbox = () => nodes(render()).find(node => node.type === "input" && node.props.type === "checkbox");
         assert.equal(checkbox().props.checked, false);
         assert.ok(text(render()).includes(t("export.preview.confirmLanguage")));
-        assert.ok(text(render()).includes(t("export.preview.languageUndeclared", {
-          language: t("export.targetLang"), declared: t("export.preview.languageUnknown"), expected: "es",
-        })));
+        // Nothing declared: say so plainly, without an empty "(not declared)" parenthesis.
+        assert.ok(text(render()).includes(t("export.preview.languageUndeclaredNone", { language: t("export.targetLang") })));
+        assert.ok(!text(render()).includes(`(${t("export.preview.languageUnknown")})`));
+        // The confirmation sits in a warning callout, and the disabled Apply says why.
+        const tree = render();
+        const box = nodes(tree).find(node => node.type === "input" && node.props.type === "checkbox");
+        const callout = nodes(tree).filter(node => node.type === "div" && nodes(node.props.children).includes(box)).slice(-1)[0];
+        assert.ok(String(callout?.props.className).includes("border-warning"), callout?.props.className);
+        const hint = () => nodes(render()).find(node => node.type === "p" && text(node) === t("export.preview.confirmFirst"));
+        assert.ok(hint());
+        assert.equal(button("export.preview.apply").props["aria-describedby"], hint().props.id);
         // The handler also enforces confirmation if called without a DOM click.
         await button("export.preview.apply").props.onClick(); await flush();
         assert.equal(h.calls.filter(call => call.command === "apply_import_preview").length, 0);
         assert.equal(h.bodies.filter(body => body.path.endsWith("/apply")).length, 0);
         checkbox().props.onChange({ target: { checked: true } });
         assert.equal(button("export.preview.apply").props.disabled, false);
+        assert.equal(hint(), undefined);
         checkbox().props.onChange({ target: { checked: false } });
         assert.equal(button("export.preview.apply").props.disabled, true);
         checkbox().props.onChange({ target: { checked: true } });
@@ -630,7 +673,7 @@ for (const native of [true, false]) {
     checkbox().props.onChange({ target: { checked: true } });
     radio(false).props.onChange(); await flush();
     assert.equal(checkbox().props.checked, false);
-    assert.equal(button("export.preview.apply").props.disabled, true);
+    assert.equal(applyButton().props.disabled, true);
   });
 }
 
@@ -641,7 +684,12 @@ for (const native of [true, false]) {
     await click("export.preview.apply");
     assert.equal(h.imported, 0); assert.equal(h.closed, 0);
     assert.equal(button("export.preview.apply").props.disabled, true);
-    assert.ok(nodes(render()).some(node => node.props?.role === "alert" && text(node).includes(t("export.preview.stale"))));
+    const alert = nodes(render()).find(node => node.props?.role === "alert" && text(node).includes(t("export.preview.stale")));
+    assert.ok(alert);
+    // A stale preview is a warning with one way forward, not a danger state with two buttons.
+    assert.ok(alert.props.className.includes("border-warning") && !alert.props.className.includes("danger"), alert.props.className);
+    assert.equal(nodes(render()).filter(node => node.type === "button" && text(node) === t("export.preview.again")).length, 1);
+    assert.equal(nodes(render()).filter(node => node.type === "button" && text(node) === t("export.preview.action")).length, 0);
     h.failure = "";
     await click("export.preview.again");
     assert.equal(button("export.preview.apply").props.disabled, false);
@@ -668,9 +716,9 @@ test("out-of-order radio previews cannot restore an obsolete token", async () =>
   await flush();
   assert.equal(pending.length, 2);
   pending[1](importPreview(false)); await flush();
-  assert.equal(button("export.preview.apply").props.disabled, false);
+  assert.equal(applyButton().props.disabled, false);
   pending[0](importPreview(true)); await flush();
-  await click("export.preview.apply");
+  applyButton().props.onClick(); await flush();
   assert.equal(h.calls.find(call => call.command === "apply_import_preview")?.args.planToken, "replace-plan");
 });
 
@@ -681,7 +729,7 @@ test("an obsolete apply handler cannot use a token after synchronous invalidatio
   oldApply();
   await flush();
   assert.ok(!h.calls.some(call => call.command === "apply_import_preview"));
-  assert.equal(button("export.preview.apply").props.disabled, false);
+  assert.equal(applyButton().props.disabled, false);
 });
 
 test("apply consumes the preview before another click can submit it", async () => {
@@ -707,7 +755,7 @@ test("format, database, close and mode changes discard in-flight previews", asyn
     if (change === "mode") await click("export.import");
     else render();
     assert.equal(button("export.preview.apply").props.disabled, true, change);
-    assert.ok(!text(render()).includes(t("export.preview.kept", { count: 1 })), change);
+    assert.equal(previewCounts(render()).length, 0, change);
   }
 });
 

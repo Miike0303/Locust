@@ -57,8 +57,8 @@ Export modal in both languages and sizes; no unreachable content or action at 10
 
 ## Tasks
 
-- T1 | S1, S34 | inline | done (commit below) | API key blur keeps the saved key, explicit Remove key, labelled inputs, Test disabled while testing, full error text. RED 5/6 -> GREEN 6/6 (`ProvidersSection.test.tsx`); frontend 1713/0, build ok. Pinned handler hash in `settingsDesign.test.ts` updated on purpose.
-- T2 | S2, S3, S6, S10, S24 | inline | pending | Import dialog.
+- T1 | S1, S34 | inline | done `8c2f832` | API key blur keeps the saved key, explicit Remove key, labelled inputs, Test disabled while testing, full error text. RED 5/6 -> GREEN 6/6 (`ProvidersSection.test.tsx`); frontend 1713/0, build ok. Pinned handler hash in `settingsDesign.test.ts` updated on purpose.
+- T2 | S2, S3, S6, S10, S24 | inline | done (commit below) | Import dialog: labelled count rows replace the one-line summary; replace mode shows the count in warning colour and a destructive "Replace N translations" button; the language confirmation sits in a warning callout, "not declared" no longer repeats in parentheses, and a hint next to Apply says why it is disabled; one scroller (the modal body) with a sticky table head; a stale preview is a warning with one action (the footer button reads "Preview again"). RED 26 failing -> GREEN 80/80 (`ExportModal.test.tsx`, existing assertions updated where the requested behaviour changed); frontend 1713/0, build ok.
 - T3 | S4, S5, S7, S8, S11, S12, S27, S29, S30 | inline | pending | Editor chrome and compact layout.
 - T4 | S13, S14, S32, S33 | inline | pending | Keyboard and shortcuts.
 - T5 | S15, S16, S19, S21, S22 | inline | pending | Destructive actions and dialogs.

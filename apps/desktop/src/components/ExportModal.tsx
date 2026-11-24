@@ -297,6 +297,11 @@ export default function ExportModal({
 		}
 	};
 
+	// Replacing existing translations is the destructive outcome of an import.
+	const replacing = !keepExisting && !!preview && preview.replace > 0;
+	const needsLanguageConfirmation = mode === "import" && !!preview
+		&& preview.languages.requires_confirmation && !allowUndeclaredLanguage;
+
 	return (
 		<div className={MODAL_BACKDROP_CLASS}>
 			<div
@@ -467,29 +472,49 @@ export default function ExportModal({
 							<div role="status" aria-live="polite" aria-atomic="true">
 								{previewing && <p className="text-body text-text-muted">{t("export.preview.loading")}</p>}
 								{preview && <div className="rounded border border-border bg-surface-muted p-3 text-body">
-									<p>{t("export.preview.summary", { fill: preview.fill, replace: preview.replace, unchanged: preview.unchanged, unknown: preview.unknown_ids })}
-										{keepExisting && ` · ${t("export.preview.kept", { count: preview.kept_existing })}`}</p>
+									<dl className="grid grid-cols-[1fr_auto] gap-x-4 gap-y-1">
+										{([
+											["export.preview.count.fill", preview.fill, false],
+											["export.preview.count.replace", preview.replace, replacing],
+											["export.preview.count.unchanged", preview.unchanged, false],
+											["export.preview.count.unknown", preview.unknown_ids, false],
+											...(keepExisting ? [["export.preview.count.kept", preview.kept_existing, false] as const] : []),
+										] as const).map(([label, value, destructive]) => (
+											<div key={label} className="contents">
+												<dt className="text-text-muted">{t(label)}</dt>
+												<dd className={clsx("text-right tabular-nums font-medium", destructive ? "text-warning" : "text-text")}>{value}</dd>
+											</div>
+										))}
+									</dl>
 									{preview.stale_sources > 0 && <p className="mt-1 text-caption">{t("export.preview.staleSources", { count: preview.stale_sources })}</p>}
-									{preview.languages.warnings.map(warning => <p key={`${warning.side}-${warning.code}`} className="mt-2 text-caption">
-										{t(warning.code === "region" ? "export.preview.languageRegion" : warning.code === "project_undeclared" ? "export.preview.projectLanguageUnknown" : "export.preview.languageUndeclared", {
-											language: t(warning.side === "source" ? "export.sourceLang" : "export.targetLang"),
-											declared: warning.declared.filter(Boolean).join(", ") || t("export.preview.languageUnknown"),
-											expected: warning.expected ?? t("export.preview.languageUnknown"),
-										})}
-									</p>)}
+									{preview.languages.warnings.map(warning => {
+										const language = t(warning.side === "source" ? "export.sourceLang" : "export.targetLang");
+										const declared = warning.declared.filter(Boolean).join(", ");
+										return <p key={`${warning.side}-${warning.code}`} className="mt-2 text-caption">
+											{warning.code === "undeclared" && !declared
+												? t("export.preview.languageUndeclaredNone", { language })
+												: t(warning.code === "region" ? "export.preview.languageRegion" : warning.code === "project_undeclared" ? "export.preview.projectLanguageUnknown" : "export.preview.languageUndeclared", {
+													language,
+													declared: declared || t("export.preview.languageUnknown"),
+													expected: warning.expected ?? t("export.preview.languageUnknown"),
+												})}
+										</p>;
+									})}
 								</div>}
 							</div>
-							{preview?.languages.requires_confirmation && <label className="flex items-center gap-2 text-body">
-								<input type="checkbox" checked={allowUndeclaredLanguage} disabled={loading || previewing}
-									onChange={event => setAllowUndeclaredLanguage(event.target.checked)}
-									className="focus:outline-none focus:ring-2 focus:ring-accent-fg" />
-								{t("export.preview.confirmLanguage")}
-							</label>}
+							{preview?.languages.requires_confirmation && <div className="rounded border border-warning bg-warning-muted p-3">
+								<label className="flex items-center gap-2 text-body font-medium text-text">
+									<input type="checkbox" checked={allowUndeclaredLanguage} disabled={loading || previewing}
+										onChange={event => setAllowUndeclaredLanguage(event.target.checked)}
+										className="focus:outline-none focus:ring-2 focus:ring-accent-fg" />
+									{t("export.preview.confirmLanguage")}
+								</label>
+							</div>}
 							{preview && preview.replacements.length > 0 && <div>
-								<div className="max-h-64 overflow-auto rounded border border-border" role="region" aria-label={t("export.preview.replacements")} tabIndex={0}>
+								<div className="rounded border border-border" role="region" aria-label={t("export.preview.replacements")}>
 									<table className="w-full table-fixed text-left text-body">
 										<caption className="sr-only">{t("export.preview.replacements")}</caption>
-										<thead className="sticky top-0 bg-surface-muted"><tr>
+										<thead className="sticky top-0 z-10 bg-surface-muted"><tr>
 											<th scope="col" className="w-1/4 p-2 font-medium">{t("export.scope.file")}</th>
 											<th scope="col" className="p-2 font-medium">{t("export.preview.previous")}</th>
 											<th scope="col" className="p-2 font-medium">{t("export.preview.new")}</th>
@@ -503,10 +528,10 @@ export default function ExportModal({
 								</div>
 							</div>}
 							{preview?.truncated && <p className="text-caption text-text-muted">{t("export.preview.truncated", { count: preview.replacements.length })}</p>}
-							{importError && <div role="alert" className="rounded border border-danger bg-danger-muted p-3 text-body text-danger">
+							{/* A stale plan is recoverable: warn and leave one way forward, the footer's preview button. */}
+							{importError && <div role="alert" className={clsx("rounded border p-3 text-body",
+								stalePlan ? "border-warning bg-warning-muted text-text" : "border-danger bg-danger-muted text-danger")}>
 								<p>{importError}</p>
-								{stalePlan && <button type="button" onClick={() => { void runPreview(); }} disabled={previewing || loading}
-									className="mt-2 rounded underline underline-offset-2 focus:outline-none focus:ring-2 focus:ring-accent-fg disabled:opacity-50">{t("export.preview.again")}</button>}
 							</div>}
 						</>
 					)}
@@ -535,14 +560,19 @@ export default function ExportModal({
 					>
 						{t("common.cancel")}
 					</button>
+					{needsLanguageConfirmation && <p id={`${scopeId}-apply-hint`} className="mr-auto self-center text-caption text-warning">
+						{t("export.preview.confirmFirst")}
+					</p>}
 					{mode === "import" && <button type="button" onClick={() => { void runPreview(); }} disabled={!importSource || previewing || loading}
 						className={clsx("px-4 py-2 text-body font-medium rounded focus:outline-none focus:ring-2 focus:ring-accent-fg disabled:opacity-50",
 							preview ? "border border-border bg-surface text-text hover:bg-surface-muted" : "bg-accent hover:bg-accent-hover text-white")}>
-						{previewing ? t("export.preview.loading") : t("export.preview.action")}
+						{previewing ? t("export.preview.loading") : stalePlan ? t("export.preview.again") : t("export.preview.action")}
 					</button>}
-					{mode === "import" && <button type="button" onClick={() => { void handleApplyImport(); }} disabled={!preview || previewing || loading || (preview.languages.requires_confirmation && !allowUndeclaredLanguage)}
-						className="px-4 py-2 text-body font-medium rounded bg-accent hover:bg-accent-hover disabled:opacity-50 text-white focus:outline-none focus:ring-2 focus:ring-accent-fg">
-						{loading ? t("export.importing") : t("export.preview.apply")}
+					{mode === "import" && <button type="button" onClick={() => { void handleApplyImport(); }} disabled={!preview || previewing || loading || needsLanguageConfirmation}
+						aria-describedby={needsLanguageConfirmation ? `${scopeId}-apply-hint` : undefined}
+						className={clsx("px-4 py-2 text-body font-medium rounded disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-accent-fg",
+							replacing ? "bg-danger text-danger-contrast hover:bg-danger/90" : "bg-accent hover:bg-accent-hover text-white")}>
+						{loading ? t("export.importing") : replacing ? t("export.preview.applyReplace", { count: preview!.replace }) : t("export.preview.apply")}
 					</button>}
 					{mode === "export" && <button
 						onClick={() => {
