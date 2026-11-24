@@ -84,6 +84,44 @@ fn save_tokens(tokens: &TokenStore) -> Result<()> {
     save_tokens_with(tokens, |file, bytes| file.write_all(bytes))
 }
 
+/// A refreshed pair whose write to `token_path()` failed. xAI rotates the
+/// refresh token, so rereading the stale file would hand back a token the
+/// server may already have retired; the process keeps the new pair instead.
+static UNSAVED_TOKENS: std::sync::Mutex<Option<TokenStore>> = std::sync::Mutex::new(None);
+
+fn unsaved_tokens() -> Option<TokenStore> {
+    UNSAVED_TOKENS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Newest pair this process knows: the token file, or a refreshed pair that
+/// could not be written. A later login on disk (longer expiry) still wins.
+fn current_tokens() -> Option<TokenStore> {
+    match (load_tokens(), unsaved_tokens()) {
+        (Some(disk), Some(unsaved)) if unsaved.expires_at > disk.expires_at => Some(unsaved),
+        (Some(disk), _) => Some(disk),
+        (None, unsaved) => unsaved,
+    }
+}
+
+/// Persist a refreshed pair; on failure keep it for this process and warn.
+fn keep_refreshed_tokens(store: &TokenStore) {
+    let saved = save_tokens(store);
+    let mut unsaved = UNSAVED_TOKENS.lock().unwrap_or_else(|e| e.into_inner());
+    match saved {
+        Ok(()) => *unsaved = None,
+        Err(error) => {
+            tracing::warn!(
+                "could not save refreshed xAI tokens to {}: {error}; keeping them in memory until Locust closes",
+                token_path().display()
+            );
+            *unsaved = Some(store.clone());
+        }
+    }
+}
+
 fn save_tokens_with(
     tokens: &TokenStore,
     write: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
@@ -489,7 +527,7 @@ async fn refresh_with_endpoint(
             .unwrap_or_else(|| tokens.refresh_token.clone()),
         expires_at: now_secs() + tr.expires_in,
     };
-    save_tokens(&store)?;
+    keep_refreshed_tokens(&store);
     Ok(store)
 }
 
@@ -513,7 +551,7 @@ impl GrokSubscriptionProvider {
         // Re-read after acquiring the gate so later batches see the new token.
         static REFRESH_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
         let guard = REFRESH_GATE.lock().await;
-        let tokens = load_tokens().ok_or_else(|| {
+        let tokens = current_tokens().ok_or_else(|| {
             LocustError::ProviderError(
                 "not logged in to xAI — run `locust auth grok` first".to_string(),
             )
@@ -785,6 +823,7 @@ mod tests {
                 .unwrap();
             let path = directory.path().join("fixture.json");
             set_token_path_override(Some(path.clone()));
+            *UNSAVED_TOKENS.lock().unwrap_or_else(|e| e.into_inner()) = None;
             let fixture = Self {
                 tokens: TokenStore {
                     access_token: "access-sentinel-keep-secret".to_string(),
@@ -1205,6 +1244,67 @@ mod tests {
         assert_eq!(saved.access_token, refreshed.access_token);
         assert_eq!(saved.refresh_token, refreshed.refresh_token);
         assert_eq!(saved.expires_at, refreshed.expires_at);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn rotated_tokens_survive_a_failed_token_file_write_for_this_process() {
+        let fixture = RefreshFixture::new();
+        let original = std::fs::read(&fixture.path).unwrap();
+        // A file where the token directory should be: the write cannot succeed.
+        let blocker = fixture.path.parent().unwrap().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        set_token_path_override(Some(blocker.join("xai-oauth.json")));
+        let server = MockServer::start();
+        let rotation = server.mock(|when, then| {
+            when.method(POST)
+                .path("/oauth2/token")
+                .body_contains(format!("refresh_token={}", fixture.tokens.refresh_token));
+            then.status(200).json_body(serde_json::json!({
+                "access_token": "rotated-access-sentinel",
+                "refresh_token": "rotated-refresh-sentinel",
+                "expires_in": 7200
+            }));
+        });
+        let url = server.url("/oauth2/token");
+        let client = reqwest::Client::new();
+
+        let refreshed = refresh_with_endpoint(&fixture.tokens, &url, &client)
+            .await
+            .expect("a refresh whose write failed still returns the new pair");
+        rotation.assert();
+        assert_eq!(refreshed.refresh_token, "rotated-refresh-sentinel");
+        let current = current_tokens().expect("the rotated pair is kept in memory");
+        assert_eq!(current.refresh_token, "rotated-refresh-sentinel");
+        assert_eq!(current.access_token, "rotated-access-sentinel");
+
+        // The stale file on disk does not win over the newer in-memory pair.
+        set_token_path_override(Some(fixture.path.clone()));
+        assert_eq!(std::fs::read(&fixture.path).unwrap(), original);
+        let current = current_tokens().unwrap();
+        assert_eq!(current.refresh_token, "rotated-refresh-sentinel");
+
+        // The next successful write makes the file authoritative again.
+        let next = server.mock(|when, then| {
+            when.method(POST)
+                .path("/oauth2/token")
+                .body_contains("refresh_token=rotated-refresh-sentinel");
+            then.status(200).json_body(serde_json::json!({
+                "access_token": "second-access-sentinel",
+                "refresh_token": "second-refresh-sentinel",
+                "expires_in": 7200
+            }));
+        });
+        let second = refresh_with_endpoint(&current, &url, &client)
+            .await
+            .unwrap();
+        next.assert();
+        assert_eq!(
+            load_tokens().unwrap().refresh_token,
+            second.refresh_token,
+            "the second pair was written to disk"
+        );
+        assert!(unsaved_tokens().is_none());
     }
 
     #[tokio::test]
