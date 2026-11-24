@@ -54,7 +54,8 @@ const hooks = registerHooks({
   },
 });
 (globalThis as any).__speakersClient = client;
-const { default: Speakers } = await import("./Speakers.tsx");
+const { default: Speakers, forgetSpeakerNoteDrafts } = await import("./Speakers.tsx");
+const { default: ConfirmDialog } = await import("../components/ConfirmDialog.tsx");
 function expand(node: any, scope = "root"): any {
   if (!node || typeof node !== "object") return node;
   if (Array.isArray(node)) return node.map(n => expand(n, scope));
@@ -93,7 +94,12 @@ function select(id = "opaque:a") {
 }
 function edit(value: string) { nodes(tree()).find(n => n.type === "textarea").props.onChange({ target: { value } }); }
 function seed(data = groups) { client.setQueryData(["speakers", draftProjectKey(h.project!)], data); }
-beforeEach(() => { client.clear(); h.states.clear(); h.project = project; h.calls = []; h.queries = []; h.ids = []; h.destination = ""; h.fail = false; h.defer = false; h.finish = null; setLocale("en"); });
+function clearConfirm() {
+  const dialog = nodes(tree()).find(n => n.type === ConfirmDialog);
+  assert.ok(dialog, "clearing a saved note has a confirmation");
+  return dialog;
+}
+beforeEach(() => { forgetSpeakerNoteDrafts(); client.clear(); h.states.clear(); h.project = project; h.calls = []; h.queries = []; h.ids = []; h.destination = ""; h.fail = false; h.defer = false; h.finish = null; setLocale("en"); });
 after(() => { hooks.deregister(); client.clear(); Reflect.deleteProperty(globalThis, "__speakersTest"); Reflect.deleteProperty(globalThis, "__speakersClient"); setLocale("en"); });
 
 for (const locale of ["en", "es"] as const) {
@@ -133,7 +139,8 @@ test("note save, clear, pending and failure retain exact opaque ownership and dr
   assert.deepEqual(h.calls[0], { database_path: project.database_path, project_path: project.path, format_id: "renpy", speaker_id: "opaque:a", note: "New note" });
   assert.ok(html().includes(t("speakers.saved")));
   h.defer = false;
-  await button("speakers.clear").props.onClick();
+  button("speakers.clear").props.onClick();
+  await clearConfirm().props.onConfirm();
   assert.equal(h.calls[h.calls.length - 1].note, "");
   assert.match(html(), /<textarea[^>]*><\/textarea>/);
   edit("Retain on failure"); h.fail = true;
@@ -259,4 +266,62 @@ test("speaker route/navigation are additive and preserve previous destinations a
   for (const [path, label] of [["/", "home"], ["/dashboard", "dashboard"], ["/editor", "editor"], ["/review", "review"], ["/qa", "qa"], ["/memory", "memory"], ["/settings", "settings"], ["/speakers", "speakers"]]) {
     assert.match(layout, new RegExp(`to: "${path}"[^\\n]*labelKey: "nav.${label}"`));
   }
+});
+
+for (const locale of ["en", "es"] as const) {
+  test(`${locale}: clearing a saved note needs a destructive confirmation`, async () => {
+    setLocale(locale); seed(); select(); edit("Draft before clearing");
+    assert.equal(clearConfirm().props.open, false);
+    button("speakers.clear").props.onClick();
+    let dialog = clearConfirm();
+    assert.equal(dialog.props.open, true);
+    assert.equal(dialog.props.destructive, true);
+    assert.equal(dialog.props.title, t("speakers.clearConfirm.title"));
+    assert.equal(dialog.props.message, t("speakers.clearConfirm.message", { name: "Alice" }));
+    assert.equal(dialog.props.confirmLabel, t("speakers.clear"));
+    dialog.props.onCancel();
+    assert.equal(clearConfirm().props.open, false);
+    assert.equal(h.calls.length, 0, "cancel keeps the saved note");
+    assert.equal(nodes(tree()).find(n => n.type === "textarea").props.value, "Draft before clearing");
+    button("speakers.clear").props.onClick();
+    dialog = clearConfirm();
+    await dialog.props.onConfirm();
+    assert.equal(h.calls.length, 1);
+    assert.equal(h.calls[0].speaker_id, "opaque:a");
+    assert.equal(h.calls[0].note, "");
+    assert.equal(clearConfirm().props.open, false);
+  });
+}
+
+test("the selected speaker has a visible pressed state", () => {
+  seed();
+  const speakerButtons = () => nodes(tree()).filter(n => n.type === "button" && String(n.key).startsWith("opaque:"));
+  const [a, b] = speakerButtons();
+  assert.equal(a.props.className, b.props.className, "nothing is selected yet");
+  select("opaque:b");
+  const [unselected, selected] = speakerButtons();
+  assert.equal(selected.props["aria-pressed"], true);
+  assert.equal(unselected.props["aria-pressed"], false);
+  assert.notEqual(selected.props.className, unselected.props.className, "selection is visible, not only announced");
+  assert.match(selected.props.className, /\bbg-accent\b/);
+  assert.match(selected.props.className, /\btext-white\b/);
+});
+
+test("an unsaved note survives leaving and returning to the page", async () => {
+  seed(); select(); edit("Unsaved draft");
+  select("opaque:b"); edit("Second draft");
+  h.project = null; tree(); // Leaving the route unmounts the whole speaker view.
+  h.project = project; seed();
+  select();
+  assert.equal(nodes(tree()).find(n => n.type === "textarea").props.value, "Unsaved draft");
+  select("opaque:b");
+  assert.equal(nodes(tree()).find(n => n.type === "textarea").props.value, "Second draft");
+  await button("speakers.save").props.onClick();
+  assert.equal(h.calls[0].note, "Second draft");
+  h.project = null; tree();
+  h.project = project; select("opaque:b");
+  assert.equal(nodes(tree()).find(n => n.type === "textarea").props.value, "Second draft", "a saved note is the server note again");
+  assert.ok(!html().includes(t("speakers.saved")), "no stale saved status after returning");
+  h.project = { ...project, database_path: "C:/other.db" }; seed(); select();
+  assert.equal(nodes(tree()).find(n => n.type === "textarea").props.value, "Formal", "drafts stay with their own project");
 });

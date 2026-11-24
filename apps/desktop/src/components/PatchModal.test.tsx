@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import PatchApplyTab, { PatchApplyActions } from "./patch/PatchApplyTab";
 import PatchPackTab, { PatchPackActions } from "./patch/PatchPackTab";
+import ConfirmDialog from "./ConfirmDialog";
 import { after, test } from "node:test";
 import { registerHooks } from "node:module";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -16,6 +18,7 @@ const h = {
   changed: 0,
   runEffects: false, effectCursor: 0, effectDeps: [] as unknown[][], effects: [] as (() => void)[],
   pickerCalls: [] as any[], selectedDirectory: null as string | null,
+  a11yOptions: null as null | { open: boolean; ownEscape?: boolean; onClose?: () => void },
   effect(fn: () => void, deps: unknown[]) {
     if (!this.runEffects) return;
     const index = this.effectCursor++;
@@ -59,7 +62,7 @@ const hooks = registerHooks({
           export const MODAL_BODY_CLASS=h.a11y.MODAL_BODY_CLASS;
           export const MODAL_FOOTER_CLASS=h.a11y.MODAL_FOOTER_CLASS;
           export const modalPanelClass=h.a11y.modalPanelClass;
-          export const useModalA11y=()=>({dialogRef:{current:null},dialogProps:h.a11y.buildModalDialogProps({titleId:'title'}),titleProps:h.a11y.buildModalTitleProps('title')});`,
+          export const useModalA11y=(options)=>{h.a11yOptions=options;return {dialogRef:{current:null},dialogProps:h.a11y.buildModalDialogProps({titleId:'title'}),titleProps:h.a11y.buildModalTitleProps('title')};};`,
       };
       if (stubs[specifier]) return { url: `data:text/javascript,${encodeURIComponent(stubs[specifier])}`, shortCircuit: true };
     }
@@ -492,11 +495,19 @@ test("apply interruption refreshes its original game and hides its recovery mess
   assertRecovery(true);
 });
 
+function rollbackConfirm() {
+  const dialog = nodes(render()).find(node => node.type === ConfirmDialog);
+  assert.ok(dialog, "the rollback confirmation is rendered");
+  return dialog;
+}
+
 for (const recovery of [false, true]) test(`${recovery ? "recovery" : "regular"} real rollback still omits dry_run and resets verification, refreshes status and reports success`, async () => {
   reset("en");
   await verifyAndInterrupt();
   report.aborted_edited = [];
-  await button(t(recovery ? "patch.rollbackNow" : "patch.rollback")).props.onClick();
+  button(t(recovery ? "patch.rollbackNow" : "patch.rollback")).props.onClick();
+  assert.deepEqual(calls, [], "rollback waits for the destructive confirmation");
+  await rollbackConfirm().props.onConfirm();
   assert.deepEqual(calls, [
     { url: "http://localhost:7842/api/patch/rollback", body: { game_path: "/game", force: false } },
     { url: "http://localhost:7842/api/patch/status", body: { game_path: "/game" } },
@@ -504,6 +515,36 @@ for (const recovery of [false, true]) test(`${recovery ? "recovery" : "regular"}
   assert.equal(h.changed, 1);
   assert.ok(h.toasts.some(toast => toast[0] === "success" && toast[1] === t("patch.toast.rollback", { restored: 2, deleted: 1 })));
   assert.ok(!renderToStaticMarkup(render()).includes("verification retained"));
+  assert.equal(rollbackConfirm().props.open, false, "the confirmation closes once rollback runs");
+});
+
+for (const locale of ["en", "es"] as const) test(`${locale} Rollback is disabled without a game path and runs only after a destructive confirmation`, async () => {
+  reset(locale);
+  report.aborted_edited = [];
+  selectGame("  ");
+  assert.equal(button(t("patch.rollback")).props.disabled, true, "no game path, no rollback");
+  selectGame("/game");
+  assert.equal(button(t("patch.rollback")).props.disabled, false);
+  assert.equal(rollbackConfirm().props.open, false);
+  button(t("patch.rollback")).props.onClick();
+  let dialog = rollbackConfirm();
+  assert.equal(dialog.props.open, true);
+  assert.equal(dialog.props.destructive, true);
+  assert.equal(dialog.props.confirmLabel, t("patch.rollback"));
+  assert.equal(dialog.props.title, t("patch.rollbackConfirm.title"));
+  assert.equal(dialog.props.message, t("patch.rollbackConfirm.message", { path: "/game" }));
+  dialog.props.onCancel();
+  assert.equal(rollbackConfirm().props.open, false);
+  assert.deepEqual(calls, [], "cancelling the confirmation changes nothing");
+  assert.deepEqual(h.toasts, []);
+  const force = nodes(render()).find(node => node.type === "input" && node.props.type === "checkbox");
+  force.props.onChange({ target: { checked: true } });
+  button(t("patch.rollback")).props.onClick();
+  dialog = rollbackConfirm();
+  assert.equal(dialog.props.message, t("patch.rollbackConfirm.forceMessage", { path: "/game" }));
+  await dialog.props.onConfirm();
+  assert.deepEqual(calls[0], { url: "http://localhost:7842/api/patch/rollback", body: { game_path: "/game", force: true } });
+  assert.equal(rollbackConfirm().props.open, false);
 });
 
 for (const locale of ["en", "es"] as const) test(`${locale} Rollback is outlined in normal and recovery states with unchanged action guards`, () => {
@@ -521,7 +562,7 @@ for (const locale of ["en", "es"] as const) test(`${locale} Rollback is outlined
           canVerifyApply: Boolean(gamePath.trim()) && sourceOk, showPartialWarning });
         const action = (key: Parameters<typeof t>[0]) => nodes(tree).find(node => node.type === "button" && text(node).trim() === t(key));
         const rollback = action("patch.rollback");
-        assert.equal(rollback.props.disabled, loading || applying);
+        assert.equal(rollback.props.disabled, loading || applying || !gamePath.trim());
         assert.equal(rollback.props.onClick, props.handleRollback);
         assert.match(rollback.props.className, /\bborder-warning\b/);
         assert.match(rollback.props.className, /\btext-warning\b/);
@@ -534,7 +575,7 @@ for (const locale of ["en", "es"] as const) test(`${locale} Rollback is outlined
         const recovery = action("patch.rollbackNow");
         assert.equal(Boolean(recovery), !applying && showPartialWarning);
         if (recovery) {
-          assert.equal(recovery.props.disabled, loading);
+          assert.equal(recovery.props.disabled, loading || !gamePath.trim());
           assert.equal(recovery.props.onClick, props.handleRollback);
         }
       }
@@ -641,3 +682,24 @@ for (const locale of ["en", "es"] as const) {
     assertRecovery(false);
   });
 }
+
+test("the dialog closes itself on Escape wherever it is opened, including Home", () => {
+  reset("en");
+  let closed = 0;
+  renderOptions = { onClose() { closed++; } };
+  try {
+    render();
+    assert.equal(h.a11yOptions?.open, true);
+    assert.equal(h.a11yOptions?.ownEscape, true, "Home has no Escape hotkey of its own");
+    h.a11yOptions?.onClose?.();
+    assert.equal(closed, 1);
+  } finally { renderOptions = {}; }
+});
+
+test("Editor leaves Escape to the open Patch dialog so one key press closes it once", () => {
+  const source = readFileSync(new URL("../pages/Editor.tsx", import.meta.url), "utf8");
+  const closePanel = source.match(/useHotkey\(\s*"closePanel",([\s\S]*?)\n\t\);/);
+  assert.ok(closePanel, "Editor registers its Escape hotkey");
+  assert.doesNotMatch(closePanel[1], /setShowPatchModal\(false\)/, "the hotkey must not close the Patch dialog as well");
+  assert.match(closePanel[1], /!showPatchModal/, "the hotkey pauses while the Patch dialog owns Escape");
+});

@@ -8,8 +8,11 @@ import { draftProjectKey } from "../stores/draftStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useEditorStore } from "../stores/editorStore";
 import EmptyState from "../components/EmptyState";
+import ConfirmDialog from "../components/ConfirmDialog";
 
-const ACTION = "rounded-md bg-accent-muted px-3 py-2 text-body font-medium text-accent-fg hover:bg-accent-muted/80 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg";
+const ACTION_SHAPE = "rounded-md px-3 py-2 text-body font-medium disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg";
+const ACTION = `${ACTION_SHAPE} bg-accent-muted text-accent-fg hover:bg-accent-muted/80`;
+const SELECTED_ACTION = `${ACTION_SHAPE} bg-accent text-white hover:bg-accent-hover focus-visible:ring-offset-2 focus-visible:ring-offset-surface`;
 function isCurrent(projectKey: string) {
   const current = useProjectStore.getState().project;
   return !!current && draftProjectKey(current) === projectKey;
@@ -31,6 +34,26 @@ function reconcileNote(note: string, state?: NoteState): NoteState {
     error: state?.error ?? "", saved: !!state?.saved && state.baseline === note };
 }
 
+/**
+ * Unsaved note drafts per project, kept for the session when the page unmounts
+ * (route change, project reopen) so leaving never discards typed text.
+ */
+const keptNoteDrafts = new Map<string, Record<string, NoteState>>();
+
+/** Drops every kept draft. Tests use it to isolate cases. */
+export function forgetSpeakerNoteDrafts() {
+  keptNoteDrafts.clear();
+}
+
+function keepDirtyNotes(projectKey: string, states: Record<string, NoteState>) {
+  // An in-flight save cannot report back to an unmounted view; the draft text stays dirty.
+  const dirty = Object.entries(states)
+    .filter(([, state]) => state.text !== state.baseline)
+    .map(([id, state]) => [id, { ...state, pending: null, error: "", saved: false }] as const);
+  if (dirty.length) keptNoteDrafts.set(projectKey, Object.fromEntries(dirty));
+  else keptNoteDrafts.delete(projectKey);
+}
+
 export default function Speakers() {
   const project = useProjectStore(s => s.project);
   const projectKey = project ? draftProjectKey(project) : "";
@@ -42,7 +65,7 @@ function ProjectSpeakers({ project, projectKey }: { project: ProjectInfo | null;
   const navigate = useNavigate();
   const startValidationWorklist = useEditorStore(s => s.startValidationWorklist);
   const [selected, setSelected] = useState<string | null>(null);
-  const [notes, setNotes] = useState<Record<string, NoteState>>({});
+  const [notes, setNotes] = useState<Record<string, NoteState>>(() => keptNoteDrafts.get(projectKey) ?? {});
   // The project owns drafts and requests, not the selected editor's mount.
   // The ref also rejects duplicate/stale events before React commits a render.
   const noteStates = useRef(notes);
@@ -51,8 +74,11 @@ function ProjectSpeakers({ project, projectKey }: { project: ProjectInfo | null;
   const qc = useQueryClient();
   useEffect(() => {
     active.current = true;
-    return () => { active.current = false; };
-  }, []);
+    return () => {
+      active.current = false;
+      keepDirtyNotes(projectKey, noteStates.current);
+    };
+  }, [projectKey]);
   const updateNote = (id: string, state: NoteState) => {
     noteStates.current = { ...noteStates.current, [id]: state };
     setNotes(noteStates.current);
@@ -126,7 +152,7 @@ function ProjectSpeakers({ project, projectKey }: { project: ProjectInfo | null;
         : <div className="grid gap-6 md:grid-cols-2">
           <div className="space-y-3">
             <ul className="space-y-2" aria-label={t("speakers.title")}>
-              {query.data?.groups.map(g => <li key={g.id}><button key={g.id} type="button" className={ACTION} aria-pressed={selected === g.id} onClick={() => setSelected(g.id)}>{g.name} ({g.count})</button></li>)}
+              {query.data?.groups.map(g => <li key={g.id}><button key={g.id} type="button" className={selected === g.id ? SELECTED_ACTION : ACTION} aria-pressed={selected === g.id} onClick={() => setSelected(g.id)}>{g.name} ({g.count})</button></li>)}
             </ul>
             <div className="space-y-2 rounded-lg border border-border p-4">
               <h2 className="font-semibold">{t("speakers.unassigned")} ({unassigned.length})</h2>
@@ -136,7 +162,7 @@ function ProjectSpeakers({ project, projectKey }: { project: ProjectInfo | null;
           {group ? <section className="space-y-3 rounded-lg border border-border p-4">
             <h2 className="font-semibold">{group.name} ({group.count})</h2>
             <button type="button" className={ACTION} onClick={() => openRows(group.entry_ids)}>{t("speakers.openRows")}</button>
-            <SpeakerNoteEditor key={JSON.stringify([projectKey, group.id])} state={note!}
+            <SpeakerNoteEditor key={JSON.stringify([projectKey, group.id])} name={group.name} state={note!}
               onEdit={text => editNote(group, note!.revision, text)}
               onSave={() => saveNote(group, note!.revision)} onClear={() => saveNote(group, note!.revision, true)} />
           </section> : <p className="text-body text-text-muted">{t("speakers.select")}</p>}
@@ -145,10 +171,11 @@ function ProjectSpeakers({ project, projectKey }: { project: ProjectInfo | null;
   </div>;
 }
 
-function SpeakerNoteEditor({ state, onEdit, onSave, onClear }: {
-  state: NoteState; onEdit: (text: string) => void; onSave: () => Promise<void>; onClear: () => Promise<void>;
+function SpeakerNoteEditor({ name, state, onEdit, onSave, onClear }: {
+  name: string; state: NoteState; onEdit: (text: string) => void; onSave: () => Promise<void>; onClear: () => Promise<void>;
 }) {
   const t = useT();
+  const [confirmClear, setConfirmClear] = useState(false);
   const { text, pending, saved, error } = state;
   return <div className="space-y-3">
     <label className="block space-y-2 text-body"><span>{t("speakers.note")}</span>
@@ -156,8 +183,11 @@ function SpeakerNoteEditor({ state, onEdit, onSave, onClear }: {
     </label>
     <div className="flex gap-2">
       <button type="button" className={ACTION} disabled={pending !== null} onClick={onSave}>{t("speakers.save")}</button>
-      <button type="button" className={ACTION} disabled={pending !== null} onClick={onClear}>{t("speakers.clear")}</button>
+      <button type="button" className={ACTION} disabled={pending !== null} onClick={() => setConfirmClear(true)}>{t("speakers.clear")}</button>
     </div>
+    <ConfirmDialog open={confirmClear} title={t("speakers.clearConfirm.title")} message={t("speakers.clearConfirm.message", { name })}
+      confirmLabel={t("speakers.clear")} destructive onCancel={() => setConfirmClear(false)}
+      onConfirm={() => { setConfirmClear(false); return onClear(); }} />
     {pending !== null && <p role="status" className="text-body text-text-muted">{t("speakers.saving")}</p>}
     {saved && <p role="status" className="text-body text-text-muted">{t("speakers.saved")}</p>}
     {error && <p role="alert" className="text-body text-danger">{t("speakers.saveError")} {error}</p>}

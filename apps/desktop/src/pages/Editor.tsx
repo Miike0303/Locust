@@ -42,7 +42,7 @@ import {
 import { workflowLastEditKey } from "../lib/translationWrites";
 import { qaLastRunKey } from "../lib/qaDashboard";
 import { addToast } from "../stores/toastStore";
-import { addLog } from "../stores/logStore";
+import { addLog, useLogStore } from "../stores/logStore";
 import FilterBar from "../components/FilterBar";
 import StringTable from "../components/StringTable";
 import DetailPanel from "../components/DetailPanel";
@@ -340,6 +340,10 @@ export default function Editor() {
 		},
 		!editorModalOpen,
 	);
+	// The Activity Log (rendered by Layout) owns Escape while open; this hotkey,
+	// registered earlier, would otherwise take Escape first.
+	const [activityLogOpen, setActivityLogOpen] = useState(() => useLogStore.getState().isOpen);
+	useEffect(() => useLogStore.subscribe((state) => setActivityLogOpen(state.isOpen)), []);
 	useHotkey(
 		"closePanel",
 		() => {
@@ -347,12 +351,12 @@ export default function Editor() {
 			else if (showReplaceModal) setShowReplaceModal(false);
 			else if (showPivotModal) setShowPivotModal(false);
 			else if (showExportModal) setShowExportModal(false);
-			else if (showPatchModal) setShowPatchModal(false);
 			else if (showInjectModal) setShowInjectModal(false);
 			else if (showTranslateModal) setShowTranslateModal(false);
 			else if (selectedEntryId) closeDetail();
 		},
-		!showFastWorkflowModal && !showFontPatch && (editorModalOpen || !!selectedEntryId),
+		// These dialogs own Escape (and any confirmation nested in them).
+		!showFastWorkflowModal && !showFontPatch && !showPatchModal && !activityLogOpen && (editorModalOpen || !!selectedEntryId),
 		true,
 	);
 

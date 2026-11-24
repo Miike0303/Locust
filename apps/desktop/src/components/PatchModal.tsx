@@ -34,6 +34,7 @@ import { patchVerificationSummary } from "../lib/patchVerification";
 import { subscribeToJob } from "../lib/ws";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
+import ConfirmDialog from "./ConfirmDialog";
 import PatchApplyTab, { PatchApplyActions } from "./patch/PatchApplyTab";
 import PatchPackTab, { PatchPackActions } from "./patch/PatchPackTab";
 
@@ -155,9 +156,13 @@ export default function PatchModal({
 	const applyJobIdRef = useRef<string | null>(null);
 	const applyFinishedRef = useRef(false);
 	const applyCancelRequestedRef = useRef(false);
+	const [confirmRollback, setConfirmRollback] = useState(false);
+	// The dialog owns Escape in every host (Home has no Escape hotkey); a nested
+	// confirmation is the topmost dialog and takes Escape first.
 	const { dialogRef, dialogProps, titleProps } = useModalA11y({
 		open,
-		ownEscape: false,
+		onClose,
+		ownEscape: true,
 	});
 
 	useEffect(() => {
@@ -173,6 +178,7 @@ export default function PatchModal({
 		setTab(allowPack ? initialTab : "apply");
 		setError(null);
 		setRollbackPreview(null);
+		setConfirmRollback(false);
 		if (!allowPack) {
 			setRecordings([]);
 			setPristineRecordings([]);
@@ -605,7 +611,17 @@ export default function PatchModal({
 		}
 	};
 
+	// Rollback rewrites game files, so it runs only from the destructive confirmation.
+	const requestRollback = async () => {
+		if (!gamePath.trim()) {
+			addToast("error", t("patch.toast.selectGame"));
+			return;
+		}
+		setConfirmRollback(true);
+	};
+
 	const handleRollback = async () => {
+		setConfirmRollback(false);
 		if (!gamePath.trim()) {
 			addToast("error", t("patch.toast.selectGame"));
 			return;
@@ -754,7 +770,7 @@ export default function PatchModal({
 		sourceOk,
 		handleApply,
 		handlePreviewRollback,
-		handleRollback,
+		handleRollback: requestRollback,
 		showPartialWarning,
 		refreshStatus: async () => { await refreshStatus(); },
 		applyProgress,
@@ -892,6 +908,15 @@ export default function PatchModal({
 					{tab === "apply" ? <PatchApplyActions {...applyProps} /> : <PatchPackActions {...packProps} />}
 				</footer>
 			</div>
+			<ConfirmDialog
+				open={confirmRollback}
+				title={t("patch.rollbackConfirm.title")}
+				message={t(force ? "patch.rollbackConfirm.forceMessage" : "patch.rollbackConfirm.message", { path: gamePath.trim() })}
+				confirmLabel={t("patch.rollback")}
+				destructive
+				onConfirm={handleRollback}
+				onCancel={() => setConfirmRollback(false)}
+			/>
 		</div>
 	);
 }

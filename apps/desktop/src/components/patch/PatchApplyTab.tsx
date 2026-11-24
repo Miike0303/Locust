@@ -427,8 +427,10 @@ export function PatchApplyActions({
 				<RotateCcw size={16} /> {t("patch.rollbackPreview")}
 			</button>
 			<button
+				type="button"
 				onClick={handleRollback}
-				disabled={loading || applying}
+				disabled={loading || applying || !gamePath.trim()}
+				title={!gamePath.trim() ? t("patch.selectGame") : undefined}
 				className={
 					showPartialWarning
 						? "flex items-center gap-1.5 px-3 py-2 border border-warning text-warning bg-transparent hover:underline rounded text-body font-medium disabled:opacity-50 ring-2 ring-warning ring-offset-1 ring-offset-surface"
@@ -457,7 +459,7 @@ export function PatchApplyActions({
 			<button
 				type="button"
 				onClick={handleRollback}
-				disabled={loading}
+				disabled={loading || !gamePath.trim()}
 				className="w-full flex items-center justify-center gap-1.5 py-2 bg-amber-700 hover:bg-amber-800 disabled:opacity-50 text-white rounded text-body font-medium"
 			>
 				<RotateCcw size={16} /> {t("patch.rollbackNow")}

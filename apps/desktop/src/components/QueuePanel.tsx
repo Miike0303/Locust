@@ -303,6 +303,8 @@ export default function QueuePanel() {
 		["extracting", "translating", "validating"].includes(i.status),
 	).length;
 	const totalCount = items.length;
+	// Same readiness rule as the warning above the footer: Start stays off until the key exists.
+	const missingKey = !providerReadiness.ready && providerReadiness.reason === "missing_key";
 
 	return (
 		<div className={MODAL_BACKDROP_CLASS}>
@@ -597,11 +599,10 @@ export default function QueuePanel() {
 
 				{/* Footer */}
 				<footer className={`${MODAL_FOOTER_CLASS} flex-col items-stretch p-4`}>
-					{!providerReadiness.ready &&
-						providerReadiness.reason === "missing_key" &&
+					{missingKey &&
 						!isRunning &&
 						pendingCount > 0 && (
-							<div className="mb-3 p-2 rounded border border-warning bg-warning-muted text-body text-warning">
+							<div id="queue-needs-key" className="mb-3 p-2 rounded border border-warning bg-warning-muted text-body text-warning">
 								{t("queue.needsKey")}{" "}
 								<button
 									type="button"
@@ -643,7 +644,9 @@ export default function QueuePanel() {
 							<button
 								type="button"
 								onClick={handleStart}
-								disabled={pendingCount === 0 || estimate.pending}
+								disabled={pendingCount === 0 || estimate.pending || missingKey}
+								aria-describedby={missingKey && pendingCount > 0 ? "queue-needs-key" : undefined}
+								title={missingKey ? t("queue.needsKey") : undefined}
 								className="flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-body font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-accent-fg focus:ring-offset-2 focus:ring-offset-surface"
 							>
 								<Play size={14} aria-hidden="true" />

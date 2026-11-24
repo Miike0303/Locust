@@ -30,8 +30,9 @@ const hooks = registerHooks({
 });
 const { default: QueuePanel } = await import("./QueuePanel");
 after(() => { hooks.deregister(); Reflect.deleteProperty(globalThis, "__queuePanel"); setLocale("en"); });
-function render() {
+function render(seed?: (client: QueryClient) => void) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  seed?.(client);
   try {
     return renderToStaticMarkup(createElement(QueryClientProvider, { client },
       createElement(MemoryRouter, null, createElement(QueuePanel))));
@@ -102,5 +103,42 @@ for (const locale of ["en", "es"] as const) {
       state.recoveryAvailable = true;
       assert.ok(render().includes(t("queue.recoveryAvailable")));
     } finally { state.persistenceError = false; state.recoveryAvailable = false; state.isRunning = false; }
+  });
+}
+
+for (const locale of ["en", "es"] as const) {
+  test(`QueuePanel disables Start and says why when the provider has no API key in ${locale}`, () => {
+    setLocale(locale);
+    const items = state.items;
+    const mutable = state as any;
+    mutable.items = [...items, { ...item, id: "pending", status: "pending", error: null }];
+    mutable.translationParams = { provider_id: "openai", options: { source_lang: "ja", target_lang: "en" }, fallback_provider_ids: [] };
+    const seed = (key: string | null) => (client: QueryClient) => {
+      client.setQueryData(["providers"], [
+        { id: "openai", name: "OpenAI", requires_api_key: true, is_free: false, configured: true },
+        { id: "mock", name: "Mock", requires_api_key: false, is_free: true, configured: true },
+      ]);
+      client.setQueryData(["config"], { providers: key ? { openai: { api_key: key } } : {} });
+      client.setQueryData(["formats"], []);
+    };
+    try {
+      const startLabel = t("queue.start", { count: 1 });
+      const start = (html: string) => (html.match(/<button\b[^>]*>[\s\S]*?<\/button>/g) ?? []).find(b => b.includes(startLabel));
+      const missing = render(seed(null));
+      const button = start(missing);
+      assert.ok(button, "Start is rendered");
+      assert.ok(button.includes('disabled=""'), "Start is disabled without the API key");
+      const reason = button.match(/aria-describedby="([^"]+)"/);
+      assert.ok(reason, "Start points at the reason it is disabled");
+      assert.match(missing, new RegExp(`id="${reason[1]}"[^>]*>${t("queue.needsKey")}`));
+      const ready = start(render(seed("***")));
+      assert.ok(ready && !ready.includes('disabled=""'), "a saved key enables Start");
+      assert.ok(!ready.includes("aria-describedby"));
+      mutable.translationParams = { provider_id: "mock", options: { source_lang: "ja", target_lang: "en" }, fallback_provider_ids: [] };
+      const keyless = start(render(seed(null)));
+      assert.ok(keyless && !keyless.includes('disabled=""'), "a provider without a key requirement stays startable");
+    } finally {
+      mutable.items = items; mutable.translationParams = null;
+    }
   });
 }
