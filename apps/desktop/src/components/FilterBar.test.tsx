@@ -222,3 +222,59 @@ test("a single first page has no pagination controls", () => {
     assert.ok(!tree.some(node => node.props["aria-label"] === t("filter.previousPage") || node.props["aria-label"] === t("filter.nextPage")));
   }
 });
+
+function text(node: any): string {
+  if (node == null || typeof node === "boolean") return "";
+  if (typeof node !== "object") return String(node);
+  return Array.isArray(node) ? node.map(text).join("") : text(node.props?.children);
+}
+const activeChip = () => render().find(node => node.props && "data-active-filter" in node.props);
+for (const locale of ["en", "es"] as const) {
+  test(`${locale}: active filters are named in a visible chip, including a pending-only filter`, () => {
+    setLocale(locale);
+    props = { total: 2, showing: 2 };
+    useEditorStore.setState({ filter: { limit: 100, offset: 0, status: "pending" } });
+    let chip = activeChip();
+    assert.ok(chip, "the pending filter set after a stale-source open is named");
+    const pendingOnly = t("filter.active", { filters: t("filter.pending") });
+    assert.equal(text(chip), pendingOnly);
+    assert.equal(chip.props.title, pendingOnly);
+    useEditorStore.setState({ filter: { limit: 100, offset: 0, status: "error", search: "dialogue", file_path: "data/story.json", tag: "quest" } });
+    chip = activeChip();
+    const every = t("filter.active", { filters: [
+      t("filter.error"), t("filter.activeSearch", { search: "dialogue" }),
+      `${t("filter.file")}: data/story.json`, `${t("filter.tag")}: quest`,
+    ].join(", ") });
+    assert.equal(text(chip), every);
+    assert.equal(chip.props.title, every);
+    useEditorStore.setState({ filter: { limit: 100, offset: 0 } });
+    assert.equal(activeChip(), undefined, "no chip without filters");
+  });
+}
+
+test("the bar wraps only between the status/search row and one facet/count group", () => {
+  useEditorStore.setState({ filter: { limit: 100, offset: 0, status: "pending", file_path: "story.json" } });
+  props = { total: 350, showing: 100 };
+  const tree = render(), root = tree[0];
+  assert.match(root.props.className, /\bflex-wrap\b/);
+  const direct = (node: any) => [node.props.children].flat(Infinity).filter(child => child && typeof child === "object");
+  const statusGroup = tree.find(node => direct(node).some(child => child.props["aria-pressed"] !== undefined));
+  assert.match(statusGroup.props.className, /\bshrink-0\b/, "status chips keep one row");
+  assert.doesNotMatch(statusGroup.props.className, /\bflex-wrap\b/);
+  const parts = [
+    (node: any) => node.props?.id === "file-path-filter",
+    (node: any) => node.props?.id === "tag-filter",
+    (node: any) => node.props && "data-active-filter" in node.props,
+    (node: any) => node.type === "button" && text(node).includes(t("common.clear")),
+    (node: any) => node.type === "span" && text(node) === t("filter.results", { from: 1, to: 100, total: 350 }),
+  ];
+  const groups = tree.filter(node => node !== root && parts.every(part => nodes(node).some(part)));
+  assert.equal(groups.length, 1, "file, tag, active filter, Clear and count wrap together");
+  assert.match(groups[0].props.className, /\bflex-1\b/);
+  assert.match(groups[0].props.className, /\bflex-wrap\b/);
+  const count = tree.find(parts[4]);
+  assert.match(count.props.className, /\bwhitespace-nowrap\b/);
+  const countGroup = tree.find(node => direct(node).includes(count));
+  assert.match(countGroup.props.className, /\bml-auto\b/, "the count stays at the right edge");
+  assert.match(countGroup.props.className, /\bshrink-0\b/);
+});

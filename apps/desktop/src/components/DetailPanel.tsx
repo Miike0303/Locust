@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, type Ref } from "react";
-import { AlertTriangle, ChevronDown, ChevronRight } from "lucide-react";
+import { AlertTriangle, ChevronDown, ChevronRight, X } from "lucide-react";
 import clsx from "clsx";
 import type { StringEntry, StringStatus } from "../lib/api";
 import { encodedByteLen, getString, patchString } from "../lib/api";
@@ -175,22 +175,24 @@ export default function DetailPanel({
 	].filter(Boolean).join(" ");
 
 	const panel = (
-		<aside ref={panelRef} className={clsx("relative border-l border-border overflow-y-auto bg-surface flex flex-col", compact ? "w-[min(420px,92vw)] shadow-xl" : "w-[340px]")}>
-			<div className="px-3 py-2 border-b border-border flex justify-between items-center">
+		<aside ref={panelRef} className={clsx("relative border-l border-border overflow-hidden bg-surface flex flex-col", compact ? "w-[min(420px,92vw)] shadow-xl" : "w-[340px]")}>
+			{/* Only the body scrolls, so the title and close control stay in view. */}
+			<div className="shrink-0 px-3 py-1.5 border-b border-border flex justify-between items-center">
 				<h3 className="text-caption font-semibold text-text">
 					{t("detail.title")}
 				</h3>
 				<button
 					ref={closeButtonRef}
+					type="button"
 					onClick={onClose}
-					className="text-text-muted hover:text-text text-section rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg"
+					className="inline-flex size-7 items-center justify-center rounded text-text-muted hover:bg-surface-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg"
 					aria-label={t("detail.closeAria")}
 				>
-					&times;
+					<X size={16} aria-hidden={true} />
 				</button>
 			</div>
 
-			<div className="p-3 space-y-3 flex-1">
+			<div className="min-h-0 flex-1 overflow-y-auto p-3 space-y-3">
 				{Object.prototype.hasOwnProperty.call(entry.metadata ?? {}, "locust_stale_translation") && (
 					<p className="text-caption text-warning bg-warning-muted rounded p-2">
 						<strong>{t("validate.kind.staleLabel")}. </strong>{t("validate.kind.staleDetail")}
@@ -277,14 +279,7 @@ export default function DetailPanel({
 					</div>
 				</div>
 
-				{isTextFitEligible(entry) && <TextFitPreview key={projectKey} projectKey={projectKey} entry={entry} draft={translation} />}
-
-				<MemorySuggestions projectKey={projectKey} entry={entry} sampleSources={sampleSources}
-					busy={saving || changingStatus} onUse={text => {
-						if (isCurrentProject() && !saving && !changingStatus) editDraft(draftKey, text, entry.translation);
-					}} />
-
-				{/* Status */}
+				{/* Status sits right below the translation so it stays above the fold. */}
 				<fieldset>
 					<legend className="text-caption font-medium text-text-muted">
 						{t("detail.status")}
@@ -326,6 +321,13 @@ export default function DetailPanel({
 						})}
 					</div>
 				)}
+
+				{isTextFitEligible(entry) && <TextFitPreview key={projectKey} projectKey={projectKey} entry={entry} draft={translation} />}
+
+				<MemorySuggestions projectKey={projectKey} entry={entry} sampleSources={sampleSources}
+					busy={saving || changingStatus} onUse={text => {
+						if (isCurrentProject() && !saving && !changingStatus) editDraft(draftKey, text, entry.translation);
+					}} />
 
 				<StringHistory key={draftKey} projectKey={projectKey} entryId={entry.id}
 					translation={entry.translation} busy={saving || changingStatus} onRestore={handleRestore} />

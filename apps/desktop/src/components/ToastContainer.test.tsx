@@ -3,6 +3,7 @@ import { registerHooks } from "node:module";
 import { after, afterEach, beforeEach, test } from "node:test";
 import { addToast, useToastStore as store } from "../stores/toastStore";
 import { setLocale, t } from "../lib/i18n";
+import { readFileSync } from "node:fs";
 
 // Render authored JSX and invoke its actual handlers; keep timers and store real.
 (globalThis as any).__toastHarness = { store, t };
@@ -63,7 +64,7 @@ test("long unbroken text is wrapped inside a viewport-bounded scrollable stack w
   const tree = render();
   const container = tree.find(node => node.props.role === "region");
   assert.match(container.props.className, /w-\[calc\(100%-2rem\)\]/);
-  assert.match(container.props.className, /max-h-\[calc\(100dvh-2rem\)\]/);
+  assert.match(container.props.className, /max-h-\[calc\(100dvh-4rem\)\]/);
   assert.match(container.props.className, /overflow-y-auto/);
   const toast = toastNode();
   assert.match(toast.props.className, /min-w-0/);
@@ -72,6 +73,17 @@ test("long unbroken text is wrapped inside a viewport-bounded scrollable stack w
   assert.equal(text.props.children, message);
   assert.match(text.props.className, /min-w-0/);
   assert.match(text.props.className, /\[overflow-wrap:anywhere\]/);
+});
+test("the stack is anchored bottom-right above the bottom bar, clear of the editor header actions", () => {
+  addToast("info", "anchored");
+  const classes: string[] = render().find(node => node.props.role === "region").props.className.split(/\s+/);
+  assert.ok(classes.includes("fixed") && classes.includes("right-4"));
+  assert.ok(classes.includes("bottom-12"), "3rem clears the BottomBar");
+  assert.ok(!classes.some(name => /^top-/.test(name)), "no longer covers the header at the top");
+  // The stack keeps a 1rem top margin: 100dvh minus the 3rem bottom offset and 1rem.
+  assert.ok(classes.includes("max-h-[calc(100dvh-4rem)]"));
+  const bottomBar = readFileSync(new URL("./BottomBar.tsx", import.meta.url), "utf8");
+  assert.match(bottomBar, /className="h-9 /, "BottomBar is 2.25rem tall, below the 3rem offset");
 });
 for (const first of ["pointer", "focus"] as const) {
   test(`${first} plus overlapping pause reason resumes only the remaining duration`, (ctx) => {

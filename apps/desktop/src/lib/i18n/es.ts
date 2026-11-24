@@ -76,6 +76,8 @@ export const es: Record<keyof typeof en, string> = {
   "textFit.line": "Línea {line}",
   "textFit.within": "avance estimado dentro del ancho elegido",
   "textFit.exceeds": "el avance estimado supera el ancho elegido",
+  "textFit.fitsShort": "cabe",
+  "textFit.exceedsShort": "excede",
   "textFit.unavailable": "Estimación no disponible",
   "textFit.unknownReason": "Métrica no disponible",
   "textFit.noText": "No hay texto que evaluar.",
@@ -829,6 +831,8 @@ export const es: Record<keyof typeof en, string> = {
   "filter.anyTag": "Todas",
   "filter.results": "{from}–{to} de {total}",
   "filter.zeroResults": "0 resultados",
+  "filter.active": "Filtro: {filters}",
+  "filter.activeSearch": "«{search}»",
 
   "table.status": "Estado",
   "table.source": "Origen",

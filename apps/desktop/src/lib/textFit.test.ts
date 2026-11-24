@@ -292,12 +292,17 @@ for (const locale of ["en", "es"] as const) test(`${locale}: collapsed, configur
   assert.deepEqual(ui.loadTextFitProfile("project-a"), validProfile);
   assert.ok(markup().includes(t("textFit.loading"))); context.mock.timers.tick(250); await finish();
   const html = markup();
-  for (const value of ["12 px / 30 px", "54 px / 30 px", t("textFit.within"), t("textFit.exceeds"), t("textFit.linesHint"), t("textFit.limits")]) assert.ok(html.includes(value), value);
+  for (const value of ["12 / 30 px", "54 / 30 px", t("textFit.within"), t("textFit.exceeds"), t("textFit.linesHint"), t("textFit.limits")]) assert.ok(html.includes(value), value);
+  // Concise visible verdicts; the full wording stays available to screen readers only.
+  assert.ok(!html.includes("12 px / 30 px"), "one unit per measurement");
+  assert.ok(html.includes(`<span aria-hidden="true">${t("textFit.fitsShort")}</span><span class="sr-only">${t("textFit.within")}</span>`));
+  assert.ok(html.includes(`<span aria-hidden="true">${t("textFit.exceedsShort")}</span><span class="sr-only">${t("textFit.exceeds")}</span>`));
+  assert.equal((html.match(/lucide-triangle-alert/g) ?? []).length, 1, "only the over-width line carries a warning icon");
   assert.match(html, /bg-text-muted/); assert.match(html, /bg-warning/); assert.ok(!html.includes("text-success"));
   component("project-a", row, ""); context.mock.timers.tick(250);
   await finish(1, { source: [{ status: "unavailable", advance_px: null, usable_width_px: 30, reason: "U+3042 is unsupported" }], draft: [{ status: "within_width", advance_px: 0, usable_width_px: 30, reason: null }] });
   const independent = renderToStaticMarkup(component("project-a", row, ""));
-  assert.ok(independent.includes("U+3042 is unsupported")); assert.ok(independent.includes(t("textFit.noText"))); assert.ok(independent.includes("0 px / 30 px"));
+  assert.ok(independent.includes("U+3042 is unsupported")); assert.ok(independent.includes(t("textFit.noText"))); assert.ok(independent.includes("0 / 30 px"));
 });
 
 for (const locale of ["en", "es"] as const) test(`${locale}: reasons are localized without losing codepoint details`, () => {
@@ -387,4 +392,18 @@ for (const tauri of [true, false]) test(`${tauri ? "Tauri" : "HTTP"} API preserv
     assert.deepEqual(await api.estimateTextFit(body, controller.signal), { source: [], draft: [] });
     assert.deepEqual(h.transport, [tauri ? ["text_fit", { request: body }] : ["http://localhost:7842/api/text-fit", "POST", body, controller.signal]]);
   }
+});
+
+for (const locale of ["en", "es"] as const) test(`${locale}: a long font path shows its file name, with the full path as the tooltip`, () => {
+  setLocale(locale);
+  expand();
+  assert.ok(!nodes(component()).some(node => node.props && "data-font-name" in node.props), "no name before a file is chosen");
+  const fontPath = String.raw`C:\Users\Player\AppData\Local\Game\www\fonts\mplus-1m-regular.ttf`;
+  control("-font").props.onChange({ target: { value: fontPath } });
+  const tree = nodes(component());
+  const name = tree.find(node => node.props && "data-font-name" in node.props);
+  assert.ok(name, "the chosen file is named");
+  assert.equal(name.props.children, "mplus-1m-regular.ttf");
+  assert.equal(name.props.title, fontPath);
+  assert.equal(tree.find(node => node.props?.id?.endsWith("-font")).props.title, fontPath);
 });

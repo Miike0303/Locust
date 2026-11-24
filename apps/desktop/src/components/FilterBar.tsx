@@ -91,12 +91,22 @@ export default function FilterBar({ total, showing }: FilterBarProps) {
 
 	const hasFilters =
 		filter.status || filter.search || filter.file_path || filter.tag;
+	// Name every active filter: a pressed Pending chip alone is barely distinguishable.
+	const statusKey = STATUSES.find(({ value }) => value && value === filter.status)?.labelKey;
+	const activeFilters = [
+		filter.status && (statusKey ? t(statusKey) : filter.status),
+		filter.search && t("filter.activeSearch", { search: filter.search }),
+		filter.file_path && `${t("filter.file")}: ${filter.file_path}`,
+		filter.tag && `${t("filter.tag")}: ${filter.tag}`,
+	].filter(Boolean).join(", ");
+	const activeLabel = activeFilters ? t("filter.active", { filters: activeFilters }) : null;
 	const offset = filter.offset ?? 0;
 	const limit = filter.limit ?? 100;
 
+	// Wrapping happens only between the status/search row and the facet/count group.
 	return (
 		<div className="flex flex-wrap items-center gap-2 p-2 border-b border-border bg-surface">
-			<div className="flex flex-wrap gap-0.5">
+			<div className="flex shrink-0 gap-0.5">
 				{STATUSES.map(({ labelKey, value }) => (
 					<button
 						key={labelKey}
@@ -133,133 +143,145 @@ export default function FilterBar({ total, showing }: FilterBarProps) {
 				/>
 			</div>
 
-			<div className="flex items-center gap-1">
-				<label
-					htmlFor="file-path-filter"
-					className="text-caption text-text-muted"
-				>
-					{t("filter.file")}
-				</label>
-				<input
-					id="file-path-filter"
-					list="file-path-filter-options"
-					value={filePathDraft}
-					onChange={(event) => {
-						const value = event.target.value;
-						setFilePathDraft(value);
-						if (filePaths.includes(value))
-							setFilter(filePathFilterPatch(value));
-					}}
-					onBlur={commitFilePath}
-					onKeyDown={(event) =>
-						handleFacetKeyDown(
-							event,
-							filter.file_path || "",
-							setFilePathDraft,
-							commitFilePath,
-						)
-					}
-					placeholder={t("filter.anyFile")}
-					className="w-32 rounded border border-border bg-surface px-2 py-0.5 text-body text-text"
-				/>
-				<datalist id="file-path-filter-options">
-					{filePaths.map((path) => (
-						<option key={path} value={path} label={filePathOptionLabel(path)} />
-					))}
-				</datalist>
-			</div>
+			<div className="flex flex-1 flex-wrap items-center gap-2">
+				<div className="flex items-center gap-1">
+					<label
+						htmlFor="file-path-filter"
+						className="text-caption text-text-muted"
+					>
+						{t("filter.file")}
+					</label>
+					<input
+						id="file-path-filter"
+						list="file-path-filter-options"
+						value={filePathDraft}
+						onChange={(event) => {
+							const value = event.target.value;
+							setFilePathDraft(value);
+							if (filePaths.includes(value))
+								setFilter(filePathFilterPatch(value));
+						}}
+						onBlur={commitFilePath}
+						onKeyDown={(event) =>
+							handleFacetKeyDown(
+								event,
+								filter.file_path || "",
+								setFilePathDraft,
+								commitFilePath,
+							)
+						}
+						placeholder={t("filter.anyFile")}
+						className="w-32 rounded border border-border bg-surface px-2 py-0.5 text-body text-text"
+					/>
+					<datalist id="file-path-filter-options">
+						{filePaths.map((path) => (
+							<option key={path} value={path} label={filePathOptionLabel(path)} />
+						))}
+					</datalist>
+				</div>
 
-			<div className="flex items-center gap-1">
-				<label
-					htmlFor="tag-filter"
-					className="text-caption text-text-muted"
-				>
-					{t("filter.tag")}
-				</label>
-				<input
-					id="tag-filter"
-					list="tag-filter-options"
-					value={tagDraft}
-					onChange={(event) => {
-						const value = event.target.value;
-						setTagDraft(value);
-						if (tags.includes(value)) setFilter(tagFilterPatch(value));
-					}}
-					onBlur={commitTag}
-					onKeyDown={(event) =>
-						handleFacetKeyDown(event, filter.tag || "", setTagDraft, commitTag)
-					}
-					placeholder={t("filter.anyTag")}
-					className="w-24 rounded border border-border bg-surface px-2 py-0.5 text-body text-text"
-				/>
-				<datalist id="tag-filter-options">
-					{tags.map((tag) => (
-						<option key={tag} value={tag} />
-					))}
-				</datalist>
-			</div>
+				<div className="flex items-center gap-1">
+					<label
+						htmlFor="tag-filter"
+						className="text-caption text-text-muted"
+					>
+						{t("filter.tag")}
+					</label>
+					<input
+						id="tag-filter"
+						list="tag-filter-options"
+						value={tagDraft}
+						onChange={(event) => {
+							const value = event.target.value;
+							setTagDraft(value);
+							if (tags.includes(value)) setFilter(tagFilterPatch(value));
+						}}
+						onBlur={commitTag}
+						onKeyDown={(event) =>
+							handleFacetKeyDown(event, filter.tag || "", setTagDraft, commitTag)
+						}
+						placeholder={t("filter.anyTag")}
+						className="w-24 rounded border border-border bg-surface px-2 py-0.5 text-body text-text"
+					/>
+					<datalist id="tag-filter-options">
+						{tags.map((tag) => (
+							<option key={tag} value={tag} />
+						))}
+					</datalist>
+				</div>
 
-			{hasFilters && (
-				<button
-					onClick={() => {
-						setFilter({
-							status: undefined,
-							search: undefined,
-							file_path: undefined,
-							tag: undefined,
-							offset: 0,
-						});
-						setSearchInput("");
-					}}
-					className="flex items-center gap-1 px-2 py-0.5 text-caption text-text-muted hover:text-text"
-				>
-					<X size={14} /> {t("common.clear")}
-				</button>
-			)}
-
-			<div className="flex items-center gap-2 ml-auto">
-				<span className="text-caption text-text-muted">
-					{total > 0
-						? t("filter.results", {
-								from: offset + 1,
-								to: Math.min(offset + showing, total),
-								total,
-							})
-						: t("filter.zeroResults")}
-				</span>
-				{(total > limit || offset > 0) && (
-					<div className="flex items-center gap-0.5">
-						<button
-							onClick={() =>
-								setFilter({
-									offset: Math.max(
-										0,
-										Math.min(offset - limit, (Math.ceil(total / limit) - 1) * limit),
-									),
-								})
-							}
-							type="button"
-							aria-label={t("filter.previousPage")}
-							disabled={offset === 0}
-							className="p-1 text-text-muted hover:text-text disabled:opacity-30 focus:outline-none focus:ring-2 focus:ring-accent-fg rounded"
-						>
-							<ChevronLeft size={14} />
-						</button>
-						<button
-							onClick={() =>
-								setFilter({
-									offset: offset + limit,
-								})
-							}
-							type="button"
-							aria-label={t("filter.nextPage")}
-							disabled={offset + limit >= total}
-							className="p-1 text-text-muted hover:text-text disabled:opacity-30 focus:outline-none focus:ring-2 focus:ring-accent-fg rounded"
-						>
-							<ChevronRight size={14} />
-						</button>
-					</div>
+				{activeLabel && (
+					<span
+						data-active-filter=""
+						title={activeLabel}
+						className="max-w-60 truncate rounded-full bg-accent-muted px-2 py-0.5 text-caption font-medium text-accent-fg"
+					>
+						{activeLabel}
+					</span>
 				)}
+
+				{hasFilters && (
+					<button
+						onClick={() => {
+							setFilter({
+								status: undefined,
+								search: undefined,
+								file_path: undefined,
+								tag: undefined,
+								offset: 0,
+							});
+							setSearchInput("");
+						}}
+						className="flex items-center gap-1 px-2 py-0.5 text-caption text-text-muted hover:text-text"
+					>
+						<X size={14} /> {t("common.clear")}
+					</button>
+				)}
+
+				<div className="flex shrink-0 items-center gap-2 ml-auto">
+					<span className="whitespace-nowrap text-caption text-text-muted">
+						{total > 0
+							? t("filter.results", {
+									from: offset + 1,
+									to: Math.min(offset + showing, total),
+									total,
+								})
+							: t("filter.zeroResults")}
+					</span>
+					{(total > limit || offset > 0) && (
+						<div className="flex items-center gap-0.5">
+							<button
+								onClick={() =>
+									setFilter({
+										offset: Math.max(
+											0,
+											Math.min(offset - limit, (Math.ceil(total / limit) - 1) * limit),
+										),
+									})
+								}
+								type="button"
+								aria-label={t("filter.previousPage")}
+								disabled={offset === 0}
+								className="p-1 text-text-muted hover:text-text disabled:opacity-30 focus:outline-none focus:ring-2 focus:ring-accent-fg rounded"
+							>
+								<ChevronLeft size={14} />
+							</button>
+							<button
+								onClick={() =>
+									setFilter({
+										offset: offset + limit,
+									})
+								}
+								type="button"
+								aria-label={t("filter.nextPage")}
+								disabled={offset + limit >= total}
+								className="p-1 text-text-muted hover:text-text disabled:opacity-30 focus:outline-none focus:ring-2 focus:ring-accent-fg rounded"
+							>
+								<ChevronRight size={14} />
+							</button>
+						</div>
+					)}
+				</div>
 			</div>
 		</div>
 	);

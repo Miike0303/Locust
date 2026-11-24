@@ -74,6 +74,8 @@ export const en = {
   "textFit.line": "Line {line}",
   "textFit.within": "estimated advance within chosen width",
   "textFit.exceeds": "estimated advance exceeds chosen width",
+  "textFit.fitsShort": "fits",
+  "textFit.exceedsShort": "exceeds",
   "textFit.unavailable": "Estimate unavailable",
   "textFit.unknownReason": "No metric available",
   "textFit.noText": "No text to assess.",
@@ -842,6 +844,8 @@ export const en = {
   "filter.anyTag": "Any tag",
   "filter.results": "{from}–{to} of {total}",
   "filter.zeroResults": "0 results",
+  "filter.active": "Filter: {filters}",
+  "filter.activeSearch": "“{search}”",
 
   // ── table ───────────────────────────────────────────────────────────────
   "table.status": "Status",

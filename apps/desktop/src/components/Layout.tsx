@@ -30,7 +30,7 @@ import { APP_VERSION } from "../lib/appVersion";
 import { useT } from "../lib/i18n";
 import { useQuery } from "@tanstack/react-query";
 import { getConfig } from "../lib/api";
-import { isCompactLayout, readSidebarCollapsed, saveSidebarCollapsed, subscribeCompactLayout } from "../lib/layoutPrefs";
+import { isCompactLayout, isNarrowLayout, readSidebarCollapsed, saveSidebarCollapsed, subscribeCompactLayout, subscribeNarrowLayout } from "../lib/layoutPrefs";
 
 const navItems = [
 	{ to: "/", icon: Home, labelKey: "nav.home", shortcut: "Alt+1" },
@@ -49,11 +49,18 @@ export default function Layout() {
 	const { data: config } = useQuery({ queryKey: ["config"], queryFn: getConfig });
 	const [showHelp, setShowHelp] = useState(false);
 	const [compact, setCompact] = useState(isCompactLayout);
+	const [narrow, setNarrow] = useState(isNarrowLayout);
 	const [sidebarPreference, setSidebarPreference] = useState(readSidebarCollapsed);
-	const collapsed = sidebarPreference ?? compact;
+	const [toggledThisSession, setToggledThisSession] = useState(false);
+	// A saved expansion would squeeze the editor below 1000px; a toggle in this session still wins.
+	const collapsed = narrow && sidebarPreference === false && !toggledThisSession
+		? true
+		: sidebarPreference ?? compact;
 	useEffect(() => subscribeCompactLayout(setCompact), []);
+	useEffect(() => subscribeNarrowLayout(setNarrow), []);
 	const toggleSidebar = () => {
 		setSidebarPreference(!collapsed);
+		setToggledThisSession(true);
 		saveSidebarCollapsed(!collapsed);
 	};
 	const toggleLabel = t(collapsed ? "nav.expandSidebar" : "nav.collapseSidebar");

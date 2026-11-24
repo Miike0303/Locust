@@ -15,12 +15,16 @@ import { ChevronUp, ChevronDown, ChevronsUpDown } from "lucide-react";
 import type { StringEntry } from "../lib/api";
 import { getConfig, getString, patchString } from "../lib/api";
 import { clampTableRowHeight, showSourceColumnEnabled } from "../lib/appearance";
+import { isCompactLayout, subscribeCompactLayout } from "../lib/layoutPrefs";
 import { useEditorStore } from "../stores/editorStore";
 import { useT } from "../lib/i18n";
 import { useProjectStore } from "../stores/projectStore";
 import { acknowledgeDraft, draftEntryKey, draftProjectKey, editDraft, loadLatestDraft, saveDraft, useDraftStore } from "../stores/draftStore";
 
 import { StatusBadge } from "../lib/statusStyles";
+
+/** The editable column never collapses below 12rem when the table is squeezed. */
+const TRANSLATION_MIN_WIDTH = "min-w-48";
 
 function InlineEdit({
 	entry,
@@ -169,9 +173,12 @@ export default function StringTable({
 	const { data: config } = useQuery({ queryKey: ["config"], queryFn: getConfig });
 	const showSource = showSourceColumnEnabled(config?.ui.show_source_column);
 	const rowHeight = clampTableRowHeight(config?.ui.table_row_height);
+	const [compact, setCompact] = useState(isCompactLayout);
+	useEffect(() => subscribeCompactLayout(setCompact), []);
+	// Compact widths drop the secondary File and Tags columns so the text columns stay readable.
 	const columnVisibility = useMemo<VisibilityState>(
-		() => ({ source: showSource }),
-		[showSource],
+		() => ({ source: showSource, file_path: !compact, tags: !compact }),
+		[showSource, compact],
 	);
 
 	const columns = useMemo<ColumnDef<StringEntry, any>[]>(
@@ -269,7 +276,7 @@ export default function StringTable({
 									key={header.id}
 									scope="col"
 									aria-sort={header.column.getIsSorted() === "asc" ? "ascending" : header.column.getIsSorted() === "desc" ? "descending" : "none"}
-									className="px-3 py-2 text-caption font-medium text-text-muted select-none"
+									className={clsx("px-3 py-2 text-caption font-medium text-text-muted select-none", header.column.id === "translation" && TRANSLATION_MIN_WIDTH)}
 									style={{ width: header.getSize() }}
 								>
 									<button type="button"
@@ -330,7 +337,7 @@ export default function StringTable({
 							{row.getVisibleCells().map((cell) => (
 								<td
 									key={cell.id}
-									className="px-3 py-1"
+									className={clsx("px-3 py-1", cell.column.id === "translation" && TRANSLATION_MIN_WIDTH)}
 									style={{ maxWidth: cell.column.getSize() }}
 								>
 									{flexRender(cell.column.columnDef.cell, cell.getContext())}

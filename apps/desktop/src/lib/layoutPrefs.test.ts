@@ -69,8 +69,10 @@ function render(component: () => any, states = h.states) {
 function cleanup(states = h.states) { states.forEach(slot => slot?.cleanup?.()); }
 const originals = new Map(["window", "document", "localStorage"].map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)]));
 let compact = true;
+let narrow = false;
 let storage: Storage;
 let mediaListeners: Set<(event: { matches: boolean }) => void>;
+let narrowListeners: Set<(event: { matches: boolean }) => void>;
 let keyListeners: Set<(event: any) => void>;
 let focusListeners: Set<(event: any) => void>;
 let active: any;
@@ -80,12 +82,16 @@ const projectKey = drafts.draftProjectKey(project);
 const entry = { id: "row-1", source: "Source", translation: "Translation", status: "translated" as const, tags: [], metadata: {}, created_at: "2026-01-01", file_path: "story.html", context: null, provider_used: null, char_limit: null, translated_at: null, reviewed_at: null };
 beforeEach(() => {
   h.states = []; h.effects = []; h.queryData = {};
-  compact = true; mediaListeners = new Set(); keyListeners = new Set(); focusListeners = new Set(); active = null; dialogs = [];
+  compact = true; narrow = false; mediaListeners = new Set(); narrowListeners = new Set(); keyListeners = new Set(); focusListeners = new Set(); active = null; dialogs = [];
   const values = new Map<string, string>();
   storage = { getItem: (key: string) => values.get(key) ?? null, setItem: (key: string, value: string) => { values.set(key, value); } } as Storage;
   Object.defineProperty(globalThis, "localStorage", { configurable: true, value: storage });
   Object.defineProperty(globalThis, "window", { configurable: true, value: {
-    matchMedia: () => ({ get matches() { return compact; }, addEventListener: (_: string, listener: any) => mediaListeners.add(listener), removeEventListener: (_: string, listener: any) => mediaListeners.delete(listener) }),
+    // The narrow (below 1000px) query has its own state; every other query is the compact one.
+    matchMedia: (query: string) => {
+      const isNarrow = query === "(width < 1000px)", listeners = () => isNarrow ? narrowListeners : mediaListeners;
+      return { get matches() { return isNarrow ? narrow : compact; }, addEventListener: (_: string, listener: any) => listeners().add(listener), removeEventListener: (_: string, listener: any) => listeners().delete(listener) };
+    },
     addEventListener: (type: string, listener: any) => { if (type === "keydown") keyListeners.add(listener); else if (type === "focusin") focusListeners.add(listener); },
     removeEventListener: (type: string, listener: any) => { if (type === "keydown") keyListeners.delete(listener); else if (type === "focusin") focusListeners.delete(listener); },
   } });
@@ -376,4 +382,97 @@ test("overlay drawer contains outside focus, yields to a nested dialog, and remo
   cleanup(states); dialogs = [];
   assert.equal(focusListeners.size, 0);
   outside.focus(); assert.equal(active, outside);
+});
+
+const sidebarCollapsed = (tree: any[]) => tree.find(n => n.type === "aside").props["data-collapsed"];
+test("below 1000px a saved expanded sidebar yields to the rail until it is expanded again this session", () => {
+  saveSidebarCollapsed(false);
+  compact = true; narrow = true;
+  const states: any[] = [];
+  let tree = render(Layout, states);
+  h.effects.forEach(effect => effect());
+  assert.equal(sidebarCollapsed(tree), true, "the saved expansion is ignored below 1000px");
+  narrow = false; narrowListeners.forEach(listener => listener({ matches: narrow }));
+  tree = render(Layout, states);
+  assert.equal(sidebarCollapsed(tree), false, "the saved expansion applies again from 1000px");
+  narrow = true; narrowListeners.forEach(listener => listener({ matches: narrow }));
+  tree = render(Layout, states);
+  assert.equal(sidebarCollapsed(tree), true);
+  tree.find(n => n.props["aria-label"] === t("nav.expandSidebar")).props.onClick();
+  tree = render(Layout, states);
+  assert.equal(sidebarCollapsed(tree), false, "an explicit expand still works below 1000px");
+  assert.equal(readSidebarCollapsed(), false);
+  tree.find(n => n.props["aria-label"] === t("nav.collapseSidebar")).props.onClick();
+  assert.equal(sidebarCollapsed(render(Layout, states)), true);
+  assert.equal(readSidebarCollapsed(), true);
+  cleanup(states);
+  assert.equal(narrowListeners.size, 0);
+  assert.equal(mediaListeners.size, 0);
+});
+
+const sortTitle = (key: "table.file" | "table.tags" | "table.translation") => t("table.sortPageBy", { column: t(key) });
+const headerTitle = (th: any) => nodes(th).find(n => n.type === "button")?.props.title;
+for (const compactWidth of [true, false]) {
+  test(`${compactWidth ? "compact" : "wide"} table ${compactWidth ? "hides" : "keeps"} File and Tags, follows resize, and keeps Translation at a minimum width`, () => {
+    compact = compactWidth;
+    const states: any[] = [];
+    let tree = render(() => StringTable({ data: [entry], onRefetch() {} }), states);
+    h.effects.forEach(effect => effect());
+    const check = (isCompact: boolean) => {
+      const titles = tree.filter(n => n.type === "th").map(headerTitle);
+      assert.equal(titles.includes(sortTitle("table.file")), !isCompact, "File column");
+      assert.equal(titles.includes(sortTitle("table.tags")), !isCompact, "Tags column");
+      assert.equal(tree.filter(n => n.type === "td").length, isCompact ? 3 : 5);
+      const th = tree.find(n => n.type === "th" && headerTitle(n) === sortTitle("table.translation"));
+      assert.match(th.props.className, /\bmin-w-48\b/);
+      const td = tree.find(n => n.type === "td" && nodes(n.props.children).some(child => child.type?.name === "InlineEdit"));
+      assert.match(td.props.className, /\bmin-w-48\b/);
+    };
+    check(compactWidth);
+    compact = !compactWidth; mediaListeners.forEach(listener => listener({ matches: compact }));
+    tree = render(() => StringTable({ data: [entry], onRefetch() {} }), states);
+    check(!compactWidth);
+    cleanup(states);
+    assert.equal(mediaListeners.size, 0);
+  });
+}
+
+const fitEntry = { ...entry, id: "Map001.json#event_1#page_0#cmd_1#msg", metadata: { format_id: "rpgmaker-mv" }, tags: ["dialogue"] };
+for (const compactWidth of [true, false]) {
+  test(`${compactWidth ? "compact" : "wide"} details pin the header, scroll only the body and show Status before the estimate`, () => {
+    compact = compactWidth;
+    const tree = render(() => DetailPanel({ projectKey, entry: fitEntry, onRefetch() {}, onClose() {} }));
+    const aside = tree.find(n => n.type === "aside");
+    assert.doesNotMatch(aside.props.className, /overflow-y-auto/, "the panel itself never scrolls its header away");
+    assert.match(aside.props.className, /\boverflow-hidden\b/);
+    const [header, body] = aside.props.children;
+    assert.ok(nodes(header).some(n => n.type === "h3"), "the header holds the title");
+    assert.ok(nodes(header).some(n => n.props["aria-label"] === t("detail.closeAria")), "and the close control");
+    assert.match(header.props.className, /\bshrink-0\b/);
+    assert.match(body.props.className, /\boverflow-y-auto\b/);
+    assert.match(body.props.className, /\bmin-h-0\b/);
+    const order = nodes(body).map(n => n.type === "fieldset" ? "Status" : typeof n.type === "function" ? n.type.name : null).filter(Boolean);
+    for (const later of ["TextFitPreview", "MemorySuggestions", "StringHistory"]) {
+      assert.ok(order.includes(later), later);
+      assert.ok(order.indexOf("Status") < order.indexOf(later), `Status before ${later}: ${order.join(", ")}`);
+    }
+  });
+}
+
+test("detail close is a 28px muted icon button instead of a bare glyph", () => {
+  for (const compactWidth of [true, false]) {
+    compact = compactWidth;
+    const close = render(() => DetailPanel({ projectKey, entry, onRefetch() {}, onClose() {} }))
+      .find(n => n.props["aria-label"] === t("detail.closeAria"));
+    assert.equal(close.type, "button");
+    assert.equal(close.props.type, "button");
+    const children = [close.props.children].flat();
+    assert.ok(!children.includes("×"), "no text glyph");
+    const icon = children.find(child => child?.type?.displayName === "X");
+    assert.ok(icon, "lucide X icon");
+    assert.equal(icon.props["aria-hidden"], true);
+    assert.match(close.props.className, /\bsize-7\b/);
+    assert.match(close.props.className, /\btext-text-muted\b/);
+    assert.doesNotMatch(close.props.className, /text-section|danger|red-/);
+  }
 });

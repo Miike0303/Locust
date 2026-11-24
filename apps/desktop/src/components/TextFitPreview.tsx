@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronDown, ChevronRight } from "lucide-react";
+import { AlertTriangle, ChevronDown, ChevronRight } from "lucide-react";
 import { estimateTextFit, type StringEntry, type TextFitRequest, type TextFitResponse, type TextFitLine } from "../lib/api";
 import { useT, type TranslateFn } from "../lib/i18n";
 import { IS_TAURI } from "../lib/runtime";
 import { browserStorage, type StringStorage } from "../lib/storage";
 import { draftProjectKey, isProjectScopedQueryEnabled } from "../lib/projectScope";
 import { useProjectStore } from "../stores/projectStore";
+import { pathBasename } from "../lib/path";
 
 export interface TextFitProfile { fontPath: string; fontSize: string; usableWidth: string }
 const emptyProfile = (): TextFitProfile => ({ fontPath: "", fontSize: "", usableWidth: "" });
@@ -161,10 +162,15 @@ export default function TextFitPreview({ projectKey, entry, draft }: Props) {
   const lines = (label: string, values: TextFitLine[], text: string) => <div className="space-y-1.5">
     <h4 className="font-medium">{label}</h4>
     {values.map((line, index) => <div key={index} className="space-y-1">
-      <p className={line.status === "exceeds_width" ? "text-warning" : "text-text-muted"}>
-        {t("textFit.line", { line: index + 1 })}: {line.status === "unavailable" || line.advance_px === null
-          ? `${t("textFit.unavailable")}: ${textFitReason(line.reason, t)}`
-          : <>{line.advance_px.toLocaleString(undefined, { maximumFractionDigits: 3 })} px / {line.usable_width_px} px · {line.reason === "no_text" || text.length === 0 ? t("textFit.noText") : t(line.status === "exceeds_width" ? "textFit.exceeds" : "textFit.within")}</>}
+      <p className={line.status === "exceeds_width" ? "flex items-start gap-1 font-medium text-warning" : "text-text-muted"}>
+        {line.status === "exceeds_width" && <AlertTriangle size={12} aria-hidden="true" className="mt-0.5 shrink-0" />}
+        <span>
+          {t("textFit.line", { line: index + 1 })}: {line.status === "unavailable" || line.advance_px === null
+            ? `${t("textFit.unavailable")}: ${textFitReason(line.reason, t)}`
+            : <>{line.advance_px.toLocaleString(undefined, { maximumFractionDigits: 1 })} / {line.usable_width_px} px · {line.reason === "no_text" || text.length === 0 ? t("textFit.noText")
+              // Short visible verdict; screen readers keep the precise wording.
+              : <><span aria-hidden="true">{t(line.status === "exceeds_width" ? "textFit.exceedsShort" : "textFit.fitsShort")}</span><span className="sr-only">{t(line.status === "exceeds_width" ? "textFit.exceeds" : "textFit.within")}</span></>}</>}
+        </span>
       </p>
       {line.status !== "unavailable" && line.advance_px !== null && line.reason !== "no_text" && text.length > 0 && <div aria-hidden="true" className="h-1 rounded bg-surface-muted overflow-hidden">
         <div className={`h-full ${line.status === "exceeds_width" ? "bg-warning" : "bg-text-muted"}`}
@@ -181,10 +187,12 @@ export default function TextFitPreview({ projectKey, entry, draft }: Props) {
       <p className="text-text-muted">{t("textFit.linesHint")}</p>
       <label className="block" htmlFor={`${id}-font`}>{t("textFit.font")}</label>
       <div className="flex gap-1">
-        <input id={`${id}-font`} value={profile.fontPath} onChange={event => update("fontPath", event.target.value)}
+        <input id={`${id}-font`} value={profile.fontPath} title={profile.fontPath || undefined} onChange={event => update("fontPath", event.target.value)}
           className="min-w-0 w-full p-1 border border-border rounded bg-surface" />
         {IS_TAURI && <button type="button" onClick={chooseFont} className="underline">{t("textFit.browse")}</button>}
       </div>
+      {/* A long path shows its start in the field; name the file and keep the full path in the tooltip. */}
+      {profile.fontPath.trim() !== "" && <p data-font-name="" title={profile.fontPath} className="truncate font-medium">{pathBasename(profile.fontPath.trim())}</p>}
       <button type="button" onClick={estimate.refreshFont} disabled={!estimate.active}
         className="text-text-muted underline hover:text-text disabled:opacity-50">{t("textFit.refreshFont")}</button>
       <div className="grid grid-cols-2 gap-2">

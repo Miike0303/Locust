@@ -22,9 +22,10 @@ export default function ToastContainer() {
 
 	if (toasts.length === 0) return null;
 
+	// Bottom-right above the h-9 BottomBar keeps the editor header actions uncovered.
 	return (
 		<div
-			className="fixed top-4 right-4 z-[100] flex flex-col gap-2 w-[calc(100%-2rem)] max-w-sm max-h-[calc(100dvh-2rem)] overflow-y-auto overflow-x-hidden"
+			className="fixed bottom-12 right-4 z-[100] flex flex-col gap-2 w-[calc(100%-2rem)] max-w-sm max-h-[calc(100dvh-4rem)] overflow-y-auto overflow-x-hidden"
 			role="region"
 			aria-label={t("toast.notifications")}
 		>

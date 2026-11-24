@@ -84,7 +84,14 @@ export default function WorkflowGuideBanner({
                 </span>
                 {t(`workflow.${item}`)}
                 {item === "check" && check.state !== "current" && (
-                  <span className="flex items-center gap-1 text-caption" role="status">
+                  // A muted pill keeps the status visually apart from the step label.
+                  <span
+                    role="status"
+                    className={clsx(
+                      "flex items-center gap-1 rounded-full px-1.5 py-px text-caption font-normal",
+                      hasIssues ? "bg-warning-muted text-warning" : "bg-surface-muted text-text-muted",
+                    )}
+                  >
                     {hasIssues && <span aria-hidden="true" className="size-1.5 rounded-full bg-warning" />}
                     {hasIssues ? t("workflow.issues", { count: check.openIssues })
                       : t(check.state === "checking" ? "workflow.checking" : "workflow.notChecked")}
@@ -97,7 +104,8 @@ export default function WorkflowGuideBanner({
         })}
       </ol>
 
-      <p className="min-w-0 flex-1 truncate text-caption text-text-muted" title={content.description}>
+      {/* Wraps onto its own row when narrow instead of truncating. */}
+      <p className="min-w-64 flex-1 text-caption text-text-muted">
         {content.description}
       </p>
 
