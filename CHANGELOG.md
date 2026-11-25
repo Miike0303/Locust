@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.0]
+## [0.3.0] - 2026-11-24
 
 ### Added
 
@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Improved translation, backup, glossary, database and editor performance. Backup generations can share verified identical payload files while retaining independent restore inventories.
 - Provider-specific batching, transient-error retries and rate limits respect configured settings and supported engine controls.
 - Improved compact layouts, keyboard editing, screen-reader support and English/Spanish workflow and recovery guidance.
+- Desktop installers are now MSI (Windows), DMG and app bundle (macOS) and AppImage (Linux), the formats the in-app updater can update. NSIS, deb and rpm packages are no longer produced.
+- Opening a second copy of the desktop app focuses the running window instead.
+- Opening projects, the pre-open check and the backup list no longer freeze the window. Updates wait until running translation or patch jobs finish.
 
 ### Fixed
 
@@ -42,10 +45,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Retained reported tokens and cost when paid-provider answers are rejected.
 - Refused Wolf RPG and YU-RIS translations that change characters during Shift-JIS encoding.
 - Improved source checks, byte preservation and supported engine-control handling during extraction and injection. Injection and patch operations refuse unsafe provenance, drift and interrupted or incompatible state before writing.
+- Google, DeepL and Argos no longer translate each wrapped line of an RPG Maker MV/MZ message as a separate sentence, and injected messages keep the speaker name on its own line with its capital letter.
+- RPG Maker MV games with their data folder at the game root receive Add-mode language files next to that data.
+- Catalog imports from the browser accept files up to 64 MiB, and external links open in the system browser from the installed app.
+- Renewed Grok subscription tokens are kept for the session when the token file cannot be written.
 
 ### Security
 
 - Hardened archive paths, bounded malformed archive reads, validated every patch-download redirect and updated several vulnerable dependencies. Some dependency findings remain unresolved.
+- The desktop app's local backend accepts requests only from its own window; other local web pages are refused.
+- Release publication verifies every updater signature against the app's public key before publishing.
 
 ### Known issues
 
