@@ -76,6 +76,19 @@ async function clickElement(expression, description) {
   await command('Input.dispatchMouseEvent', { type: 'mousePressed', button: 'left', clickCount: 1, ...point });
   await command('Input.dispatchMouseEvent', { type: 'mouseReleased', button: 'left', clickCount: 1, ...point });
 }
+// Rows can still move between measuring a row and the mouse press (data
+// arriving after a reload pushes them down), so the press can select the row
+// above. Confirm the detail panel opened the intended entry; click again if not.
+async function openRow(text, description) {
+  for (let attempt = 1; ; attempt++) {
+    await clickElement(`Array.from(document.querySelectorAll('tbody tr')).find(el => el.textContent.includes(${q(text)}))?.querySelector('td')`, description);
+    try {
+      return await until(() => evaluate(`!!document.querySelector('output[id$="-source"]')?.textContent.includes(${q(text)})`), `${description} detail`, 2000);
+    } catch (error) {
+      if (attempt === 3 || !error.message.startsWith('Timed out')) throw error;
+    }
+  }
+}
 const click = selector => clickElement(control(selector), selector);
 const button = (label, within = 'document') => clickElement(`Array.from(${within}?.querySelectorAll('button') || []).find(el => el.textContent.trim() === ${q(label)})`, `button ${label}`);
 async function key(key, code, windowsVirtualKeyCode, modifiers = 0) {
@@ -269,12 +282,12 @@ async function main() {
 
   stage = 'edit-save';
   const edited = 'Hola, viajero! Bienvenido al pueblo.';
-  await clickElement(`Array.from(document.querySelectorAll('tbody tr')).find(el => el.textContent.includes('Hello, traveler!'))?.querySelector('td')`, 'fixture dialogue source cell');
+  await openRow('Hello, traveler!', 'fixture dialogue source cell');
   await fill('textarea[id$="-translation"]', edited);
   await key('Enter', 'Enter', 13, 2); // The editor's documented Ctrl+Enter save.
   await until(async () => (await readBackend(`/api/strings?limit=100`)).entries.find(e => e.id === entry.id)?.translation === edited, 'saved edit');
   await navigate('/editor');
-  await clickElement(`Array.from(document.querySelectorAll('tbody tr')).find(el => el.textContent.includes('Hello, traveler!'))?.querySelector('td')`, 'saved dialogue source cell');
+  await openRow('Hello, traveler!', 'saved dialogue source cell');
   await waitFor(`${control('textarea[id$="-translation"]')}?.value === ${q(edited)}`, 'edit survived reload');
   await click('button[aria-label="Close detail panel"]');
   summary.stages.push(stage);
